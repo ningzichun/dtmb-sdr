@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gr-dtmb"
+version = "0.1.0"
+description = "Offline-first DTMB software receiver prototypes"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "scipy>=1.11",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "psutil>=5.9",
+]
+dsp = [
+  "matplotlib>=3.8",
+]
+
+[project.scripts]
+dtmb-capture = "dtmb.capture:main"
+dtmb-acquire = "dtmb.acquire:main"
+dtmb-body-phase-sweep = "dtmb.body_phase_sweep:main"
+dtmb-body-timing-heatmap = "dtmb.body_timing_heatmap:main"
+dtmb-constellation = "dtmb.constellation:main"
+dtmb-detect = "dtmb.detect:main"
+dtmb-frame-drift = "dtmb.frame_drift:main"
+dtmb-frame-diagnostic = "dtmb.frame_diagnostic:main"
+dtmb-gate-visuals = "dtmb.gate_visuals:main"
+dtmb-llr-health = "dtmb.llr_health:main"
+dtmb-pn-cir-diagnostic = "dtmb.pn_cir_diagnostic:main"
+dtmb-pre-ldpc-probe = "dtmb.pre_ldpc_probe:main"
+dtmb-real-pre-ldpc-probe = "dtmb.real_pre_ldpc_probe:main"
+dtmb-receive = "dtmb.receiver:main"
+dtmb-rf-variant-grid = "dtmb.rf_variant_grid:main"
+dtmb-simulate = "dtmb.simulate:main"
+dtmb-transmit = "dtmb.tx_c3780:main"
+dtmb-stage-report = "dtmb.stage_report:main"
+dtmb-si-burst-correlation = "dtmb.si_burst_correlation:main"
+dtmb-si-convention-probe = "dtmb.system_info_convention_probe:main"
+dtmb-si-residual-probe = "dtmb.system_info_residual_probe:main"
+dtmb-sweep-report = "dtmb.sweep:main"
+dtmb-ts-analyze = "dtmb.ts:main"
+dtmb-timing-search = "dtmb.timing:main"
+dtmb-ui = "dtmb.ui_server:main"
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+
+[tool.setuptools.packages.find]
+where = ["python"]
+
+[tool.setuptools.package-data]
+dtmb = ["data/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
