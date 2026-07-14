@@ -5,15 +5,78 @@
 #include <cmath>
 #include <complex>
 #include <cstddef>
+#include <cstring>
+#include <limits>
+#include <mutex>
 #include <numbers>
 #include <span>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
+
+#ifdef DTMB_CORE_HAVE_FFTW3F
+#include <fftw3.h>
+#endif
 
 namespace dtmb::core {
 namespace {
 
 using Complex = std::complex<float>;
+
+#ifdef DTMB_CORE_HAVE_FFTW3F
+class FftwPlanCache {
+public:
+    FftwPlanCache() = default;
+    FftwPlanCache(const FftwPlanCache&) = delete;
+    FftwPlanCache& operator=(const FftwPlanCache&) = delete;
+
+    ~FftwPlanCache() {
+        for (const auto& [size, plan] : plans_) {
+            (void)size;
+            fftwf_destroy_plan(plan);
+        }
+    }
+
+    [[nodiscard]] fftwf_plan get(std::size_t size) {
+        if (size > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+            throw std::invalid_argument("FFT size exceeds FFTW int limit");
+        }
+        const std::lock_guard lock(mutex_);
+        if (const auto found = plans_.find(size); found != plans_.end()) {
+            return found->second;
+        }
+        auto* input = fftwf_alloc_complex(size);
+        auto* output = fftwf_alloc_complex(size);
+        if (input == nullptr || output == nullptr) {
+            fftwf_free(input);
+            fftwf_free(output);
+            throw std::bad_alloc();
+        }
+        const auto plan = fftwf_plan_dft_1d(
+            static_cast<int>(size),
+            input,
+            output,
+            FFTW_FORWARD,
+            FFTW_ESTIMATE | FFTW_UNALIGNED);
+        fftwf_free(input);
+        fftwf_free(output);
+        if (plan == nullptr) {
+            throw std::runtime_error("failed to create FFTW3f plan");
+        }
+        plans_.emplace(size, plan);
+        return plan;
+    }
+
+private:
+    std::mutex mutex_;
+    std::unordered_map<std::size_t, fftwf_plan> plans_;
+};
+
+[[nodiscard]] fftwf_plan fftw_plan(std::size_t size) {
+    static FftwPlanCache cache;
+    return cache.get(size);
+}
+#endif
 
 constexpr std::array<std::size_t, kC3780SystemInfoSymbols> kSystemInfoPositions{
     0, 140, 279, 419, 420, 560, 699, 839, 840, 980, 1119, 1259,
@@ -282,17 +345,33 @@ void fft_recursive(
 }
 
 [[nodiscard]] float nearest_qam64_level(float value) noexcept {
-    constexpr std::array<float, 8> levels{-7.0F, -5.0F, -3.0F, -1.0F, 1.0F, 3.0F, 5.0F, 7.0F};
-    auto nearest = levels.front();
-    auto best_distance = std::abs(value - nearest);
-    for (const auto level : levels) {
-        const auto distance = std::abs(value - level);
-        if (distance < best_distance) {
-            nearest = level;
-            best_distance = distance;
-        }
+    // Midpoint comparisons preserve the previous tie behaviour (the lower
+    // constellation level wins) without scanning all eight levels for every
+    // I/Q component.  This function is on the per-frame normalization hot
+    // path, so the fixed decision tree is materially cheaper and vectorizes
+    // better than the generic nearest-neighbour loop.
+    if (value <= -6.0F) {
+        return -7.0F;
     }
-    return nearest;
+    if (value <= -4.0F) {
+        return -5.0F;
+    }
+    if (value <= -2.0F) {
+        return -3.0F;
+    }
+    if (value <= 0.0F) {
+        return -1.0F;
+    }
+    if (value <= 2.0F) {
+        return 1.0F;
+    }
+    if (value <= 4.0F) {
+        return 3.0F;
+    }
+    if (value <= 6.0F) {
+        return 5.0F;
+    }
+    return 7.0F;
 }
 
 }  // namespace
@@ -350,13 +429,54 @@ void qam64_normalize_cf32(
             gain = candidate;
         }
     }
+    const auto gain_power = std::norm(gain);
+    const auto inverse_gain = gain_power > 1.0e-24F
+        ? std::conj(gain) / gain_power
+        : Complex{1.0F, 0.0F};
     for (std::size_t symbol = 0; symbol < symbol_count; ++symbol) {
         const auto normalized = Complex{
             interleaved_symbols[symbol * 2],
             interleaved_symbols[symbol * 2 + 1],
-        } / gain;
+        } * inverse_gain;
         output_symbols[symbol * 2] = normalized.real();
         output_symbols[symbol * 2 + 1] = normalized.imag();
+    }
+}
+
+void qam64_normalize_amplitude_cf32(
+    std::span<const float> interleaved_symbols,
+    std::span<float> output_symbols) {
+    if ((interleaved_symbols.size() % 2) != 0) {
+        throw std::invalid_argument("CF32 input must contain interleaved real/imag pairs");
+    }
+    if (output_symbols.size() < interleaved_symbols.size()) {
+        throw std::invalid_argument("output CF32 span is too small");
+    }
+    const auto symbol_count = interleaved_symbols.size() / 2;
+    if (symbol_count == 0) {
+        return;
+    }
+
+    double power_sum = 0.0;
+    for (std::size_t symbol = 0; symbol < symbol_count; ++symbol) {
+        const auto value = Complex{
+            interleaved_symbols[symbol * 2],
+            interleaved_symbols[symbol * 2 + 1],
+        };
+        power_sum += std::norm(value);
+    }
+    const auto observed_power = power_sum / static_cast<double>(symbol_count);
+    if (observed_power <= 1.0e-24) {
+        std::copy(interleaved_symbols.begin(), interleaved_symbols.end(), output_symbols.begin());
+        return;
+    }
+
+    constexpr double average_power = 42.0;
+    const auto scale = static_cast<float>(std::sqrt(observed_power / average_power));
+    const auto safe_scale = std::max(scale, 1.0e-12F);
+    for (std::size_t symbol = 0; symbol < symbol_count; ++symbol) {
+        output_symbols[symbol * 2] = interleaved_symbols[symbol * 2] / safe_scale;
+        output_symbols[symbol * 2 + 1] = interleaved_symbols[symbol * 2 + 1] / safe_scale;
     }
 }
 
@@ -374,6 +494,20 @@ void mixed_radix_fft_forward_cf32(
         return;
     }
 
+#ifdef DTMB_CORE_HAVE_FFTW3F
+    // New-array execution is safe concurrently and FFTW_UNALIGNED makes the
+    // plan independent of the allocator alignment used by caller-owned frame
+    // buffers.  FFTW uses the same unnormalised forward-transform convention
+    // as the built-in implementation.
+    const auto plan = fftw_plan(sample_count);
+    fftwf_execute_dft(
+        plan,
+        reinterpret_cast<fftwf_complex*>(
+            const_cast<float*>(interleaved_time_samples.data())),
+        reinterpret_cast<fftwf_complex*>(interleaved_frequency_bins.data()));
+    return;
+#else
+
     thread_local std::vector<Complex> input;
     thread_local std::vector<Complex> output;
     input.resize(sample_count);
@@ -389,6 +523,7 @@ void mixed_radix_fft_forward_cf32(
         interleaved_frequency_bins[bin * 2] = output[bin].real();
         interleaved_frequency_bins[bin * 2 + 1] = output[bin].imag();
     }
+#endif
 }
 
 void c3780_extract_frame_symbols_cf32(
@@ -401,7 +536,8 @@ void c3780_extract_frame_symbols_cf32(
         throw std::invalid_argument("C=3780 logical output span is too small");
     }
 
-    std::vector<float> spectrum(kC3780FrameBodySymbols * 2);
+    thread_local std::vector<float> spectrum;
+    spectrum.resize(kC3780FrameBodySymbols * 2);
     mixed_radix_fft_forward_cf32(interleaved_time_body, spectrum);
     c3780_deinterleave_spectrum_cf32(spectrum, interleaved_logical_symbols);
 }

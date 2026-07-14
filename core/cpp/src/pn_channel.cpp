@@ -282,11 +282,40 @@ void repair_low_energy_pn_dc_response(
     std::span<const float> header,
     std::size_t phase,
     std::size_t channel_taps,
-    float regularization) {
+    float regularization,
+    Pn945HeaderObservation observation = Pn945HeaderObservation::core_only,
+    std::size_t safe_prefix_skip = kPn945PrefixSymbols) {
     std::vector<float> observed(kPn945CoreSymbols * 2);
     for (std::size_t index = 0; index < kPn945CoreSymbols; ++index) {
-        observed[index * 2] = header[(kPn945PrefixSymbols + index) * 2];
-        observed[index * 2 + 1] = header[(kPn945PrefixSymbols + index) * 2 + 1];
+        const auto main_sample = kPn945PrefixSymbols + index;
+        auto value = Complex{
+            header[main_sample * 2],
+            header[main_sample * 2 + 1],
+        };
+        std::size_t observation_count = 1;
+        if (observation != Pn945HeaderObservation::core_only
+            && index < kPn945PrefixSymbols) {
+            const auto postfix_sample =
+                kPn945PrefixSymbols + kPn945CoreSymbols + index;
+            value += Complex{
+                header[postfix_sample * 2],
+                header[postfix_sample * 2 + 1],
+            };
+            ++observation_count;
+        }
+        constexpr auto prefix_core_start = kPn945CoreSymbols - kPn945PrefixSymbols;
+        if (observation == Pn945HeaderObservation::core_cyclic_safe_average
+            && index >= prefix_core_start + safe_prefix_skip) {
+            const auto prefix_sample = index - prefix_core_start;
+            value += Complex{
+                header[prefix_sample * 2],
+                header[prefix_sample * 2 + 1],
+            };
+            ++observation_count;
+        }
+        value /= static_cast<float>(observation_count);
+        observed[index * 2] = value.real();
+        observed[index * 2 + 1] = value.imag();
     }
 
     std::vector<float> observed_fft(observed.size());
@@ -400,6 +429,114 @@ void dilate_linear_mask(std::vector<bool>& mask, std::size_t guard_taps) {
     return scale;
 }
 
+[[nodiscard]] Complex bounded_wideband_response_scale_from_sums(
+    Complex cross_sum,
+    float reference_power_sum,
+    float observed_power_sum,
+    std::size_t tap_count,
+    float per_frame_noise_tap_power) {
+    auto scale = Complex{1.0F, 0.0F};
+    if (reference_power_sum > 0.0F
+        && tap_count > 0
+        && observed_power_sum
+            > 4.0F * per_frame_noise_tap_power * static_cast<float>(tap_count)) {
+        scale = cross_sum / reference_power_sum;
+        const auto magnitude = std::abs(scale);
+        if (magnitude > 4.0F || magnitude < 0.25F) {
+            scale /= magnitude;
+        }
+    }
+    return scale;
+}
+
+[[nodiscard]] Complex wideband_response_scale_for_rotated_taps(
+    std::span<const Complex> rotated_taps,
+    const Pn945WidebandChannelModel& model,
+    Pn945WidebandScaleEstimator estimator) {
+    const auto template_size = model.template_taps.size() / 2;
+    if (template_size == 0 || model.dominant_tap_index >= template_size) {
+        throw std::invalid_argument("wideband PN945 model has invalid template taps");
+    }
+    if (estimator == Pn945WidebandScaleEstimator::dominant_tap) {
+        const auto anchor = rotated_taps[model.dominant_tap_index];
+        const auto reference = Complex{
+            model.template_taps[model.dominant_tap_index * 2],
+            model.template_taps[model.dominant_tap_index * 2 + 1],
+        };
+        return bounded_wideband_response_scale(
+            anchor,
+            reference,
+            model.per_frame_noise_tap_power);
+    }
+
+    Complex cross_sum{0.0F, 0.0F};
+    float reference_power_sum = 0.0F;
+    float observed_power_sum = 0.0F;
+    std::size_t tap_count = 0;
+    for (std::size_t tap = 0; tap < template_size; ++tap) {
+        const auto reference = Complex{
+            model.template_taps[tap * 2],
+            model.template_taps[tap * 2 + 1],
+        };
+        const auto reference_power = std::norm(reference);
+        if (reference_power <= 0.0F) {
+            continue;
+        }
+        const auto observed = rotated_taps[tap];
+        cross_sum += observed * std::conj(reference);
+        reference_power_sum += reference_power;
+        observed_power_sum += std::norm(observed);
+        ++tap_count;
+    }
+    return bounded_wideband_response_scale_from_sums(
+        cross_sum,
+        reference_power_sum,
+        observed_power_sum,
+        tap_count,
+        model.per_frame_noise_tap_power);
+}
+
+[[nodiscard]] bool uses_masked_frame_taps(Pn945WidebandScaleEstimator estimator) noexcept {
+    return estimator == Pn945WidebandScaleEstimator::masked_frame_taps;
+}
+
+[[nodiscard]] std::vector<Complex> masked_frame_taps_from_rotated_taps(
+    std::span<const Complex> rotated_taps,
+    const Pn945WidebandChannelModel& model) {
+    const auto template_size = model.template_taps.size() / 2;
+    if (template_size == 0
+        || model.template_tap_mask.size() != template_size
+        || rotated_taps.size() < template_size) {
+        throw std::invalid_argument("wideband PN945 frame-tap model has invalid mask");
+    }
+    std::vector<Complex> taps(template_size);
+    for (std::size_t tap = 0; tap < template_size; ++tap) {
+        if (model.template_tap_mask[tap] != 0U) {
+            taps[tap] = rotated_taps[tap];
+        }
+    }
+    return taps;
+}
+
+[[nodiscard]] std::vector<Complex> masked_frame_taps_for_model_frame(
+    const Pn945WidebandChannelModel& model,
+    std::size_t model_frame_index) {
+    const auto template_size = model.template_taps.size() / 2;
+    if (template_size == 0
+        || (model_frame_index + 1) * template_size * 2 > model.frame_template_taps.size()) {
+        throw std::invalid_argument("wideband PN945 cached frame taps are missing");
+    }
+    std::vector<Complex> taps(template_size);
+    const auto base = model_frame_index * template_size * 2;
+    for (std::size_t tap = 0; tap < template_size; ++tap) {
+        taps[tap] = Complex{
+            model.frame_template_taps[base + tap * 2],
+            model.frame_template_taps[base + tap * 2 + 1],
+        };
+    }
+    return taps;
+}
+
 [[nodiscard]] std::vector<Complex> scaled_template_taps(
     const Pn945WidebandChannelModel& model,
     Complex scale) {
@@ -425,21 +562,20 @@ void dilate_linear_mask(std::vector<bool>& mask, std::size_t guard_taps) {
         header,
         header_phase,
         kPn945CoreSymbols,
-        regularization);
+        regularization,
+        model.header_observation);
     const auto rotated = rotate_left(raw_taps, model.rotation_symbols);
-    const auto template_size = model.template_taps.size() / 2;
-    if (template_size == 0 || model.dominant_tap_index >= template_size) {
-        throw std::invalid_argument("wideband PN945 model has invalid template taps");
+    if (uses_masked_frame_taps(model.scale_estimator)) {
+        scale = Complex{1.0F, 0.0F};
+        auto result = masked_frame_taps_from_rotated_taps(rotated, model);
+        pn_phase = (header_phase + kPn945CoreSymbols - model.rotation_symbols)
+            % kPn945CoreSymbols;
+        return result;
     }
-    const auto anchor = rotated[model.dominant_tap_index];
-    const auto reference = Complex{
-        model.template_taps[model.dominant_tap_index * 2],
-        model.template_taps[model.dominant_tap_index * 2 + 1],
-    };
-    scale = bounded_wideband_response_scale(
-        anchor,
-        reference,
-        model.per_frame_noise_tap_power);
+    scale = wideband_response_scale_for_rotated_taps(
+        rotated,
+        model,
+        model.scale_estimator);
     auto result = scaled_template_taps(model, scale);
     pn_phase = (header_phase + kPn945CoreSymbols - model.rotation_symbols)
         % kPn945CoreSymbols;
@@ -474,38 +610,76 @@ void dilate_linear_mask(std::vector<bool>& mask, std::size_t guard_taps) {
     return sum;
 }
 
-void restore_and_equalize(
+[[nodiscard]] std::vector<Complex> midpoint_taps(
+    std::span<const Complex> current_taps,
+    std::span<const Complex> next_taps) {
+    if (current_taps.size() != next_taps.size()) {
+        throw std::invalid_argument("PN945 midpoint tap spans must match");
+    }
+    std::vector<Complex> result(current_taps.size());
+    for (std::size_t tap = 0; tap < result.size(); ++tap) {
+        result[tap] = 0.5F * (current_taps[tap] + next_taps[tap]);
+    }
+    return result;
+}
+
+void restore_and_equalize_transition(
     std::span<const float> interleaved_time_body,
     std::span<const float> interleaved_next_header,
     std::span<float> interleaved_equalized_spectrum,
     std::size_t phase,
     std::size_t next_phase,
-    std::span<const Complex> taps,
+    std::span<const Complex> current_taps,
+    std::span<const Complex> next_taps,
+    std::span<const Complex> body_taps,
     float response_floor,
     float noise_variance,
-    int response_window_offset) {
-    std::vector<float> restored(interleaved_time_body.begin(), interleaved_time_body.end());
+    int response_window_offset,
+    bool mmse_unbias,
+    float mmse_unbias_gain_floor,
+    std::span<float> interleaved_channel_power) {
+    if (current_taps.empty() || next_taps.empty() || body_taps.empty()) {
+        throw std::invalid_argument("PN945 transition equalizer taps must not be empty");
+    }
+    if (!interleaved_channel_power.empty()
+        && interleaved_channel_power.size() < kC3780FrameBodySymbols * 2) {
+        throw std::invalid_argument("PN945 channel-power output span is too small");
+    }
+    if (mmse_unbias
+        && (!std::isfinite(mmse_unbias_gain_floor)
+            || mmse_unbias_gain_floor <= 0.0F
+            || mmse_unbias_gain_floor > 1.0F)) {
+        throw std::invalid_argument("PN945 MMSE unbias gain floor must be in (0,1]");
+    }
+    thread_local std::vector<float> restored;
+    restored.assign(interleaved_time_body.begin(), interleaved_time_body.end());
     const auto tail_length = std::min<std::size_t>(
-        taps.size() - 1,
+        std::max(current_taps.size(), next_taps.size()) - 1,
         kC3780FrameBodySymbols);
     for (std::size_t sample = 0; sample < tail_length; ++sample) {
         auto body = Complex{restored[sample * 2], restored[sample * 2 + 1]};
-        body -= convolved_pn_header_sample(phase, taps, kPn945HeaderSymbols + sample);
+        body -= convolved_pn_header_sample(
+            phase,
+            current_taps,
+            kPn945HeaderSymbols + sample);
         const auto observed_next = Complex{
             interleaved_next_header[sample * 2],
             interleaved_next_header[sample * 2 + 1],
         };
-        body += observed_next - convolved_pn_header_sample(next_phase, taps, sample);
+        body += observed_next
+            - convolved_pn_header_sample(next_phase, next_taps, sample);
         restored[sample * 2] = body.real();
         restored[sample * 2 + 1] = body.imag();
     }
 
-    std::vector<float> padded_taps(kC3780FrameBodySymbols * 2, 0.0F);
-    std::vector<float> response(kC3780FrameBodySymbols * 2);
+    thread_local std::vector<float> padded_taps;
+    thread_local std::vector<float> response;
+    padded_taps.assign(kC3780FrameBodySymbols * 2, 0.0F);
+    response.resize(kC3780FrameBodySymbols * 2);
     mixed_radix_fft_forward_cf32(restored, interleaved_equalized_spectrum);
-    for (std::size_t tap = 0; tap < taps.size(); ++tap) {
-        padded_taps[tap * 2] = taps[tap].real();
-        padded_taps[tap * 2 + 1] = taps[tap].imag();
+    for (std::size_t tap = 0; tap < body_taps.size(); ++tap) {
+        padded_taps[tap * 2] = body_taps[tap].real();
+        padded_taps[tap * 2 + 1] = body_taps[tap].imag();
     }
     mixed_radix_fft_forward_cf32(padded_taps, response);
     for (std::size_t bin = 0; bin < kC3780FrameBodySymbols; ++bin) {
@@ -521,10 +695,19 @@ void restore_and_equalize(
                 / static_cast<float>(kC3780FrameBodySymbols);
             channel *= Complex{std::cos(angle), std::sin(angle)};
         }
+        const auto channel_power = std::norm(channel);
+        if (!interleaved_channel_power.empty()) {
+            interleaved_channel_power[bin * 2] = channel_power;
+            interleaved_channel_power[bin * 2 + 1] = 0.0F;
+        }
         Complex equalized;
         if (noise_variance >= 0.0F) {
             equalized = value * std::conj(channel)
-                / (std::norm(channel) + noise_variance);
+                / (channel_power + noise_variance);
+            if (mmse_unbias) {
+                const auto gain = channel_power / (channel_power + noise_variance);
+                equalized /= std::max(gain, mmse_unbias_gain_floor);
+            }
         } else {
             equalized = std::abs(channel) >= response_floor
                 ? value / channel
@@ -533,6 +716,36 @@ void restore_and_equalize(
         interleaved_equalized_spectrum[bin * 2] = equalized.real();
         interleaved_equalized_spectrum[bin * 2 + 1] = equalized.imag();
     }
+}
+
+void restore_and_equalize(
+    std::span<const float> interleaved_time_body,
+    std::span<const float> interleaved_next_header,
+    std::span<float> interleaved_equalized_spectrum,
+    std::size_t phase,
+    std::size_t next_phase,
+    std::span<const Complex> taps,
+    float response_floor,
+    float noise_variance,
+    int response_window_offset,
+    bool mmse_unbias,
+    float mmse_unbias_gain_floor,
+    std::span<float> interleaved_channel_power) {
+    restore_and_equalize_transition(
+        interleaved_time_body,
+        interleaved_next_header,
+        interleaved_equalized_spectrum,
+        phase,
+        next_phase,
+        taps,
+        taps,
+        taps,
+        response_floor,
+        noise_variance,
+        response_window_offset,
+        mmse_unbias,
+        mmse_unbias_gain_floor,
+        interleaved_channel_power);
 }
 
 void restore_and_equalize_with_template_response(
@@ -546,11 +759,25 @@ void restore_and_equalize_with_template_response(
     Complex response_scale,
     float response_floor,
     float noise_variance,
-    int response_window_offset) {
+    int response_window_offset,
+    bool mmse_unbias,
+    float mmse_unbias_gain_floor,
+    std::span<float> interleaved_channel_power) {
     if (template_response_fft.size() < kC3780FrameBodySymbols * 2) {
         throw std::invalid_argument("wideband PN945 template response FFT is too small");
     }
-    std::vector<float> restored(interleaved_time_body.begin(), interleaved_time_body.end());
+    if (!interleaved_channel_power.empty()
+        && interleaved_channel_power.size() < kC3780FrameBodySymbols * 2) {
+        throw std::invalid_argument("PN945 channel-power output span is too small");
+    }
+    if (mmse_unbias
+        && (!std::isfinite(mmse_unbias_gain_floor)
+            || mmse_unbias_gain_floor <= 0.0F
+            || mmse_unbias_gain_floor > 1.0F)) {
+        throw std::invalid_argument("PN945 MMSE unbias gain floor must be in (0,1]");
+    }
+    thread_local std::vector<float> restored;
+    restored.assign(interleaved_time_body.begin(), interleaved_time_body.end());
     const auto tail_length = std::min<std::size_t>(
         taps.size() - 1,
         kC3780FrameBodySymbols);
@@ -583,10 +810,19 @@ void restore_and_equalize_with_template_response(
                 / static_cast<float>(kC3780FrameBodySymbols);
             channel *= Complex{std::cos(angle), std::sin(angle)};
         }
+        const auto channel_power = std::norm(channel);
+        if (!interleaved_channel_power.empty()) {
+            interleaved_channel_power[bin * 2] = channel_power;
+            interleaved_channel_power[bin * 2 + 1] = 0.0F;
+        }
         Complex equalized;
         if (noise_variance >= 0.0F) {
             equalized = value * std::conj(channel)
-                / (std::norm(channel) + noise_variance);
+                / (channel_power + noise_variance);
+            if (mmse_unbias) {
+                const auto gain = channel_power / (channel_power + noise_variance);
+                equalized /= std::max(gain, mmse_unbias_gain_floor);
+            }
         } else {
             equalized = std::abs(channel) >= response_floor
                 ? value / channel
@@ -780,7 +1016,10 @@ Pn945EqualizeResult pn945_equalize_c3780_frame_cf32(
         taps,
         options.response_floor,
         options.noise_variance,
-        0);
+        0,
+        options.mmse_unbias,
+        options.mmse_unbias_gain_floor,
+        options.interleaved_channel_power);
     return Pn945EqualizeResult{phase, next_phase};
 }
 
@@ -803,7 +1042,9 @@ Pn945WidebandChannelModel build_pn945_wideband_channel_model_cf32(
     const auto frame_count = interleaved_headers.size() / header_stride;
     std::vector<std::size_t> phases(frame_count);
     std::vector<std::vector<Complex>> rows;
+    std::vector<std::vector<Complex>> structure_rows;
     rows.reserve(frame_count);
+    structure_rows.reserve(frame_count);
     std::array<std::size_t, kPn945CoreSymbols> phase_counts{};
     for (std::size_t frame = 0; frame < frame_count; ++frame) {
         const auto header = interleaved_headers.subspan(frame * header_stride, header_stride);
@@ -813,7 +1054,18 @@ Pn945WidebandChannelModel build_pn945_wideband_channel_model_cf32(
             header,
             phases[frame],
             kPn945CoreSymbols,
-            options.regularization));
+            options.regularization,
+            options.header_observation));
+        if (options.header_observation == Pn945HeaderObservation::core_only) {
+            structure_rows.push_back(rows.back());
+        } else {
+            structure_rows.push_back(estimate_channel_taps(
+                header,
+                phases[frame],
+                kPn945CoreSymbols,
+                options.regularization,
+                Pn945HeaderObservation::core_only));
+        }
     }
     const auto base_phase = static_cast<std::size_t>(
         std::distance(
@@ -821,7 +1073,7 @@ Pn945WidebandChannelModel build_pn945_wideband_channel_model_cf32(
             std::max_element(phase_counts.begin(), phase_counts.end())));
 
     std::vector<float> raw_power(kPn945CoreSymbols, 0.0F);
-    for (const auto& row : rows) {
+    for (const auto& row : structure_rows) {
         for (std::size_t tap = 0; tap < kPn945CoreSymbols; ++tap) {
             raw_power[tap] += std::norm(row[tap]) / static_cast<float>(frame_count);
         }
@@ -829,7 +1081,7 @@ Pn945WidebandChannelModel build_pn945_wideband_channel_model_cf32(
     const auto dominant_raw = static_cast<std::size_t>(
         std::distance(raw_power.begin(), std::max_element(raw_power.begin(), raw_power.end())));
     std::vector<Complex> mean_taps(kPn945CoreSymbols, Complex{0.0F, 0.0F});
-    for (const auto& row : rows) {
+    for (const auto& row : structure_rows) {
         const auto anchor = row[dominant_raw];
         const auto rotation = std::abs(anchor) > 0.0F
             ? std::conj(anchor) / std::abs(anchor)
@@ -872,7 +1124,7 @@ Pn945WidebandChannelModel build_pn945_wideband_channel_model_cf32(
     }
 
     std::vector<float> per_frame_noise_samples;
-    for (const auto& row : rows) {
+    for (const auto& row : structure_rows) {
         for (std::size_t tap = 0; tap < kPn945CoreSymbols; ++tap) {
             if (!mask[tap]) {
                 per_frame_noise_samples.push_back(std::norm(row[tap]));
@@ -892,7 +1144,21 @@ Pn945WidebandChannelModel build_pn945_wideband_channel_model_cf32(
         }
     }
     span = std::min(span, options.max_span_symbols);
+    if (options.header_observation == Pn945HeaderObservation::core_cyclic_safe_average) {
+        const auto safe_prefix_skip = std::min(span - 1, kPn945PrefixSymbols);
+        for (std::size_t frame = 0; frame < frame_count; ++frame) {
+            const auto header = interleaved_headers.subspan(frame * header_stride, header_stride);
+            rows[frame] = estimate_channel_taps(
+                header,
+                phases[frame],
+                kPn945CoreSymbols,
+                options.regularization,
+                options.header_observation,
+                safe_prefix_skip);
+        }
+    }
     std::vector<float> template_taps(span * 2, 0.0F);
+    std::vector<std::uint8_t> template_tap_mask(span, 0U);
     std::size_t significant_taps = 0;
     float kept_energy = 0.0F;
     float dropped_energy = 0.0F;
@@ -903,6 +1169,7 @@ Pn945WidebandChannelModel build_pn945_wideband_channel_model_cf32(
         if (tap < span) {
             template_taps[tap * 2] = rotated_taps[tap].real();
             template_taps[tap * 2 + 1] = rotated_taps[tap].imag();
+            template_tap_mask[tap] = 1U;
             kept_energy += std::norm(rotated_taps[tap]);
             ++significant_taps;
         } else {
@@ -928,6 +1195,10 @@ Pn945WidebandChannelModel build_pn945_wideband_channel_model_cf32(
 
     std::vector<std::size_t> frame_pn_phases(frame_count);
     std::vector<float> frame_response_scales(frame_count * 2);
+    std::vector<float> frame_template_taps;
+    if (uses_masked_frame_taps(options.scale_estimator)) {
+        frame_template_taps.assign(frame_count * span * 2, 0.0F);
+    }
     const auto reference = Complex{
         template_taps[dominant_tap * 2],
         template_taps[dominant_tap * 2 + 1],
@@ -935,11 +1206,76 @@ Pn945WidebandChannelModel build_pn945_wideband_channel_model_cf32(
     for (std::size_t frame = 0; frame < frame_count; ++frame) {
         frame_pn_phases[frame] =
             (phases[frame] + kPn945CoreSymbols - rotation) % kPn945CoreSymbols;
-        const auto anchor = rows[frame][(dominant_tap + rotation) % kPn945CoreSymbols];
-        const auto scale = bounded_wideband_response_scale(
-            anchor,
-            reference,
-            per_frame_noise);
+        Complex scale{1.0F, 0.0F};
+        if (uses_masked_frame_taps(options.scale_estimator)) {
+            Complex cross_sum{0.0F, 0.0F};
+            float reference_power_sum = 0.0F;
+            float observed_power_sum = 0.0F;
+            std::size_t tap_count = 0;
+            for (std::size_t tap = 0; tap < span; ++tap) {
+                if (template_tap_mask[tap] == 0U) {
+                    continue;
+                }
+                const auto observed =
+                    rows[frame][(tap + rotation) % kPn945CoreSymbols];
+                const auto base = (frame * span + tap) * 2;
+                frame_template_taps[base] = observed.real();
+                frame_template_taps[base + 1] = observed.imag();
+                const auto reference = Complex{
+                    template_taps[tap * 2],
+                    template_taps[tap * 2 + 1],
+                };
+                const auto reference_power = std::norm(reference);
+                if (reference_power <= 0.0F) {
+                    continue;
+                }
+                cross_sum += observed * std::conj(reference);
+                reference_power_sum += reference_power;
+                observed_power_sum += std::norm(observed);
+                ++tap_count;
+            }
+            scale = bounded_wideband_response_scale_from_sums(
+                cross_sum,
+                reference_power_sum,
+                observed_power_sum,
+                tap_count,
+                per_frame_noise);
+        } else if (options.scale_estimator
+            == Pn945WidebandScaleEstimator::least_squares_template) {
+            Complex cross_sum{0.0F, 0.0F};
+            float reference_power_sum = 0.0F;
+            float observed_power_sum = 0.0F;
+            std::size_t tap_count = 0;
+            for (std::size_t tap = 0; tap < span; ++tap) {
+                const auto template_tap = Complex{
+                    template_taps[tap * 2],
+                    template_taps[tap * 2 + 1],
+                };
+                const auto template_power = std::norm(template_tap);
+                if (template_power <= 0.0F) {
+                    continue;
+                }
+                const auto observed =
+                    rows[frame][(tap + rotation) % kPn945CoreSymbols];
+                cross_sum += observed * std::conj(template_tap);
+                reference_power_sum += template_power;
+                observed_power_sum += std::norm(observed);
+                ++tap_count;
+            }
+            scale = bounded_wideband_response_scale_from_sums(
+                cross_sum,
+                reference_power_sum,
+                observed_power_sum,
+                tap_count,
+                per_frame_noise);
+        } else {
+            const auto anchor =
+                rows[frame][(dominant_tap + rotation) % kPn945CoreSymbols];
+            scale = bounded_wideband_response_scale(
+                anchor,
+                reference,
+                per_frame_noise);
+        }
         frame_response_scales[frame * 2] = scale.real();
         frame_response_scales[frame * 2 + 1] = scale.imag();
     }
@@ -949,8 +1285,10 @@ Pn945WidebandChannelModel build_pn945_wideband_channel_model_cf32(
         rotation,
         std::move(template_taps),
         std::move(template_response_fft),
+        std::move(template_tap_mask),
         std::move(frame_pn_phases),
         std::move(frame_response_scales),
+        std::move(frame_template_taps),
         significant_taps,
         dominant_tap,
         frame_count,
@@ -960,6 +1298,8 @@ Pn945WidebandChannelModel build_pn945_wideband_channel_model_cf32(
         (kept_energy + dropped_energy) > 0.0F
             ? dropped_energy / (kept_energy + dropped_energy)
             : 0.0F,
+        options.scale_estimator,
+        options.header_observation,
     };
 }
 
@@ -989,12 +1329,57 @@ Pn945EqualizeResult pn945_equalize_c3780_frame_wideband_cf32(
         options.regularization,
         phase,
         response_scale);
-    const auto next_phase = wideband_pn_phase_only(
-        interleaved_next_header,
-        model);
+    std::size_t next_phase = 0;
+    Complex next_response_scale{1.0F, 0.0F};
+    std::vector<Complex> next_taps;
+    if (options.interpolate_body_channel) {
+        next_taps = instantiate_wideband_taps(
+            interleaved_next_header,
+            model,
+            options.regularization,
+            next_phase,
+            next_response_scale);
+    } else {
+        next_phase = wideband_pn_phase_only(interleaved_next_header, model);
+    }
     auto signed_rotation = static_cast<int>(model.rotation_symbols);
     if (signed_rotation > static_cast<int>(kPn945CoreSymbols / 2)) {
         signed_rotation -= static_cast<int>(kPn945CoreSymbols);
+    }
+    if (options.interpolate_body_channel) {
+        const auto body_taps = midpoint_taps(taps, next_taps);
+        restore_and_equalize_transition(
+            interleaved_time_body,
+            interleaved_next_header,
+            interleaved_equalized_spectrum,
+            phase,
+            next_phase,
+            taps,
+            next_taps,
+            body_taps,
+            options.response_floor,
+            options.noise_variance,
+            -signed_rotation + options.response_window_offset_adjust,
+            options.mmse_unbias,
+            options.mmse_unbias_gain_floor,
+            options.interleaved_channel_power);
+        return Pn945EqualizeResult{phase, next_phase};
+    }
+    if (uses_masked_frame_taps(model.scale_estimator)) {
+        restore_and_equalize(
+            interleaved_time_body,
+            interleaved_next_header,
+            interleaved_equalized_spectrum,
+            phase,
+            next_phase,
+            taps,
+            options.response_floor,
+            options.noise_variance,
+            -signed_rotation + options.response_window_offset_adjust,
+            options.mmse_unbias,
+            options.mmse_unbias_gain_floor,
+            options.interleaved_channel_power);
+        return Pn945EqualizeResult{phase, next_phase};
     }
     restore_and_equalize_with_template_response(
         interleaved_time_body,
@@ -1007,7 +1392,10 @@ Pn945EqualizeResult pn945_equalize_c3780_frame_wideband_cf32(
         response_scale,
         options.response_floor,
         options.noise_variance,
-        -signed_rotation);
+        -signed_rotation + options.response_window_offset_adjust,
+        options.mmse_unbias,
+        options.mmse_unbias_gain_floor,
+        options.interleaved_channel_power);
     return Pn945EqualizeResult{phase, next_phase};
 }
 
@@ -1041,10 +1429,54 @@ Pn945EqualizeResult pn945_equalize_c3780_frame_wideband_cached_cf32(
         model.frame_response_scales[model_frame_index * 2],
         model.frame_response_scales[model_frame_index * 2 + 1],
     };
-    const auto taps = scaled_template_taps(model, response_scale);
+    const auto taps = uses_masked_frame_taps(model.scale_estimator)
+        ? masked_frame_taps_for_model_frame(model, model_frame_index)
+        : scaled_template_taps(model, response_scale);
     auto signed_rotation = static_cast<int>(model.rotation_symbols);
     if (signed_rotation > static_cast<int>(kPn945CoreSymbols / 2)) {
         signed_rotation -= static_cast<int>(kPn945CoreSymbols);
+    }
+    if (options.interpolate_body_channel) {
+        const auto next_response_scale = Complex{
+            model.frame_response_scales[(model_frame_index + 1) * 2],
+            model.frame_response_scales[(model_frame_index + 1) * 2 + 1],
+        };
+        const auto next_taps = uses_masked_frame_taps(model.scale_estimator)
+            ? masked_frame_taps_for_model_frame(model, model_frame_index + 1)
+            : scaled_template_taps(model, next_response_scale);
+        const auto body_taps = midpoint_taps(taps, next_taps);
+        restore_and_equalize_transition(
+            interleaved_time_body,
+            interleaved_next_header,
+            interleaved_equalized_spectrum,
+            phase,
+            next_phase,
+            taps,
+            next_taps,
+            body_taps,
+            options.response_floor,
+            options.noise_variance,
+            -signed_rotation + options.response_window_offset_adjust,
+            options.mmse_unbias,
+            options.mmse_unbias_gain_floor,
+            options.interleaved_channel_power);
+        return Pn945EqualizeResult{phase, next_phase};
+    }
+    if (uses_masked_frame_taps(model.scale_estimator)) {
+        restore_and_equalize(
+            interleaved_time_body,
+            interleaved_next_header,
+            interleaved_equalized_spectrum,
+            phase,
+            next_phase,
+            taps,
+            options.response_floor,
+            options.noise_variance,
+            -signed_rotation + options.response_window_offset_adjust,
+            options.mmse_unbias,
+            options.mmse_unbias_gain_floor,
+            options.interleaved_channel_power);
+        return Pn945EqualizeResult{phase, next_phase};
     }
     restore_and_equalize_with_template_response(
         interleaved_time_body,
@@ -1057,7 +1489,10 @@ Pn945EqualizeResult pn945_equalize_c3780_frame_wideband_cached_cf32(
         response_scale,
         options.response_floor,
         options.noise_variance,
-        -signed_rotation);
+        -signed_rotation + options.response_window_offset_adjust,
+        options.mmse_unbias,
+        options.mmse_unbias_gain_floor,
+        options.interleaved_channel_power);
     return Pn945EqualizeResult{phase, next_phase};
 }
 

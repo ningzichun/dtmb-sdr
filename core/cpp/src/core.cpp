@@ -155,10 +155,42 @@ constexpr std::array<std::array<std::uint8_t, 3>, 8> kQam64AxisBits{{
     return (min_one - min_zero) / noise_variance;
 }
 
+[[nodiscard]] double log_sum_exp4(const std::array<double, 4>& values) noexcept {
+    const auto max_value = *std::max_element(values.begin(), values.end());
+    auto scaled_sum = 0.0;
+    for (const auto value : values) {
+        scaled_sum += std::exp(value - max_value);
+    }
+    return max_value + std::log(scaled_sum);
+}
+
+[[nodiscard]] float axis_llr_exact(
+    float value,
+    std::size_t bit_index,
+    float noise_variance) noexcept {
+    std::array<double, 4> zero_metrics{};
+    std::array<double, 4> one_metrics{};
+    std::size_t zero_count = 0;
+    std::size_t one_count = 0;
+
+    for (std::size_t index = 0; index < kQam64Levels.size(); ++index) {
+        const auto delta = static_cast<double>(value) - static_cast<double>(kQam64Levels[index]);
+        const auto metric = -(delta * delta) / static_cast<double>(noise_variance);
+        if (kQam64AxisBits[index][bit_index] == 0) {
+            zero_metrics[zero_count++] = metric;
+        } else {
+            one_metrics[one_count++] = metric;
+        }
+    }
+
+    return static_cast<float>(log_sum_exp4(zero_metrics) - log_sum_exp4(one_metrics));
+}
+
 void qam64_soft_demodulate_range(
     std::span<const float> interleaved_symbols,
     std::span<float> output_llr,
     float noise_variance,
+    QamSoftDemapMethod method,
     std::size_t first_symbol,
     std::size_t last_symbol) {
     for (std::size_t symbol = first_symbol; symbol < last_symbol; ++symbol) {
@@ -166,8 +198,13 @@ void qam64_soft_demodulate_range(
         const auto imag = interleaved_symbols[symbol * 2 + 1];
         auto* out = output_llr.data() + symbol * 6;
         for (std::size_t bit = 0; bit < 3; ++bit) {
-            out[bit] = axis_llr(real, bit, noise_variance);
-            out[3 + bit] = axis_llr(imag, bit, noise_variance);
+            if (method == QamSoftDemapMethod::log_sum_exp) {
+                out[bit] = axis_llr_exact(real, bit, noise_variance);
+                out[3 + bit] = axis_llr_exact(imag, bit, noise_variance);
+            } else {
+                out[bit] = axis_llr(real, bit, noise_variance);
+                out[3 + bit] = axis_llr(imag, bit, noise_variance);
+            }
         }
     }
 }
@@ -355,6 +392,7 @@ void qam64_soft_demodulate_cf32(
             interleaved_symbols,
             output_llr,
             options.noise_variance,
+            options.method,
             0,
             symbol_count);
         return;
@@ -370,6 +408,7 @@ void qam64_soft_demodulate_cf32(
                 interleaved_symbols,
                 output_llr,
                 options.noise_variance,
+                options.method,
                 first,
                 last);
         });

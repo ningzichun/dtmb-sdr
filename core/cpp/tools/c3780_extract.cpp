@@ -14,7 +14,9 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numbers>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <string>
@@ -28,6 +30,7 @@ namespace {
 enum class Normalization {
     system_info,
     qam64,
+    qam64_amplitude,
     none,
 };
 
@@ -52,16 +55,108 @@ struct SourceCarrierResidualRule {
     std::size_t last_frame = 0;
 };
 
+using SourceCarrierChannelRule = SourceCarrierResidualRule;
+
+constexpr std::size_t kPn945CoreSymbols = 511;
+
+constexpr std::array<std::size_t, dtmb::core::kC3780SystemInfoSymbols>
+    kC3780SystemInfoPositions{
+        0, 140, 279, 419, 420, 560, 699, 839, 840, 980, 1119, 1259,
+        1260, 1400, 1539, 1679, 1680, 1820, 1959, 2099, 2100, 2240,
+        2379, 2519, 2520, 2660, 2799, 2939, 2940, 3080, 3219, 3359,
+        3360, 3500, 3639, 3779,
+    };
+
+struct DataDecisionDirectedOptions {
+    bool enabled = false;
+    float max_relative_error = 0.55F;
+    std::size_t min_reliable_carriers = dtmb::core::kC3780DataSymbols / 2;
+    float max_axis_inner_fraction = 0.60F;
+    float max_hard_bit_bias = 0.0F;
+};
+
+enum class DataDecisionDirectedRejectReason {
+    none,
+    reliable_carriers,
+    axis_inner_fraction,
+    hard_bit_bias,
+};
+
+struct DataDecisionDirectedStats {
+    mutable std::mutex mutex;
+    std::size_t observed_frames = 0;
+    std::size_t refined_frames = 0;
+    std::size_t rejected_frames = 0;
+    std::size_t reliable_carrier_rejected_frames = 0;
+    std::size_t axis_inner_rejected_frames = 0;
+    std::size_t hard_bit_bias_rejected_frames = 0;
+    std::size_t min_reliable_carriers = std::numeric_limits<std::size_t>::max();
+    std::size_t max_reliable_carriers = 0;
+    std::uint64_t reliable_carrier_sum = 0;
+
+    void observe(
+        std::size_t reliable_carriers,
+        bool refined,
+        DataDecisionDirectedRejectReason reason =
+            DataDecisionDirectedRejectReason::none) {
+        const auto lock = std::lock_guard<std::mutex>{mutex};
+        ++observed_frames;
+        if (refined) {
+            ++refined_frames;
+        } else {
+            ++rejected_frames;
+            if (reason == DataDecisionDirectedRejectReason::reliable_carriers) {
+                ++reliable_carrier_rejected_frames;
+            } else if (reason
+                == DataDecisionDirectedRejectReason::axis_inner_fraction) {
+                ++axis_inner_rejected_frames;
+            } else if (reason == DataDecisionDirectedRejectReason::hard_bit_bias) {
+                ++hard_bit_bias_rejected_frames;
+            }
+        }
+        min_reliable_carriers = std::min(min_reliable_carriers, reliable_carriers);
+        max_reliable_carriers = std::max(max_reliable_carriers, reliable_carriers);
+        reliable_carrier_sum += reliable_carriers;
+    }
+
+    [[nodiscard]] double mean_reliable_carriers() const noexcept {
+        const auto lock = std::lock_guard<std::mutex>{mutex};
+        return observed_frames == 0
+            ? 0.0
+            : static_cast<double>(reliable_carrier_sum)
+                / static_cast<double>(observed_frames);
+    }
+};
+
 struct Qam64ResidualPoint {
     float observed_real = 0.0F;
     float observed_imag = 0.0F;
     float decision_real = 0.0F;
     float decision_imag = 0.0F;
+    std::size_t decision_real_index = 0;
+    std::size_t decision_imag_index = 0;
     float residual_real = 0.0F;
     float residual_imag = 0.0F;
     float residual_abs = 0.0F;
     float decision_abs = 0.0F;
     float observed_abs = 0.0F;
+};
+
+Qam64ResidualPoint qam64_residual_point(float observed_real, float observed_imag);
+
+struct ComplexGainEstimate {
+    std::complex<float> gain{1.0F, 0.0F};
+    float coherence = 0.0F;
+    bool valid = false;
+};
+
+struct FrameNormalizationStats {
+    ComplexGainEstimate qam_gain;
+    ComplexGainEstimate system_info_gain;
+    float qam_residual_ratio = 0.0F;
+    float qam_minus_system_info_phase_rad = 0.0F;
+    float qam_minus_system_info_phase_mod_pi_over_2_rad = 0.0F;
+    int qam_minus_system_info_quadrant = 0;
 };
 
 struct FrameWork {
@@ -72,7 +167,10 @@ struct FrameWork {
           body_cf32(dtmb::core::kC3780FrameBodySymbols * 2),
           spectrum_cf32(dtmb::core::kC3780FrameBodySymbols * 2),
           logical_cf32(dtmb::core::kC3780FrameBodySymbols * 2),
-          data_cf32(dtmb::core::kC3780DataSymbols * 2) {}
+          data_cf32(dtmb::core::kC3780DataSymbols * 2),
+          channel_power_spectrum_cf32(dtmb::core::kC3780FrameBodySymbols * 2),
+          channel_power_logical_cf32(dtmb::core::kC3780FrameBodySymbols * 2),
+          csi_weights(dtmb::core::kC3780DataSymbols) {}
 
     std::vector<std::int8_t> header_ci8;
     std::vector<std::int8_t> body_ci8;
@@ -81,8 +179,14 @@ struct FrameWork {
     std::vector<float> spectrum_cf32;
     std::vector<float> logical_cf32;
     std::vector<float> data_cf32;
+    std::vector<float> channel_power_spectrum_cf32;
+    std::vector<float> channel_power_logical_cf32;
+    std::vector<float> csi_weights;
+    FrameNormalizationStats normalization_stats;
     std::size_t sample_start = 0;
 };
+
+void prepare_csi_weights(FrameWork& frame);
 
 struct TimingTrackerStats {
     bool enabled = false;
@@ -101,6 +205,9 @@ struct TimingTrackerStats {
     float last_best_metric = 0.0F;
     std::size_t trajectory_interval_frames = 0;
     std::size_t trajectory_fit_points = 0;
+    std::size_t trajectory_seed_points = 0;
+    std::size_t trajectory_frame_index_offset = 0;
+    double trajectory_offset_origin_samples = 0.0;
     std::size_t trajectory_reacquisitions = 0;
     std::size_t trajectory_accepted_points = 0;
     std::size_t trajectory_low_metric_fallbacks = 0;
@@ -120,6 +227,7 @@ struct TimingTrackerStats {
     float trajectory_local_max_improvement = 0.0F;
     std::size_t trajectory_shadow_searches = 0;
     std::size_t trajectory_shadow_hits = 0;
+    std::size_t trajectory_shadow_reanchors = 0;
     std::size_t trajectory_scheduled_slips = 0;
     std::int64_t trajectory_min_offset = 0;
     std::int64_t trajectory_max_offset = 0;
@@ -135,9 +243,32 @@ struct TimingTrackerStats {
     float trajectory_last_metric = 0.0F;
 };
 
+struct TimingTrajectorySeedPoint {
+    double frame_index = 0.0;
+    double offset_samples = 0.0;
+};
+
+struct TimingTrajectorySeedState {
+    std::vector<TimingTrajectorySeedPoint> points;
+    std::optional<std::size_t> frame_index_offset;
+    std::optional<double> offset_origin_samples;
+};
+
+struct TimingLocalSearchScopedMinImprovementRule {
+    std::size_t first_frame = 0;
+    std::size_t last_frame = 0;
+    float min_improvement = 0.0F;
+};
+
+struct TimingLocalSearchTransientRange {
+    std::size_t first_frame = 0;
+    std::size_t last_frame = 0;
+};
+
 struct TimingShadowResult {
     bool available = false;
     bool hit = false;
+    std::size_t selected_start = 0;
     std::int64_t delta_samples = 0;
     float metric = 0.0F;
 };
@@ -360,21 +491,48 @@ void usage(const char* program) {
         << " [--timing-trajectory-interval-frames N]"
         << " [--timing-trajectory-fit-points N]"
         << " [--timing-trajectory-max-innovation-samples X]"
+        << " [--timing-trajectory-seed PATH]"
+        << " [--timing-trajectory-frame-index-offset N]"
+        << " [--timing-trajectory-offset-origin-samples X]"
+        << " [--timing-trajectory-state-out PATH]"
+        << " [--timing-trajectory-state-out-frame N]"
         << " [--timing-trajectory-local-search]"
         << " [--timing-trajectory-local-search-min-improvement X]"
+        << " [--timing-trajectory-local-search-scoped-min-improvement FIRST:LAST:X]"
+        << " [--timing-trajectory-local-search-transient]"
+        << " [--timing-trajectory-local-search-transient-range FIRST:LAST]"
         << " [--timing-diagnostics PATH]"
         << " [--no-residual-cfo]"
         << " [--frequency-shift-hz X]"
         << " [--workers N] [--batch-frames N]"
         << " [--equalizer flat|pn] [--pn-estimator compact|wideband]"
         << " [--pn-channel-taps N] [--pn-wideband-block-frames N]"
+        << " [--pn-wideband-header-observation core|core-postfix|core-cyclic-safe]"
+        << " [--pn-wideband-scale-estimator dominant|least-squares|masked-frame-taps]"
+        << " [--pn-wideband-max-span-symbols N]"
+        << " [--pn-wideband-response-window-offset-adjust N]"
+        << " [--pn-wideband-body-channel current|midpoint]"
+        << " [--pn-csi-demap] [--pn-csi-weights-out PATH]"
         << " [--pn-wideband-diagnostics PATH]"
+        << " [--pn-wideband-frame-diagnostics PATH]"
         << " [--frame-residual-diagnostics PATH]"
+        << " [--normalization-diagnostics PATH]"
         << " [--source-carrier-residual CARRIER:FIRST:LAST]"
         << " [--source-carrier-residual-diagnostics-out PATH]"
+        << " [--source-carrier-channel CARRIER:FIRST:LAST]"
+        << " [--source-carrier-channel-diagnostics-out PATH]"
         << " [--pn-mmse off|auto|X]"
         << " [--remove-dc]"
-        << " [--normalization system-info|qam64|none] [--system-info-index N]"
+        << " [--normalization system-info|qam64|qam64-amplitude|none]"
+        << " [--system-info-index N|auto]"
+        << " [--system-info-auto-observation-frames N]"
+        << " [--system-info-auto-min-metric X]"
+        << " [--system-info-auto-min-margin X]"
+        << " [--data-dd-refine]"
+        << " [--data-dd-max-relative-error X]"
+        << " [--data-dd-min-reliable-carriers N]"
+        << " [--data-dd-max-axis-inner-fraction X]"
+        << " [--data-dd-max-hard-bit-bias X]"
         << " [input.ci8|-] [output.cf32|-]\n";
 }
 
@@ -403,6 +561,101 @@ float parse_float(const std::string& text, const char* field) {
         throw std::invalid_argument(std::string("invalid ") + field + ": " + text);
     }
     return value;
+}
+
+double parse_double(const std::string& text, const char* field) {
+    std::size_t parsed = 0;
+    const auto value = std::stod(text, &parsed);
+    if (parsed != text.size() || !std::isfinite(value)) {
+        throw std::invalid_argument(std::string("invalid ") + field + ": " + text);
+    }
+    return value;
+}
+
+TimingTrajectorySeedState load_timing_trajectory_seed(
+    const std::string& path) {
+    if (path.empty()) {
+        return {};
+    }
+    std::ifstream input(path);
+    if (!input) {
+        throw std::runtime_error("failed to open timing trajectory seed: " + path);
+    }
+    std::string line;
+    if (!std::getline(input, line)) {
+        throw std::invalid_argument("timing trajectory seed is empty: " + path);
+    }
+    if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+    }
+    auto state = TimingTrajectorySeedState{};
+    constexpr auto frame_offset_prefix = std::string_view("frame_index_offset,");
+    if (line.starts_with(frame_offset_prefix)) {
+        state.frame_index_offset = parse_size(
+            line.substr(frame_offset_prefix.size()),
+            "timing trajectory seed frame index offset");
+        if (!std::getline(input, line)) {
+            throw std::invalid_argument(
+                "timing trajectory seed is missing offset origin: " + path);
+        }
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        constexpr auto offset_origin_prefix =
+            std::string_view("offset_origin_samples,");
+        if (!line.starts_with(offset_origin_prefix)) {
+            throw std::invalid_argument(
+                "timing trajectory seed is missing offset_origin_samples: " + path);
+        }
+        state.offset_origin_samples = parse_double(
+            line.substr(offset_origin_prefix.size()),
+            "timing trajectory seed offset origin");
+        if (!std::getline(input, line)) {
+            throw std::invalid_argument(
+                "timing trajectory seed is missing point header: " + path);
+        }
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+    }
+    if (line != "frame_index,offset_samples") {
+        throw std::invalid_argument(
+            "timing trajectory seed header must be frame_index,offset_samples: "
+            + path);
+    }
+
+    std::size_t line_number = 1;
+    while (std::getline(input, line)) {
+        ++line_number;
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        if (line.empty()) {
+            continue;
+        }
+        const auto comma = line.find(',');
+        if (comma == std::string::npos || line.find(',', comma + 1U) != std::string::npos) {
+            throw std::invalid_argument(
+                "invalid timing trajectory seed row " + std::to_string(line_number)
+                + ": " + line);
+        }
+        const auto frame_index = parse_double(
+            line.substr(0, comma),
+            "timing trajectory seed frame index");
+        const auto offset_samples = parse_double(
+            line.substr(comma + 1U),
+            "timing trajectory seed offset");
+        if (!state.points.empty()
+            && frame_index <= state.points.back().frame_index) {
+            throw std::invalid_argument(
+                "timing trajectory seed frame indices must be strictly increasing");
+        }
+        state.points.push_back(TimingTrajectorySeedPoint{frame_index, offset_samples});
+    }
+    if (state.points.empty()) {
+        throw std::invalid_argument("timing trajectory seed has no points: " + path);
+    }
+    return state;
 }
 
 std::istream& input_stream(
@@ -510,8 +763,18 @@ public:
         std::size_t trajectory_interval_frames,
         std::size_t trajectory_fit_points,
         double trajectory_max_innovation_samples,
+        std::vector<TimingTrajectorySeedPoint> trajectory_seed_points,
+        std::size_t trajectory_frame_index_offset,
+        double trajectory_offset_origin_samples,
+        std::string trajectory_state_out_path,
+        std::size_t trajectory_state_out_frame,
         bool trajectory_local_search,
         float trajectory_local_search_min_improvement,
+        std::vector<TimingLocalSearchScopedMinImprovementRule>
+            trajectory_local_search_scoped_min_improvements,
+        bool trajectory_local_search_transient,
+        std::vector<TimingLocalSearchTransientRange>
+            trajectory_local_search_transient_ranges,
         TimingDiagnostics* timing_diagnostics)
         : input_(input),
           buffer_start_sample_(phase_offset),
@@ -522,9 +785,18 @@ public:
           trajectory_interval_frames_(trajectory_interval_frames),
           trajectory_fit_points_(trajectory_fit_points),
           trajectory_max_innovation_samples_(trajectory_max_innovation_samples),
+          trajectory_frame_index_offset_(trajectory_frame_index_offset),
+          trajectory_offset_origin_samples_(trajectory_offset_origin_samples),
+          trajectory_state_out_path_(std::move(trajectory_state_out_path)),
+          trajectory_state_out_frame_(trajectory_state_out_frame),
           trajectory_local_search_(trajectory_local_search),
           trajectory_local_search_min_improvement_(
               trajectory_local_search_min_improvement),
+          trajectory_local_search_scoped_min_improvements_(
+              std::move(trajectory_local_search_scoped_min_improvements)),
+          trajectory_local_search_transient_(trajectory_local_search_transient),
+          trajectory_local_search_transient_ranges_(
+              std::move(trajectory_local_search_transient_ranges)),
           timing_diagnostics_(timing_diagnostics) {
         stats_.enabled = search_radius_ != 0 && trajectory_interval_frames_ == 0;
         stats_.trajectory_enabled = trajectory_interval_frames_ != 0;
@@ -532,7 +804,23 @@ public:
         stats_.hit_threshold = hit_threshold_;
         stats_.trajectory_interval_frames = trajectory_interval_frames_;
         stats_.trajectory_fit_points = trajectory_fit_points_;
+        stats_.trajectory_seed_points = trajectory_seed_points.size();
+        stats_.trajectory_frame_index_offset = trajectory_frame_index_offset_;
+        stats_.trajectory_offset_origin_samples = trajectory_offset_origin_samples_;
         stats_.trajectory_local_search_enabled = trajectory_local_search_;
+        trajectory_seeded_restart_ = !trajectory_seed_points.empty();
+        for (const auto& point : trajectory_seed_points) {
+            trajectory_points_.push_back(TrajectoryPoint{
+                point.frame_index,
+                point.offset_samples,
+            });
+        }
+        while (trajectory_points_.size() > trajectory_fit_points_) {
+            trajectory_points_.pop_front();
+        }
+        fit_trajectory();
+        stats_.trajectory_slope_samples_per_frame =
+            trajectory_slope_samples_per_frame_;
     }
 
     bool read(FrameWork& frame, std::size_t& trailing_ci8_bytes) {
@@ -660,7 +948,10 @@ private:
 
     [[nodiscard]] double trajectory_offset_at(std::size_t frame_index) const noexcept {
         return trajectory_intercept_samples_
-            + trajectory_slope_samples_per_frame_ * static_cast<double>(frame_index);
+            + trajectory_slope_samples_per_frame_
+                * (static_cast<double>(trajectory_frame_index_offset_)
+                   + static_cast<double>(frame_index))
+            - trajectory_offset_origin_samples_;
     }
 
     void fit_trajectory() {
@@ -699,8 +990,9 @@ private:
 
     void add_trajectory_point(std::size_t frame_index, std::int64_t offset_samples) {
         trajectory_points_.push_back(TrajectoryPoint{
-            static_cast<double>(frame_index),
-            static_cast<double>(offset_samples),
+            static_cast<double>(trajectory_frame_index_offset_)
+                + static_cast<double>(frame_index),
+            static_cast<double>(offset_samples) + trajectory_offset_origin_samples_,
         });
         while (trajectory_points_.size() > trajectory_fit_points_) {
             trajectory_points_.pop_front();
@@ -709,6 +1001,15 @@ private:
         stats_.trajectory_accepted_points += 1;
         stats_.trajectory_slope_samples_per_frame = trajectory_slope_samples_per_frame_;
         stats_.trajectory_last_observed_offset = static_cast<double>(offset_samples);
+    }
+
+    void reset_trajectory_at(std::size_t frame_index, std::size_t selected_start) {
+        const auto nominal_start = trajectory_nominal_start(frame_index);
+        const auto observed_offset = static_cast<std::int64_t>(selected_start)
+            - static_cast<std::int64_t>(nominal_start);
+        trajectory_points_.clear();
+        trajectory_local_offset_samples_ = 0;
+        add_trajectory_point(frame_index, observed_offset);
     }
 
     void record_trajectory_selection(std::size_t selected_start) {
@@ -769,6 +1070,7 @@ private:
         return TimingShadowResult{
             true,
             best_metric >= hit_threshold_,
+            best_start,
             delta,
             best_metric,
         };
@@ -782,8 +1084,15 @@ private:
         selected_start = apply_trajectory_offset(
             selected_start,
             static_cast<double>(trajectory_local_offset_samples_));
+        const auto seeded_restart = trajectory_seeded_restart_
+            && trajectory_frame_index_ == 0;
+        if (seeded_restart) {
+            selected_start = nominal_start;
+        }
         const auto predicted_start = selected_start;
-        auto event_name = std::string_view("trajectory_predicted");
+        auto event_name = seeded_restart
+            ? std::string_view("trajectory_seeded_restart")
+            : std::string_view("trajectory_predicted");
         auto metric = 0.0F;
         auto best_metric_for_event = 0.0F;
         auto predicted_metric = 0.0F;
@@ -794,8 +1103,11 @@ private:
         auto local_correction = false;
         auto local_delta = std::int64_t{0};
         auto shadow = TimingShadowResult{};
-        const auto reacquire =
-            (trajectory_frame_index_ % trajectory_interval_frames_) == 0;
+        const auto reacquire_phase =
+            (trajectory_frame_index_offset_ % trajectory_interval_frames_
+             + trajectory_frame_index_ % trajectory_interval_frames_)
+            % trajectory_interval_frames_;
+        const auto reacquire = !seeded_restart && reacquire_phase == 0;
         if (reacquire) {
             const auto search_min = selected_start > search_radius_
                 ? selected_start - search_radius_
@@ -865,6 +1177,14 @@ private:
                 low_metric_fallback = true;
                 event_name = std::string_view("trajectory_reacquire_low_metric");
                 shadow = record_trajectory_shadow_search(selected_start);
+                if (shadow.hit) {
+                    selected_start = shadow.selected_start;
+                    metric = shadow.metric;
+                    best_metric_for_event = shadow.metric;
+                    reset_trajectory_at(trajectory_frame_index_, selected_start);
+                    ++stats_.trajectory_shadow_reanchors;
+                    event_name = std::string_view("trajectory_shadow_reanchor");
+                }
             }
         } else if (trajectory_local_search_) {
             const auto predicted_start = selected_start;
@@ -927,7 +1247,9 @@ private:
                     std::string_view("trajectory_local_innovation_rejected");
             } else if (
                 delta != 0
-                && improvement < trajectory_local_search_min_improvement_) {
+                && improvement
+                    < trajectory_local_search_min_improvement_for(
+                        trajectory_frame_index_)) {
                 ++stats_.trajectory_local_improvement_rejections;
                 event_name =
                     std::string_view("trajectory_local_improvement_rejected");
@@ -935,9 +1257,15 @@ private:
                 ++stats_.trajectory_local_hits;
                 if (best_start != predicted_start) {
                     ++stats_.trajectory_local_corrections;
-                    trajectory_local_offset_samples_ += delta;
+                    const auto transient_correction =
+                        trajectory_local_search_transient_for(trajectory_frame_index_);
+                    if (!transient_correction) {
+                        trajectory_local_offset_samples_ += delta;
+                    }
                     local_correction = true;
-                    event_name = std::string_view("trajectory_local_correction");
+                    event_name = transient_correction
+                        ? std::string_view("trajectory_local_transient_correction")
+                        : std::string_view("trajectory_local_correction");
                 }
                 selected_start = best_start;
             }
@@ -985,6 +1313,10 @@ private:
             });
         }
         record_trajectory_selection(selected_start);
+        if (!trajectory_state_out_path_.empty()
+            && trajectory_frame_index_ == trajectory_state_out_frame_) {
+            write_trajectory_state(selected_start, nominal_start);
+        }
         ++trajectory_frame_index_;
 
         const auto next_nominal = trajectory_nominal_start(trajectory_frame_index_);
@@ -996,6 +1328,36 @@ private:
                            ? next_scheduled - retained_history
                            : 0);
         return true;
+    }
+
+    void write_trajectory_state(
+        std::size_t selected_start,
+        std::size_t nominal_start) {
+        std::ofstream output(trajectory_state_out_path_, std::ios::binary);
+        if (!output) {
+            throw std::runtime_error(
+                "failed to open timing trajectory state output: "
+                + trajectory_state_out_path_);
+        }
+        const auto global_frame_index = trajectory_frame_index_offset_
+            + trajectory_frame_index_;
+        const auto local_selected_offset = static_cast<std::int64_t>(selected_start)
+            - static_cast<std::int64_t>(nominal_start);
+        const auto global_offset_origin =
+            static_cast<double>(local_selected_offset)
+            + trajectory_offset_origin_samples_;
+        output << "frame_index_offset," << global_frame_index << '\n'
+               << "offset_origin_samples," << global_offset_origin << '\n'
+               << "frame_index,offset_samples\n";
+        for (const auto& point : trajectory_points_) {
+            output << point.frame_index << ',' << point.offset_samples << '\n';
+        }
+        output.flush();
+        if (!output) {
+            throw std::runtime_error(
+                "failed to write timing trajectory state output: "
+                + trajectory_state_out_path_);
+        }
     }
 
     bool read_untracked(FrameWork& frame, std::size_t& trailing_ci8_bytes) {
@@ -1038,6 +1400,29 @@ private:
     [[nodiscard]] float metric_at(std::size_t candidate_start) const {
         const auto relative_start = candidate_start - buffer_start_sample_;
         return pn945_ci8_cyclic_extension_metric(buffer_, relative_start);
+    }
+
+    [[nodiscard]] float trajectory_local_search_min_improvement_for(
+        std::size_t frame_index) const noexcept {
+        for (const auto& rule : trajectory_local_search_scoped_min_improvements_) {
+            if (frame_index >= rule.first_frame && frame_index <= rule.last_frame) {
+                return rule.min_improvement;
+            }
+        }
+        return trajectory_local_search_min_improvement_;
+    }
+
+    [[nodiscard]] bool trajectory_local_search_transient_for(
+        std::size_t frame_index) const noexcept {
+        if (trajectory_local_search_transient_) {
+            return true;
+        }
+        for (const auto& range : trajectory_local_search_transient_ranges_) {
+            if (frame_index >= range.first_frame && frame_index <= range.last_frame) {
+                return true;
+            }
+        }
+        return false;
     }
 
     void copy_frame(std::size_t sample_start, FrameWork& frame) const {
@@ -1098,14 +1483,24 @@ private:
     std::size_t trajectory_interval_frames_ = 0;
     std::size_t trajectory_fit_points_ = 0;
     double trajectory_max_innovation_samples_ = 0.0;
+    std::size_t trajectory_frame_index_offset_ = 0;
+    double trajectory_offset_origin_samples_ = 0.0;
+    std::string trajectory_state_out_path_;
+    std::size_t trajectory_state_out_frame_ = 0;
     bool trajectory_local_search_ = false;
+    bool trajectory_local_search_transient_ = false;
+    std::vector<TimingLocalSearchTransientRange>
+        trajectory_local_search_transient_ranges_;
     float trajectory_local_search_min_improvement_ = 0.0F;
+    std::vector<TimingLocalSearchScopedMinImprovementRule>
+        trajectory_local_search_scoped_min_improvements_;
     std::int64_t trajectory_local_offset_samples_ = 0;
     std::size_t trajectory_frame_index_ = 0;
     std::size_t previous_trajectory_start_ = 0;
     std::deque<TrajectoryPoint> trajectory_points_;
     double trajectory_intercept_samples_ = 0.0;
     double trajectory_slope_samples_per_frame_ = 0.0;
+    bool trajectory_seeded_restart_ = false;
     bool input_ended_ = false;
     TimingTrackerStats stats_{};
     TimingDiagnostics* timing_diagnostics_ = nullptr;
@@ -1132,10 +1527,14 @@ Normalization parse_normalization(const std::string& text) {
     if (text == "qam64") {
         return Normalization::qam64;
     }
+    if (text == "qam64-amplitude" || text == "qam64-amp") {
+        return Normalization::qam64_amplitude;
+    }
     if (text == "none") {
         return Normalization::none;
     }
-    throw std::invalid_argument("normalization must be system-info, qam64, or none");
+    throw std::invalid_argument(
+        "normalization must be system-info, qam64, qam64-amplitude, or none");
 }
 
 Equalizer parse_equalizer(const std::string& text) {
@@ -1158,6 +1557,62 @@ PnEstimator parse_pn_estimator(const std::string& text) {
     throw std::invalid_argument("PN estimator must be compact or wideband");
 }
 
+dtmb::core::Pn945WidebandScaleEstimator parse_pn_wideband_scale_estimator(
+    const std::string& text) {
+    if (text == "dominant" || text == "dominant-tap") {
+        return dtmb::core::Pn945WidebandScaleEstimator::dominant_tap;
+    }
+    if (text == "least-squares" || text == "ls") {
+        return dtmb::core::Pn945WidebandScaleEstimator::least_squares_template;
+    }
+    if (text == "masked-frame-taps" || text == "frame-taps" || text == "masked-frame") {
+        return dtmb::core::Pn945WidebandScaleEstimator::masked_frame_taps;
+    }
+    throw std::invalid_argument(
+        "PN wideband scale estimator must be dominant, least-squares, or masked-frame-taps");
+}
+
+const char* pn_wideband_scale_estimator_name(
+    dtmb::core::Pn945WidebandScaleEstimator estimator) noexcept {
+    switch (estimator) {
+    case dtmb::core::Pn945WidebandScaleEstimator::dominant_tap:
+        return "dominant";
+    case dtmb::core::Pn945WidebandScaleEstimator::least_squares_template:
+        return "least-squares";
+    case dtmb::core::Pn945WidebandScaleEstimator::masked_frame_taps:
+        return "masked-frame-taps";
+    }
+    return "unknown";
+}
+
+dtmb::core::Pn945HeaderObservation parse_pn_wideband_header_observation(
+    const std::string& text) {
+    if (text == "core" || text == "core-only") {
+        return dtmb::core::Pn945HeaderObservation::core_only;
+    }
+    if (text == "core-postfix" || text == "postfix-average") {
+        return dtmb::core::Pn945HeaderObservation::core_postfix_average;
+    }
+    if (text == "core-cyclic-safe" || text == "cyclic-safe-average") {
+        return dtmb::core::Pn945HeaderObservation::core_cyclic_safe_average;
+    }
+    throw std::invalid_argument(
+        "PN wideband header observation must be core, core-postfix, or core-cyclic-safe");
+}
+
+const char* pn_wideband_header_observation_name(
+    dtmb::core::Pn945HeaderObservation observation) noexcept {
+    switch (observation) {
+    case dtmb::core::Pn945HeaderObservation::core_only:
+        return "core";
+    case dtmb::core::Pn945HeaderObservation::core_postfix_average:
+        return "core-postfix";
+    case dtmb::core::Pn945HeaderObservation::core_cyclic_safe_average:
+        return "core-cyclic-safe";
+    }
+    return "unknown";
+}
+
 PnMmse parse_pn_mmse(const std::string& text) {
     if (text == "off" || text == "none") {
         return {};
@@ -1170,6 +1625,68 @@ PnMmse parse_pn_mmse(const std::string& text) {
         throw std::invalid_argument("PN MMSE noise variance must be non-negative");
     }
     return PnMmse{false, value};
+}
+
+bool parse_pn_wideband_body_channel_midpoint(const std::string& text) {
+    if (text == "current") {
+        return false;
+    }
+    if (text == "midpoint") {
+        return true;
+    }
+    throw std::invalid_argument(
+        "PN wideband body channel must be current or midpoint");
+}
+
+TimingLocalSearchScopedMinImprovementRule
+parse_timing_local_search_scoped_min_improvement_rule(const std::string& text) {
+    std::vector<std::string> parts;
+    std::stringstream stream(text);
+    std::string item;
+    while (std::getline(stream, item, ':')) {
+        parts.push_back(item);
+    }
+    if (parts.size() != 3) {
+        throw std::invalid_argument(
+            "invalid timing local-search scoped min-improvement rule: " + text);
+    }
+    TimingLocalSearchScopedMinImprovementRule rule;
+    rule.first_frame = parse_size(parts[0], "timing local-search scoped first frame");
+    rule.last_frame = parse_size(parts[1], "timing local-search scoped last frame");
+    rule.min_improvement =
+        parse_float(parts[2], "timing local-search scoped minimum improvement");
+    if (rule.last_frame < rule.first_frame) {
+        throw std::invalid_argument(
+            "timing local-search scoped end is before start: " + text);
+    }
+    if (!std::isfinite(rule.min_improvement) || rule.min_improvement < 0.0F) {
+        throw std::invalid_argument(
+            "timing local-search scoped minimum improvement must be non-negative: "
+            + text);
+    }
+    return rule;
+}
+
+TimingLocalSearchTransientRange
+parse_timing_local_search_transient_range(const std::string& text) {
+    std::vector<std::string> parts;
+    std::stringstream stream(text);
+    std::string item;
+    while (std::getline(stream, item, ':')) {
+        parts.push_back(item);
+    }
+    if (parts.size() != 2) {
+        throw std::invalid_argument(
+            "invalid timing local-search transient range: " + text);
+    }
+    TimingLocalSearchTransientRange range;
+    range.first_frame = parse_size(parts[0], "timing local-search transient first frame");
+    range.last_frame = parse_size(parts[1], "timing local-search transient last frame");
+    if (range.last_frame < range.first_frame) {
+        throw std::invalid_argument(
+            "timing local-search transient range end is before start: " + text);
+    }
+    return range;
 }
 
 SourceCarrierResidualRule parse_source_carrier_residual_rule(const std::string& text) {
@@ -1194,6 +1711,28 @@ SourceCarrierResidualRule parse_source_carrier_residual_rule(const std::string& 
     return rule;
 }
 
+SourceCarrierChannelRule parse_source_carrier_channel_rule(const std::string& text) {
+    std::vector<std::string> parts;
+    std::stringstream stream(text);
+    std::string item;
+    while (std::getline(stream, item, ':')) {
+        parts.push_back(item);
+    }
+    if (parts.size() != 3) {
+        throw std::invalid_argument(
+            "invalid source carrier channel rule: " + text);
+    }
+    SourceCarrierChannelRule rule;
+    rule.carrier = parse_size(parts[0], "source carrier channel carrier");
+    rule.first_frame = parse_size(parts[1], "source carrier channel first frame");
+    rule.last_frame = parse_size(parts[2], "source carrier channel last frame");
+    if (rule.last_frame < rule.first_frame) {
+        throw std::invalid_argument(
+            "source carrier channel end is before start: " + text);
+    }
+    return rule;
+}
+
 std::vector<float> system_info_reference(std::size_t index) {
     if (index < 1 || index > 64) {
         throw std::invalid_argument("system information index must be 1..64");
@@ -1213,13 +1752,13 @@ std::vector<float> system_info_reference(std::size_t index) {
     return reference;
 }
 
-void normalize_data_from_system_info(
+ComplexGainEstimate estimate_system_info_gain(
     std::span<const float> logical_symbols,
-    std::span<const float> reference,
-    std::span<float> output_data) {
+    std::span<const float> reference) {
     using Complex = std::complex<float>;
     auto numerator = Complex{0.0F, 0.0F};
     double denominator = 0.0;
+    double observed_power = 0.0;
     for (std::size_t symbol = 0; symbol < dtmb::core::kC3780SystemInfoSymbols; ++symbol) {
         const auto observed = Complex{
             logical_symbols[symbol * 2],
@@ -1231,11 +1770,147 @@ void normalize_data_from_system_info(
         };
         numerator += std::conj(expected) * observed;
         denominator += std::norm(expected);
+        observed_power += std::norm(observed);
     }
     if (denominator <= 1.0e-12) {
         throw std::runtime_error("system-information reference has zero power");
     }
     const auto gain = numerator / static_cast<float>(denominator);
+    const auto coherence_denominator = std::sqrt(denominator * observed_power);
+    return ComplexGainEstimate{
+        gain,
+        coherence_denominator > 1.0e-12
+            ? static_cast<float>(std::abs(numerator) / coherence_denominator)
+            : 0.0F,
+        std::abs(gain) > 1.0e-12F,
+    };
+}
+
+float system_info_match_metric(
+    std::span<const float> logical_symbols,
+    std::span<const float> reference) {
+    using Complex = std::complex<float>;
+    auto numerator = Complex{0.0F, 0.0F};
+    double reference_power = 0.0;
+    double observed_power = 0.0;
+    for (std::size_t symbol = 0; symbol < dtmb::core::kC3780SystemInfoSymbols; ++symbol) {
+        const auto observed = Complex{
+            logical_symbols[symbol * 2],
+            logical_symbols[symbol * 2 + 1],
+        };
+        const auto expected = Complex{
+            reference[symbol * 2],
+            reference[symbol * 2 + 1],
+        };
+        numerator += std::conj(expected) * observed;
+        reference_power += std::norm(expected);
+        observed_power += std::norm(observed);
+    }
+    const auto denominator = std::sqrt(reference_power * observed_power);
+    if (denominator <= 1.0e-12) {
+        return 0.0F;
+    }
+    const auto correlation = numerator / static_cast<float>(denominator);
+    // The PN equalizer leaves a capture-dependent common phase on the sparse
+    // system-information carriers.  Fit that one nuisance phase instead of
+    // penalizing otherwise correct references whose correlation is outside a
+    // fixed +/-45 degree sector.  The common C=3780 prefix remains part of
+    // every reference, so polarity/complement hypotheses are still distinct.
+    return std::abs(correlation);
+}
+
+struct SystemInfoAutoSelection {
+    std::size_t index = 0;
+    std::size_t runner_up_index = 0;
+    std::size_t observations = 0;
+    float metric = 0.0F;
+    float runner_up_metric = 0.0F;
+    float margin = 0.0F;
+    bool complete = false;
+    bool locked = false;
+};
+
+class SystemInfoAutoSelector {
+public:
+    SystemInfoAutoSelector(
+        std::size_t observation_frames,
+        float min_metric,
+        float min_margin)
+        : observation_frames_(observation_frames),
+          min_metric_(min_metric),
+          min_margin_(min_margin) {
+        for (std::size_t index = kFirstCandidate; index <= kLastCandidate; ++index) {
+            references_[index - 1] = system_info_reference(index);
+        }
+    }
+
+    void observe(std::span<const float> logical_symbols) {
+        if (selection_.complete) {
+            return;
+        }
+        for (std::size_t index = kFirstCandidate; index <= kLastCandidate; ++index) {
+            metric_sums_[index - 1] += system_info_match_metric(
+                logical_symbols,
+                references_[index - 1]);
+        }
+        ++selection_.observations;
+        if (selection_.observations >= observation_frames_) {
+            finalize();
+        }
+    }
+
+    [[nodiscard]] const SystemInfoAutoSelection& selection() const noexcept {
+        return selection_;
+    }
+
+private:
+    static constexpr std::size_t kFirstCandidate = 3;
+    static constexpr std::size_t kLastCandidate = 24;
+
+    void finalize() {
+        auto best_index = std::size_t{0};
+        auto second_index = std::size_t{0};
+        auto best_metric = -std::numeric_limits<double>::infinity();
+        auto second_metric = -std::numeric_limits<double>::infinity();
+        for (std::size_t index = kFirstCandidate; index <= kLastCandidate; ++index) {
+            const auto mean = metric_sums_[index - 1]
+                / static_cast<double>(selection_.observations);
+            if (mean > best_metric) {
+                second_metric = best_metric;
+                second_index = best_index;
+                best_metric = mean;
+                best_index = index;
+            } else if (mean > second_metric) {
+                second_metric = mean;
+                second_index = index;
+            }
+        }
+        selection_.index = best_index;
+        selection_.runner_up_index = second_index;
+        selection_.metric = static_cast<float>(best_metric);
+        selection_.runner_up_metric = static_cast<float>(second_metric);
+        selection_.margin = static_cast<float>(best_metric - second_metric);
+        selection_.complete = true;
+        selection_.locked = best_index != 0
+            && best_metric >= static_cast<double>(min_metric_)
+            && best_metric - second_metric >= static_cast<double>(min_margin_);
+    }
+
+    std::size_t observation_frames_ = 0;
+    float min_metric_ = 0.0F;
+    float min_margin_ = 0.0F;
+    std::array<std::vector<float>, 64> references_{};
+    std::array<double, 64> metric_sums_{};
+    SystemInfoAutoSelection selection_{};
+};
+
+void normalize_data_from_system_info(
+    std::span<const float> logical_symbols,
+    std::span<const float> reference,
+    std::span<float> output_data) {
+    using Complex = std::complex<float>;
+    const auto estimate = estimate_system_info_gain(logical_symbols, reference);
+    const auto gain = estimate.gain;
     if (std::abs(gain) <= 1.0e-12F) {
         throw std::runtime_error("system-information gain estimate is zero");
     }
@@ -1250,6 +1925,76 @@ void normalize_data_from_system_info(
     }
 }
 
+ComplexGainEstimate estimate_applied_gain(
+    std::span<const float> raw_symbols,
+    std::span<const float> normalized_symbols) {
+    using Complex = std::complex<float>;
+    if (raw_symbols.size() != normalized_symbols.size()
+        || (raw_symbols.size() % 2U) != 0U) {
+        throw std::invalid_argument("gain diagnostic CF32 spans must have equal size");
+    }
+    auto numerator = Complex{0.0F, 0.0F};
+    double denominator = 0.0;
+    for (std::size_t symbol = 0; symbol < raw_symbols.size() / 2U; ++symbol) {
+        const auto raw = Complex{
+            raw_symbols[symbol * 2U],
+            raw_symbols[symbol * 2U + 1U],
+        };
+        const auto normalized = Complex{
+            normalized_symbols[symbol * 2U],
+            normalized_symbols[symbol * 2U + 1U],
+        };
+        numerator += std::conj(normalized) * raw;
+        denominator += std::norm(normalized);
+    }
+    if (denominator <= 1.0e-12) {
+        return {};
+    }
+    const auto gain = numerator / static_cast<float>(denominator);
+    return ComplexGainEstimate{gain, 1.0F, std::abs(gain) > 1.0e-12F};
+}
+
+void update_frame_normalization_stats(
+    FrameWork& frame,
+    std::span<const float> raw_data,
+    std::span<const float> system_info_reference) {
+    frame.normalization_stats = {};
+    frame.normalization_stats.system_info_gain = estimate_system_info_gain(
+        frame.logical_cf32,
+        system_info_reference);
+    frame.normalization_stats.qam_gain = estimate_applied_gain(
+        raw_data,
+        frame.data_cf32);
+
+    double residual_ratio_sum = 0.0;
+    for (std::size_t carrier = 0; carrier < dtmb::core::kC3780DataSymbols; ++carrier) {
+        const auto point = qam64_residual_point(
+            frame.data_cf32[carrier * 2U],
+            frame.data_cf32[carrier * 2U + 1U]);
+        residual_ratio_sum += point.decision_abs > 0.0F
+            ? point.residual_abs / point.decision_abs
+            : 0.0F;
+    }
+    frame.normalization_stats.qam_residual_ratio = static_cast<float>(
+        residual_ratio_sum / static_cast<double>(dtmb::core::kC3780DataSymbols));
+
+    if (!frame.normalization_stats.qam_gain.valid
+        || !frame.normalization_stats.system_info_gain.valid) {
+        return;
+    }
+    const auto qam_phase = std::arg(frame.normalization_stats.qam_gain.gain);
+    const auto system_info_phase = std::arg(
+        frame.normalization_stats.system_info_gain.gain);
+    const auto difference = qam_phase - system_info_phase;
+    constexpr auto half_pi = std::numbers::pi_v<float> / 2.0F;
+    const auto quadrant = static_cast<int>(std::llround(difference / half_pi));
+    frame.normalization_stats.qam_minus_system_info_phase_rad = difference;
+    frame.normalization_stats.qam_minus_system_info_phase_mod_pi_over_2_rad =
+        std::remainder(difference, half_pi);
+    frame.normalization_stats.qam_minus_system_info_quadrant =
+        ((quadrant % 4) + 4) % 4;
+}
+
 void convert_ci8_to_cf32(
     std::span<const std::int8_t> input,
     std::span<float> output,
@@ -1257,30 +2002,32 @@ void convert_ci8_to_cf32(
     float frequency_shift_hz,
     std::complex<float> dc_offset = {});
 
+void extract_data_symbols(
+    FrameWork& frame,
+    Normalization normalization,
+    std::span<const float> system_info_reference,
+    const DataDecisionDirectedOptions& dd_options,
+    DataDecisionDirectedStats& dd_stats);
+
 void process_frame(
     FrameWork& frame,
     Normalization normalization,
     std::span<const float> system_info_reference,
-    float frequency_shift_hz) {
+    float frequency_shift_hz,
+    const DataDecisionDirectedOptions& dd_options,
+    DataDecisionDirectedStats& dd_stats) {
     convert_ci8_to_cf32(
         frame.body_ci8,
         frame.body_cf32,
         frame.sample_start + dtmb::core::kPn945HeaderSymbols,
         frequency_shift_hz);
     dtmb::core::c3780_extract_frame_symbols_cf32(frame.body_cf32, frame.logical_cf32);
-    const auto data = std::span<const float>(
-        frame.logical_cf32.data() + dtmb::core::kC3780SystemInfoSymbols * 2,
-        dtmb::core::kC3780DataSymbols * 2);
-    if (normalization == Normalization::system_info) {
-        normalize_data_from_system_info(
-            frame.logical_cf32,
-            system_info_reference,
-            frame.data_cf32);
-    } else if (normalization == Normalization::qam64) {
-        dtmb::core::qam64_normalize_cf32(data, frame.data_cf32);
-    } else {
-        std::copy(data.begin(), data.end(), frame.data_cf32.begin());
-    }
+    extract_data_symbols(
+        frame,
+        normalization,
+        system_info_reference,
+        dd_options,
+        dd_stats);
 }
 
 void convert_ci8_to_cf32(
@@ -1316,7 +2063,9 @@ dtmb::core::Pn945EqualizeResult process_pn_frame(
     std::span<const float> system_info_reference,
     std::size_t pn_channel_taps,
     float frequency_shift_hz,
-    float noise_variance) {
+    float noise_variance,
+    const DataDecisionDirectedOptions& dd_options,
+    DataDecisionDirectedStats& dd_stats) {
     convert_ci8_to_cf32(
         frame.header_ci8,
         frame.header_cf32,
@@ -1346,19 +2095,12 @@ dtmb::core::Pn945EqualizeResult process_pn_frame(
     dtmb::core::c3780_deinterleave_spectrum_cf32(
         frame.spectrum_cf32,
         frame.logical_cf32);
-    const auto data = std::span<const float>(
-        frame.logical_cf32.data() + dtmb::core::kC3780SystemInfoSymbols * 2,
-        dtmb::core::kC3780DataSymbols * 2);
-    if (normalization == Normalization::system_info) {
-        normalize_data_from_system_info(
-            frame.logical_cf32,
-            system_info_reference,
-            frame.data_cf32);
-    } else if (normalization == Normalization::qam64) {
-        dtmb::core::qam64_normalize_cf32(data, frame.data_cf32);
-    } else {
-        std::copy(data.begin(), data.end(), frame.data_cf32.begin());
-    }
+    extract_data_symbols(
+        frame,
+        normalization,
+        system_info_reference,
+        dd_options,
+        dd_stats);
     return result;
 }
 
@@ -1371,7 +2113,12 @@ dtmb::core::Pn945EqualizeResult process_wideband_pn_frame(
     std::size_t model_frame_index,
     float frequency_shift_hz,
     float noise_variance,
-    std::complex<float> dc_offset) {
+    std::complex<float> dc_offset,
+    int response_window_offset_adjust,
+    bool interpolate_body_channel,
+    bool csi_demap,
+    const DataDecisionDirectedOptions& dd_options,
+    DataDecisionDirectedStats& dd_stats) {
     convert_ci8_to_cf32(
         frame.body_ci8,
         frame.body_cf32,
@@ -1389,22 +2136,25 @@ dtmb::core::Pn945EqualizeResult process_wideband_pn_frame(
             1.0e-3F,
             1.0e-6F,
             noise_variance,
+            response_window_offset_adjust,
+            interpolate_body_channel,
+            csi_demap,
+            0.25F,
+            csi_demap
+                ? std::span<float>(frame.channel_power_spectrum_cf32)
+                : std::span<float>{},
         });
     dtmb::core::c3780_deinterleave_spectrum_cf32(
         frame.spectrum_cf32,
         frame.logical_cf32);
-    const auto data = std::span<const float>(
-        frame.logical_cf32.data() + dtmb::core::kC3780SystemInfoSymbols * 2,
-        dtmb::core::kC3780DataSymbols * 2);
-    if (normalization == Normalization::system_info) {
-        normalize_data_from_system_info(
-            frame.logical_cf32,
-            system_info_reference,
-            frame.data_cf32);
-    } else if (normalization == Normalization::qam64) {
-        dtmb::core::qam64_normalize_cf32(data, frame.data_cf32);
-    } else {
-        std::copy(data.begin(), data.end(), frame.data_cf32.begin());
+    extract_data_symbols(
+        frame,
+        normalization,
+        system_info_reference,
+        dd_options,
+        dd_stats);
+    if (csi_demap) {
+        prepare_csi_weights(frame);
     }
     return result;
 }
@@ -1412,7 +2162,10 @@ dtmb::core::Pn945EqualizeResult process_wideband_pn_frame(
 dtmb::core::Pn945WidebandChannelModel build_wideband_model(
     std::deque<FrameWork>& frames,
     float frequency_shift_hz,
-    std::complex<float> dc_offset) {
+    std::complex<float> dc_offset,
+    dtmb::core::Pn945WidebandScaleEstimator scale_estimator,
+    dtmb::core::Pn945HeaderObservation header_observation,
+    std::size_t max_span_symbols) {
     std::vector<float> headers;
     headers.reserve(frames.size() * dtmb::core::kPn945HeaderSymbols * 2);
     for (auto& frame : frames) {
@@ -1424,7 +2177,11 @@ dtmb::core::Pn945WidebandChannelModel build_wideband_model(
             dc_offset);
         headers.insert(headers.end(), frame.header_cf32.begin(), frame.header_cf32.end());
     }
-    return dtmb::core::build_pn945_wideband_channel_model_cf32(headers);
+    auto options = dtmb::core::Pn945WidebandModelOptions{};
+    options.scale_estimator = scale_estimator;
+    options.header_observation = header_observation;
+    options.max_span_symbols = max_span_symbols;
+    return dtmb::core::build_pn945_wideband_channel_model_cf32(headers, options);
 }
 
 std::complex<float> estimate_block_dc_offset(const std::deque<FrameWork>& frames) {
@@ -1482,25 +2239,216 @@ void write_all(std::ostream& output, std::span<const float> values) {
     }
 }
 
-float nearest_qam64_level(float value) {
-    auto best = kQam64Levels.front();
-    auto best_distance = std::abs(value - best);
-    for (const auto level : kQam64Levels) {
-        const auto distance = std::abs(value - level);
+void prepare_csi_weights(FrameWork& frame) {
+    dtmb::core::c3780_deinterleave_spectrum_cf32(
+        frame.channel_power_spectrum_cf32,
+        frame.channel_power_logical_cf32);
+    const auto power = std::span<const float>(
+        frame.channel_power_logical_cf32.data()
+            + dtmb::core::kC3780SystemInfoSymbols * 2,
+        dtmb::core::kC3780DataSymbols * 2);
+    std::vector<float> positive;
+    positive.reserve(dtmb::core::kC3780DataSymbols);
+    for (std::size_t carrier = 0; carrier < dtmb::core::kC3780DataSymbols; ++carrier) {
+        const auto value = power[carrier * 2];
+        if (std::isfinite(value) && value > 0.0F) {
+            positive.push_back(value);
+        }
+    }
+    auto scale = 1.0F;
+    if (!positive.empty()) {
+        const auto middle = positive.begin()
+            + static_cast<std::ptrdiff_t>(positive.size() / 2);
+        std::nth_element(positive.begin(), middle, positive.end());
+        scale = std::max(*middle, 1.0e-12F);
+    }
+    for (std::size_t carrier = 0; carrier < dtmb::core::kC3780DataSymbols; ++carrier) {
+        const auto value = power[carrier * 2];
+        frame.csi_weights[carrier] = std::isfinite(value) && value > 0.0F
+            ? std::clamp(value / scale, 0.0F, 4.0F)
+            : 0.0F;
+    }
+}
+
+std::array<std::uint8_t, 3> qam64_axis_bits(std::size_t level_index) {
+    const auto gray = level_index ^ (level_index >> 1U);
+    return {
+        static_cast<std::uint8_t>(gray & 0x01U),
+        static_cast<std::uint8_t>((gray >> 1U) & 0x01U),
+        static_cast<std::uint8_t>((gray >> 2U) & 0x01U),
+    };
+}
+
+void extract_data_symbols(
+    FrameWork& frame,
+    Normalization normalization,
+    std::span<const float> system_info_reference,
+    const DataDecisionDirectedOptions& dd_options,
+    DataDecisionDirectedStats& dd_stats) {
+    const auto data = std::span<const float>(
+        frame.logical_cf32.data() + dtmb::core::kC3780SystemInfoSymbols * 2,
+        dtmb::core::kC3780DataSymbols * 2);
+    if (normalization == Normalization::system_info) {
+        normalize_data_from_system_info(
+            frame.logical_cf32,
+            system_info_reference,
+            frame.data_cf32);
+        update_frame_normalization_stats(frame, data, system_info_reference);
+        return;
+    }
+    if (normalization == Normalization::none) {
+        std::copy(data.begin(), data.end(), frame.data_cf32.begin());
+        update_frame_normalization_stats(frame, data, system_info_reference);
+        return;
+    }
+    if (normalization == Normalization::qam64_amplitude) {
+        dtmb::core::qam64_normalize_amplitude_cf32(data, frame.data_cf32);
+        update_frame_normalization_stats(frame, data, system_info_reference);
+        return;
+    }
+    dtmb::core::qam64_normalize_cf32(data, frame.data_cf32);
+    update_frame_normalization_stats(frame, data, system_info_reference);
+    if (!dd_options.enabled) {
+        return;
+    }
+
+    constexpr auto qam64_rms = float{6.48074069840786F};
+    std::vector<std::size_t> reliable_indices;
+    std::vector<std::complex<float>> reliable_channels;
+    reliable_indices.reserve(dtmb::core::kC3780DataSymbols);
+    reliable_channels.reserve(dtmb::core::kC3780DataSymbols);
+    std::array<std::size_t, 6> hard_one_counts{};
+    std::size_t real_inner_count = 0;
+    std::size_t imag_inner_count = 0;
+    for (std::size_t carrier = 0; carrier < dtmb::core::kC3780DataSymbols; ++carrier) {
+        const auto point = qam64_residual_point(
+            frame.data_cf32[carrier * 2],
+            frame.data_cf32[carrier * 2 + 1]);
+        if (std::abs(point.decision_real) == 1.0F) {
+            ++real_inner_count;
+        }
+        if (std::abs(point.decision_imag) == 1.0F) {
+            ++imag_inner_count;
+        }
+        const auto real_bits = qam64_axis_bits(point.decision_real_index);
+        const auto imag_bits = qam64_axis_bits(point.decision_imag_index);
+        for (std::size_t bit = 0; bit < real_bits.size(); ++bit) {
+            hard_one_counts[bit] += real_bits[bit];
+            hard_one_counts[bit + real_bits.size()] += imag_bits[bit];
+        }
+        if ((point.residual_abs / qam64_rms) > dd_options.max_relative_error
+            || point.decision_abs <= 0.0F) {
+            continue;
+        }
+        const auto observed = std::complex<float>{
+            frame.data_cf32[carrier * 2],
+            frame.data_cf32[carrier * 2 + 1],
+        };
+        const auto decision = std::complex<float>{
+            point.decision_real,
+            point.decision_imag,
+        };
+        reliable_indices.push_back(carrier);
+        reliable_channels.push_back(observed / decision);
+    }
+    if (dd_options.max_axis_inner_fraction > 0.0F) {
+        const auto denominator =
+            static_cast<float>(dtmb::core::kC3780DataSymbols);
+        const auto inner_fraction = std::max(
+            static_cast<float>(real_inner_count) / denominator,
+            static_cast<float>(imag_inner_count) / denominator);
+        if (inner_fraction > dd_options.max_axis_inner_fraction) {
+            dd_stats.observe(
+                reliable_indices.size(),
+                false,
+                DataDecisionDirectedRejectReason::axis_inner_fraction);
+            return;
+        }
+    }
+    if (dd_options.max_hard_bit_bias > 0.0F) {
+        float max_bias = 0.0F;
+        const auto denominator =
+            static_cast<float>(dtmb::core::kC3780DataSymbols);
+        for (const auto count : hard_one_counts) {
+            const auto balance = static_cast<float>(count) / denominator;
+            max_bias = std::max(max_bias, std::abs(balance - 0.5F));
+        }
+        if (max_bias > dd_options.max_hard_bit_bias) {
+            dd_stats.observe(
+                reliable_indices.size(),
+                false,
+                DataDecisionDirectedRejectReason::hard_bit_bias);
+            return;
+        }
+    }
+    if (reliable_indices.size() < dd_options.min_reliable_carriers) {
+        dd_stats.observe(
+            reliable_indices.size(),
+            false,
+            DataDecisionDirectedRejectReason::reliable_carriers);
+        return;
+    }
+
+    std::size_t next = 0;
+    for (std::size_t carrier = 0; carrier < dtmb::core::kC3780DataSymbols; ++carrier) {
+        while (next + 1 < reliable_indices.size()
+               && reliable_indices[next + 1] < carrier) {
+            ++next;
+        }
+        auto channel = reliable_channels[next];
+        if (carrier <= reliable_indices.front()) {
+            channel = reliable_channels.front();
+        } else if (carrier >= reliable_indices.back()) {
+            channel = reliable_channels.back();
+        } else if (next + 1 < reliable_indices.size()) {
+            const auto left_index = reliable_indices[next];
+            const auto right_index = reliable_indices[next + 1];
+            const auto span = static_cast<float>(right_index - left_index);
+            const auto fraction = span > 0.0F
+                ? static_cast<float>(carrier - left_index) / span
+                : 0.0F;
+            channel = reliable_channels[next] * (1.0F - fraction)
+                + reliable_channels[next + 1] * fraction;
+        }
+        if (std::abs(channel) <= 1.0e-6F) {
+            continue;
+        }
+        const auto observed = std::complex<float>{
+            frame.data_cf32[carrier * 2],
+            frame.data_cf32[carrier * 2 + 1],
+        };
+        const auto corrected = observed / channel;
+        frame.data_cf32[carrier * 2] = corrected.real();
+        frame.data_cf32[carrier * 2 + 1] = corrected.imag();
+    }
+    dd_stats.observe(reliable_indices.size(), true);
+}
+
+std::size_t nearest_qam64_level_index(float value) {
+    std::size_t best = 0;
+    auto best_distance = std::abs(value - kQam64Levels[best]);
+    for (std::size_t index = 1; index < kQam64Levels.size(); ++index) {
+        const auto distance = std::abs(value - kQam64Levels[index]);
         if (distance < best_distance) {
-            best = level;
+            best = index;
             best_distance = distance;
         }
     }
     return best;
 }
 
+float nearest_qam64_level(float value) {
+    return kQam64Levels[nearest_qam64_level_index(value)];
+}
+
 Qam64ResidualPoint qam64_residual_point(float observed_real, float observed_imag) {
     Qam64ResidualPoint point;
     point.observed_real = observed_real;
     point.observed_imag = observed_imag;
-    point.decision_real = nearest_qam64_level(observed_real);
-    point.decision_imag = nearest_qam64_level(observed_imag);
+    point.decision_real_index = nearest_qam64_level_index(observed_real);
+    point.decision_imag_index = nearest_qam64_level_index(observed_imag);
+    point.decision_real = kQam64Levels[point.decision_real_index];
+    point.decision_imag = kQam64Levels[point.decision_imag_index];
     point.residual_real = observed_real - point.decision_real;
     point.residual_imag = observed_imag - point.decision_imag;
     point.residual_abs = std::hypot(point.residual_real, point.residual_imag);
@@ -1554,6 +2502,227 @@ void write_frame_residual_stats(std::ostream& output, const FrameResidualStats& 
            << stats.residual_abs_max << ','
            << stats.mean_residual_ratio() << ','
            << stats.mean_observed_abs();
+}
+
+bool is_c3780_system_info_position(std::size_t inserted_logical) {
+    return std::find(
+        kC3780SystemInfoPositions.begin(),
+        kC3780SystemInfoPositions.end(),
+        inserted_logical)
+        != kC3780SystemInfoPositions.end();
+}
+
+std::size_t data_carrier_to_inserted_logical(std::size_t carrier) {
+    std::size_t data_index = 0;
+    for (std::size_t inserted_logical = 0;
+         inserted_logical < dtmb::core::kC3780FrameBodySymbols;
+         ++inserted_logical) {
+        if (is_c3780_system_info_position(inserted_logical)) {
+            continue;
+        }
+        if (data_index == carrier) {
+            return inserted_logical;
+        }
+        ++data_index;
+    }
+    throw std::logic_error("invalid C3780 data carrier index");
+}
+
+std::size_t c3780_logical_to_physical(std::size_t inserted_logical) {
+    for (std::size_t i = 0; i < 3; ++i) {
+        for (std::size_t j = 0; j < 3; ++j) {
+            for (std::size_t k = 0; k < 3; ++k) {
+                for (std::size_t l = 0; l < 2; ++l) {
+                    for (std::size_t m = 0; m < 2; ++m) {
+                        for (std::size_t n = 0; n < 5; ++n) {
+                            for (std::size_t o = 0; o < 7; ++o) {
+                                const auto logical =
+                                    i * 1260 + j * 420 + k * 140 + l * 70
+                                    + m * 35 + n * 7 + o;
+                                if (logical == inserted_logical) {
+                                    return o * 540 + n * 108 + m * 54 + l * 27
+                                        + k * 9 + j * 3 + i;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    throw std::logic_error("invalid C3780 logical carrier index");
+}
+
+std::size_t data_carrier_to_physical_bin(std::size_t carrier) {
+    static const auto physical_bins = [] {
+        std::array<std::size_t, dtmb::core::kC3780DataSymbols> bins{};
+        std::size_t data_carrier = 0;
+        for (std::size_t inserted_logical = 0;
+             inserted_logical < dtmb::core::kC3780FrameBodySymbols;
+             ++inserted_logical) {
+            if (is_c3780_system_info_position(inserted_logical)) {
+                continue;
+            }
+            bins[data_carrier++] = c3780_logical_to_physical(inserted_logical);
+        }
+        if (data_carrier != bins.size()) {
+            throw std::logic_error("invalid C3780 data-carrier mapping size");
+        }
+        return bins;
+    }();
+    if (carrier >= physical_bins.size()) {
+        throw std::logic_error("invalid C3780 data carrier index");
+    }
+    return physical_bins[carrier];
+}
+
+int wideband_response_window_offset(
+    const dtmb::core::Pn945WidebandChannelModel& model,
+    int response_window_offset_adjust) {
+    auto signed_rotation = static_cast<int>(model.rotation_symbols);
+    if (signed_rotation > static_cast<int>(kPn945CoreSymbols / 2U)) {
+        signed_rotation -= static_cast<int>(kPn945CoreSymbols);
+    }
+    return -signed_rotation + response_window_offset_adjust;
+}
+
+struct PnTapTransitionStats {
+    float phase_rad = 0.0F;
+    float coherence = 0.0F;
+    float next_to_current_power = 0.0F;
+    float sampled_carrier_shape_change_rms = 0.0F;
+    float sampled_carrier_shape_change_max = 0.0F;
+    std::array<float, 3> slot_sampled_carrier_shape_change_rms{};
+    std::array<float, 3> slot_sampled_carrier_shape_change_max{};
+};
+
+PnTapTransitionStats pn_tap_transition_stats(
+    const dtmb::core::Pn945WidebandChannelModel& model,
+    std::size_t model_frame_index,
+    float noise_variance) {
+    const auto span = model.template_taps.size() / 2U;
+    if (span == 0U) {
+        throw std::runtime_error("PN tap transition diagnostics require model taps");
+    }
+
+    const auto masked_frame_taps = model.scale_estimator
+        == dtmb::core::Pn945WidebandScaleEstimator::masked_frame_taps;
+    const auto frame_tap = [&](std::size_t frame, std::size_t tap) {
+        if (masked_frame_taps) {
+            const auto offset = (frame * span + tap) * 2U;
+            if (offset + 1U >= model.frame_template_taps.size()) {
+                throw std::runtime_error(
+                    "PN tap transition diagnostics are outside masked frame taps");
+            }
+            return std::complex<float>{
+                model.frame_template_taps[offset],
+                model.frame_template_taps[offset + 1U],
+            };
+        }
+        const auto scale_offset = frame * 2U;
+        if (scale_offset + 1U >= model.frame_response_scales.size()) {
+            throw std::runtime_error(
+                "PN tap transition diagnostics are outside response scales");
+        }
+        const auto scale = std::complex<float>{
+            model.frame_response_scales[scale_offset],
+            model.frame_response_scales[scale_offset + 1U],
+        };
+        return scale * std::complex<float>{
+            model.template_taps[tap * 2U],
+            model.template_taps[tap * 2U + 1U],
+        };
+    };
+
+    std::complex<float> cross{};
+    float current_power = 0.0F;
+    float next_power = 0.0F;
+    for (std::size_t tap = 0; tap < span; ++tap) {
+        const auto current = frame_tap(model_frame_index, tap);
+        const auto next = frame_tap(model_frame_index + 1U, tap);
+        cross += next * std::conj(current);
+        current_power += std::norm(current);
+        next_power += std::norm(next);
+    }
+    const auto denominator = std::sqrt(current_power * next_power);
+    const auto alignment = current_power > 0.0F
+        ? cross / current_power
+        : std::complex<float>{1.0F, 0.0F};
+
+    constexpr auto carriers_per_slot = dtmb::core::kC3780DataSymbols / 3U;
+    constexpr std::size_t samples_per_slot = 32U;
+    constexpr auto sampled_carrier_count = samples_per_slot * 3U;
+    static_assert(carriers_per_slot * 3U == dtmb::core::kC3780DataSymbols);
+    struct CarrierSample {
+        std::size_t slot = 0;
+        std::complex<float> step{1.0F, 0.0F};
+    };
+    static const auto carrier_samples = [] {
+        std::array<CarrierSample, sampled_carrier_count> samples{};
+        std::size_t output = 0;
+        for (std::size_t slot = 0; slot < 3U; ++slot) {
+            for (std::size_t sample = 0; sample < samples_per_slot; ++sample) {
+                const auto within_slot = static_cast<std::size_t>(std::llround(
+                    static_cast<double>(sample) * (carriers_per_slot - 1U)
+                    / static_cast<double>(samples_per_slot - 1U)));
+                const auto carrier = slot * carriers_per_slot + within_slot;
+                const auto physical_bin = data_carrier_to_physical_bin(carrier);
+                const auto angle = -2.0F * std::numbers::pi_v<float>
+                    * static_cast<float>(physical_bin)
+                    / static_cast<float>(dtmb::core::kC3780FrameBodySymbols);
+                samples[output++] = CarrierSample{
+                    slot,
+                    std::complex<float>{std::cos(angle), std::sin(angle)},
+                };
+            }
+        }
+        return samples;
+    }();
+
+    double carrier_shape_change_sq_sum = 0.0;
+    std::array<double, 3> slot_shape_change_sq_sum{};
+    auto carrier_shape_change_max = 0.0F;
+    std::array<float, 3> slot_shape_change_max{};
+    const auto regularization = std::max(noise_variance, 0.0F);
+    for (const auto& sample : carrier_samples) {
+        auto current = std::complex<float>{0.0F, 0.0F};
+        auto next = std::complex<float>{0.0F, 0.0F};
+        auto weight = std::complex<float>{1.0F, 0.0F};
+        for (std::size_t tap = 0; tap < span; ++tap) {
+            current += frame_tap(model_frame_index, tap) * weight;
+            next += frame_tap(model_frame_index + 1U, tap) * weight;
+            weight *= sample.step;
+        }
+        const auto scale = std::sqrt(std::norm(current) + regularization);
+        const auto change = scale > 0.0F
+            ? std::abs(next - alignment * current) / scale
+            : 0.0F;
+        carrier_shape_change_sq_sum += static_cast<double>(change) * change;
+        slot_shape_change_sq_sum[sample.slot] +=
+            static_cast<double>(change) * change;
+        carrier_shape_change_max = std::max(carrier_shape_change_max, change);
+        slot_shape_change_max[sample.slot] = std::max(
+            slot_shape_change_max[sample.slot],
+            change);
+    }
+
+    std::array<float, 3> slot_shape_change_rms{};
+    for (std::size_t slot = 0; slot < slot_shape_change_rms.size(); ++slot) {
+        slot_shape_change_rms[slot] = std::sqrt(
+            slot_shape_change_sq_sum[slot]
+            / static_cast<double>(samples_per_slot));
+    }
+    return PnTapTransitionStats{
+        std::atan2(cross.imag(), cross.real()),
+        denominator > 0.0F ? std::abs(cross) / denominator : 0.0F,
+        current_power > 0.0F ? next_power / current_power : 0.0F,
+        static_cast<float>(std::sqrt(
+            carrier_shape_change_sq_sum
+            / static_cast<double>(sampled_carrier_count))),
+        carrier_shape_change_max,
+        slot_shape_change_rms,
+        slot_shape_change_max,
+    };
 }
 
 class FrameResidualDiagnostics {
@@ -1636,6 +2805,118 @@ public:
 
 private:
     std::string path_;
+    std::unique_ptr<std::ofstream> output_;
+    bool closed_ = false;
+};
+
+std::string_view normalization_name(Normalization normalization) noexcept {
+    switch (normalization) {
+    case Normalization::system_info:
+        return "system-info";
+    case Normalization::qam64:
+        return "qam64";
+    case Normalization::qam64_amplitude:
+        return "qam64-amplitude";
+    case Normalization::none:
+        return "none";
+    }
+    return "unknown";
+}
+
+class FrameNormalizationDiagnostics {
+public:
+    FrameNormalizationDiagnostics(std::string path, Normalization normalization)
+        : path_(std::move(path)), normalization_(normalization) {
+        if (path_.empty()) {
+            return;
+        }
+        output_ = std::make_unique<std::ofstream>(path_, std::ios::binary);
+        if (!*output_) {
+            throw std::runtime_error(
+                "failed to open frame normalization diagnostics: " + path_);
+        }
+        *output_
+            << "source_frame,normalization,qam_gain_valid,qam_gain_real,"
+            << "qam_gain_imag,qam_gain_abs,qam_gain_phase_rad,"
+            << "system_info_gain_valid,system_info_gain_real,"
+            << "system_info_gain_imag,system_info_gain_abs,"
+            << "system_info_gain_phase_rad,system_info_coherence,"
+            << "qam_minus_system_info_phase_rad,"
+            << "qam_minus_system_info_phase_mod_pi_over_2_rad,"
+            << "qam_minus_system_info_quadrant,qam_residual_ratio,"
+            << "pn_metadata_valid,pn_phase,next_pn_phase,model_pn_phase,"
+            << "model_next_pn_phase,model_rotation_symbols\n";
+    }
+
+    FrameNormalizationDiagnostics(const FrameNormalizationDiagnostics&) = delete;
+    FrameNormalizationDiagnostics& operator=(
+        const FrameNormalizationDiagnostics&) = delete;
+
+    ~FrameNormalizationDiagnostics() {
+        if (output_ && !closed_) {
+            output_->flush();
+        }
+    }
+
+    void observe(
+        std::size_t source_frame,
+        const FrameNormalizationStats& stats,
+        bool pn_metadata_valid,
+        std::size_t pn_phase,
+        std::size_t next_pn_phase,
+        std::size_t model_pn_phase,
+        std::size_t model_next_pn_phase,
+        std::size_t model_rotation_symbols) {
+        if (!output_) {
+            return;
+        }
+        const auto& qam = stats.qam_gain;
+        const auto& system_info = stats.system_info_gain;
+        *output_
+            << source_frame << ','
+            << normalization_name(normalization_) << ','
+            << (qam.valid ? 1 : 0) << ','
+            << qam.gain.real() << ','
+            << qam.gain.imag() << ','
+            << std::abs(qam.gain) << ','
+            << std::arg(qam.gain) << ','
+            << (system_info.valid ? 1 : 0) << ','
+            << system_info.gain.real() << ','
+            << system_info.gain.imag() << ','
+            << std::abs(system_info.gain) << ','
+            << std::arg(system_info.gain) << ','
+            << system_info.coherence << ','
+            << stats.qam_minus_system_info_phase_rad << ','
+            << stats.qam_minus_system_info_phase_mod_pi_over_2_rad << ','
+            << stats.qam_minus_system_info_quadrant << ','
+            << stats.qam_residual_ratio << ','
+            << (pn_metadata_valid ? 1 : 0) << ','
+            << pn_phase << ','
+            << next_pn_phase << ','
+            << model_pn_phase << ','
+            << model_next_pn_phase << ','
+            << model_rotation_symbols << '\n';
+        if (!*output_) {
+            throw std::runtime_error(
+                "failed to write frame normalization diagnostics: " + path_);
+        }
+    }
+
+    void close() {
+        if (!output_ || closed_) {
+            return;
+        }
+        output_->flush();
+        if (!*output_) {
+            throw std::runtime_error(
+                "failed to close frame normalization diagnostics: " + path_);
+        }
+        closed_ = true;
+    }
+
+private:
+    std::string path_;
+    Normalization normalization_;
     std::unique_ptr<std::ofstream> output_;
     bool closed_ = false;
 };
@@ -1738,6 +3019,228 @@ private:
     bool closed_ = false;
 };
 
+class SourceCarrierChannelDiagnostics {
+public:
+    SourceCarrierChannelDiagnostics(
+        std::string path,
+        std::vector<SourceCarrierChannelRule> rules)
+        : path_(std::move(path)),
+          rules_(std::move(rules)) {
+        if (path_.empty()) {
+            return;
+        }
+        output_ = std::make_unique<std::ofstream>(path_, std::ios::binary);
+        if (!*output_) {
+            throw std::runtime_error(
+                "failed to open source carrier channel diagnostics: " + path_);
+        }
+        auto& output = *output_;
+        output << "{\"schema\":\"dtmb.c3780_source_carrier_channel.v1\"";
+        output << ",\"rules\":[";
+        for (std::size_t index = 0; index < rules_.size(); ++index) {
+            if (index != 0) {
+                output << ',';
+            }
+            output << "{\"carrier\":" << rules_[index].carrier
+                   << ",\"first_frame\":" << rules_[index].first_frame
+                   << ",\"last_frame\":" << rules_[index].last_frame << '}';
+        }
+        output << "],\"rows\":[";
+    }
+
+    SourceCarrierChannelDiagnostics(const SourceCarrierChannelDiagnostics&) = delete;
+    SourceCarrierChannelDiagnostics& operator=(
+        const SourceCarrierChannelDiagnostics&) = delete;
+
+    ~SourceCarrierChannelDiagnostics() {
+        if (output_ && !closed_) {
+            *output_ << "]}";
+        }
+    }
+
+    void observe(
+        std::size_t source_frame,
+        std::size_t model_index,
+        std::size_t model_frame_index,
+        const dtmb::core::Pn945WidebandChannelModel& model,
+        float noise_variance,
+        float response_floor,
+        int response_window_offset_adjust) {
+        if (!output_ || rules_.empty()) {
+            return;
+        }
+        if (model.template_response_fft.size()
+            < dtmb::core::kC3780FrameBodySymbols * 2) {
+            throw std::runtime_error(
+                "source carrier channel diagnostics require template response FFT");
+        }
+        if (model_frame_index * 2 + 1 >= model.frame_response_scales.size()) {
+            throw std::runtime_error(
+                "source carrier channel diagnostics model frame index is outside response scales");
+        }
+        bool matched_frame = false;
+        for (const auto& rule : rules_) {
+            if (source_frame >= rule.first_frame && source_frame <= rule.last_frame) {
+                matched_frame = true;
+                break;
+            }
+        }
+        if (!matched_frame) {
+            return;
+        }
+
+        const auto response_scale = std::complex<float>{
+            model.frame_response_scales[model_frame_index * 2],
+            model.frame_response_scales[model_frame_index * 2 + 1],
+        };
+        const auto response_window_offset =
+            wideband_response_window_offset(model, response_window_offset_adjust);
+        const auto masked_frame_taps = model.scale_estimator
+            == dtmb::core::Pn945WidebandScaleEstimator::masked_frame_taps;
+        std::vector<float> masked_frame_response_fft;
+        if (masked_frame_taps) {
+            const auto span = model.template_taps.size() / 2;
+            if (span == 0
+                || (model_frame_index + 1) * span * 2
+                    > model.frame_template_taps.size()) {
+                throw std::runtime_error(
+                    "source carrier channel diagnostics missing masked frame taps");
+            }
+            std::vector<float> padded_taps(
+                dtmb::core::kC3780FrameBodySymbols * 2,
+                0.0F);
+            const auto base = model_frame_index * span * 2;
+            std::copy_n(
+                model.frame_template_taps.begin() + static_cast<std::ptrdiff_t>(base),
+                span * 2,
+                padded_taps.begin());
+            masked_frame_response_fft.resize(dtmb::core::kC3780FrameBodySymbols * 2);
+            dtmb::core::mixed_radix_fft_forward_cf32(
+                padded_taps,
+                masked_frame_response_fft);
+        }
+        auto& output = *output_;
+        for (std::size_t rule_index = 0; rule_index < rules_.size(); ++rule_index) {
+            const auto& rule = rules_[rule_index];
+            if (source_frame < rule.first_frame || source_frame > rule.last_frame) {
+                continue;
+            }
+            const auto inserted_logical = data_carrier_to_inserted_logical(rule.carrier);
+            const auto physical_bin = c3780_logical_to_physical(inserted_logical);
+            auto template_response = std::complex<float>{
+                model.template_response_fft[physical_bin * 2],
+                model.template_response_fft[physical_bin * 2 + 1],
+            };
+            auto frame_response = masked_frame_taps
+                ? std::complex<float>{
+                    masked_frame_response_fft[physical_bin * 2],
+                    masked_frame_response_fft[physical_bin * 2 + 1],
+                }
+                : template_response * response_scale;
+            auto channel = frame_response;
+            if (response_window_offset != 0) {
+                const auto angle = 2.0F * std::numbers::pi_v<float>
+                    * static_cast<float>(response_window_offset)
+                    * static_cast<float>(physical_bin)
+                    / static_cast<float>(dtmb::core::kC3780FrameBodySymbols);
+                channel *= std::complex<float>{std::cos(angle), std::sin(angle)};
+            }
+
+            std::complex<float> equalizer_coefficient{};
+            double mmse_denominator = 0.0;
+            if (noise_variance >= 0.0F) {
+                mmse_denominator =
+                    static_cast<double>(std::norm(channel)) + noise_variance;
+                equalizer_coefficient =
+                    std::conj(channel) / static_cast<float>(mmse_denominator);
+            } else if (std::abs(channel) >= response_floor) {
+                equalizer_coefficient = 1.0F / channel;
+            } else {
+                equalizer_coefficient = std::complex<float>{1.0F, 0.0F};
+            }
+
+            if (wrote_row_) {
+                output << ',';
+            }
+            wrote_row_ = true;
+            output << "{\"rule_index\":" << rule_index
+                   << ",\"source_frame\":" << source_frame
+                   << ",\"model_index\":" << model_index
+                   << ",\"model_frame_index\":" << model_frame_index
+                   << ",\"carrier\":" << rule.carrier
+                   << ",\"inserted_logical\":" << inserted_logical
+                   << ",\"physical_bin\":" << physical_bin
+                   << ",\"masked_frame_taps\":"
+                   << (masked_frame_taps ? "true" : "false")
+                   << ",\"response_window_offset\":" << response_window_offset
+                   << ",\"noise_variance\":" << noise_variance
+                   << ",\"response_floor\":" << response_floor
+                   << ",\"template_response_real\":" << template_response.real()
+                   << ",\"template_response_imag\":" << template_response.imag()
+                   << ",\"template_response_abs\":" << std::abs(template_response)
+                   << ",\"template_response_phase_rad\":"
+                   << std::atan2(
+                          template_response.imag(),
+                          template_response.real())
+                   << ",\"response_scale_real\":" << response_scale.real()
+                   << ",\"response_scale_imag\":" << response_scale.imag()
+                   << ",\"response_scale_abs\":" << std::abs(response_scale)
+                   << ",\"response_scale_phase_rad\":"
+                   << std::atan2(response_scale.imag(), response_scale.real())
+                   << ",\"frame_response_real\":" << frame_response.real()
+                   << ",\"frame_response_imag\":" << frame_response.imag()
+                   << ",\"frame_response_abs\":" << std::abs(frame_response)
+                   << ",\"frame_response_phase_rad\":"
+                   << std::atan2(frame_response.imag(), frame_response.real())
+                   << ",\"channel_real\":" << channel.real()
+                   << ",\"channel_imag\":" << channel.imag()
+                   << ",\"channel_abs\":" << std::abs(channel)
+                   << ",\"channel_phase_rad\":"
+                   << std::atan2(channel.imag(), channel.real())
+                   << ",\"equalizer_coefficient_real\":"
+                   << equalizer_coefficient.real()
+                   << ",\"equalizer_coefficient_imag\":"
+                   << equalizer_coefficient.imag()
+                   << ",\"equalizer_coefficient_abs\":"
+                   << std::abs(equalizer_coefficient)
+                   << ",\"equalizer_coefficient_phase_rad\":"
+                   << std::atan2(
+                          equalizer_coefficient.imag(),
+                          equalizer_coefficient.real())
+                   << ",\"mmse_denominator\":";
+            if (noise_variance >= 0.0F) {
+                output << mmse_denominator;
+            } else {
+                output << "null";
+            }
+            output << '}';
+        }
+        if (!output) {
+            throw std::runtime_error(
+                "failed to write source carrier channel diagnostics");
+        }
+    }
+
+    void close() {
+        if (!output_ || closed_) {
+            return;
+        }
+        *output_ << "]}";
+        if (!*output_) {
+            throw std::runtime_error(
+                "failed to close source carrier channel diagnostics");
+        }
+        closed_ = true;
+    }
+
+private:
+    std::string path_;
+    std::vector<SourceCarrierChannelRule> rules_;
+    std::unique_ptr<std::ofstream> output_;
+    bool wrote_row_ = false;
+    bool closed_ = false;
+};
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1753,26 +3256,56 @@ int main(int argc, char** argv) {
     std::size_t timing_trajectory_interval_frames = 0;
     std::size_t timing_trajectory_fit_points = 9;
     float timing_trajectory_max_innovation_samples = 2.0F;
+    std::string timing_trajectory_seed_path;
+    std::size_t timing_trajectory_frame_index_offset = 0;
+    double timing_trajectory_offset_origin_samples = 0.0;
+    std::string timing_trajectory_state_out_path;
+    std::size_t timing_trajectory_state_out_frame = 0;
     bool timing_trajectory_local_search = false;
     float timing_trajectory_local_search_min_improvement = 0.0F;
+    std::vector<TimingLocalSearchScopedMinImprovementRule>
+        timing_trajectory_local_search_scoped_min_improvements;
+    bool timing_trajectory_local_search_transient = false;
+    std::vector<TimingLocalSearchTransientRange>
+        timing_trajectory_local_search_transient_ranges;
     std::int64_t auto_phase_adjustment = 0;
     float frequency_shift_hz = 0.0F;
     float sync_hit_threshold = 0.35F;
     float timing_search_threshold = 0.45F;
     std::size_t system_info_index = 23;
+    bool system_info_auto = false;
+    std::size_t system_info_auto_observation_frames = 32;
+    float system_info_auto_min_metric = 0.75F;
+    float system_info_auto_min_margin = 0.03F;
     auto normalization = Normalization::system_info;
     auto equalizer = Equalizer::flat;
     auto pn_estimator = PnEstimator::compact;
+    auto pn_wideband_scale_estimator =
+        dtmb::core::Pn945WidebandScaleEstimator::dominant_tap;
+    auto pn_wideband_header_observation =
+        dtmb::core::Pn945HeaderObservation::core_only;
+    std::size_t pn_wideband_max_span_symbols =
+        dtmb::core::Pn945WidebandModelOptions{}.max_span_symbols;
+    int pn_wideband_response_window_offset_adjust = 0;
+    bool pn_wideband_body_channel_midpoint = false;
+    bool pn_csi_demap = false;
     auto pn_mmse = PnMmse{};
     bool remove_dc = false;
     bool auto_sync = false;
     bool estimate_residual_cfo = true;
     bool phase_offset_set = false;
+    auto data_dd_options = DataDecisionDirectedOptions{};
+    auto data_dd_stats = DataDecisionDirectedStats{};
     std::string wideband_diagnostics_path;
+    std::string wideband_frame_diagnostics_path;
+    std::string pn_csi_weights_path;
     std::string timing_diagnostics_path;
     std::string frame_residual_diagnostics_path;
+    std::string normalization_diagnostics_path;
     std::string source_carrier_residual_diagnostics_path;
     std::vector<SourceCarrierResidualRule> source_carrier_residual_rules;
+    std::string source_carrier_channel_diagnostics_path;
+    std::vector<SourceCarrierChannelRule> source_carrier_channel_rules;
     std::string input_path = "-";
     std::string output_path = "-";
     std::vector<std::string> positional;
@@ -1851,8 +3384,53 @@ int main(int argc, char** argv) {
                 timing_trajectory_max_innovation_samples = parse_float(
                     argv[index],
                     "timing trajectory maximum innovation");
+            } else if (arg == "--timing-trajectory-seed") {
+                if (++index >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                timing_trajectory_seed_path = argv[index];
+            } else if (arg == "--timing-trajectory-frame-index-offset") {
+                if (++index >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                timing_trajectory_frame_index_offset = parse_size(
+                    argv[index],
+                    "timing trajectory frame index offset");
+            } else if (arg == "--timing-trajectory-offset-origin-samples") {
+                if (++index >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                timing_trajectory_offset_origin_samples = parse_double(
+                    argv[index],
+                    "timing trajectory offset origin");
+            } else if (arg == "--timing-trajectory-state-out") {
+                if (++index >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                timing_trajectory_state_out_path = argv[index];
+            } else if (arg == "--timing-trajectory-state-out-frame") {
+                if (++index >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                timing_trajectory_state_out_frame = parse_size(
+                    argv[index],
+                    "timing trajectory state output frame");
             } else if (arg == "--timing-trajectory-local-search") {
                 timing_trajectory_local_search = true;
+            } else if (arg == "--timing-trajectory-local-search-transient") {
+                timing_trajectory_local_search_transient = true;
+            } else if (arg == "--timing-trajectory-local-search-transient-range") {
+                if (++index >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                timing_trajectory_local_search_transient_ranges.push_back(
+                    parse_timing_local_search_transient_range(argv[index]));
             } else if (arg == "--timing-trajectory-local-search-min-improvement") {
                 if (++index >= argc) {
                     usage(argv[0]);
@@ -1861,6 +3439,27 @@ int main(int argc, char** argv) {
                 timing_trajectory_local_search_min_improvement = parse_float(
                     argv[index],
                     "timing trajectory local-search minimum improvement");
+            } else if (
+                arg == "--timing-trajectory-local-search-scoped-min-improvement") {
+                if (++index >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                const auto rule =
+                    parse_timing_local_search_scoped_min_improvement_rule(argv[index]);
+                for (const auto& existing :
+                     timing_trajectory_local_search_scoped_min_improvements) {
+                    const auto disjoint = rule.last_frame < existing.first_frame
+                        || existing.last_frame < rule.first_frame;
+                    if (!disjoint) {
+                        throw std::invalid_argument(
+                            std::string(
+                                "overlapping timing local-search scoped "
+                                "min-improvement rule: ")
+                            + argv[index]);
+                    }
+                }
+                timing_trajectory_local_search_scoped_min_improvements.push_back(rule);
             } else if (arg == "--timing-diagnostics") {
                 if (++index >= argc) {
                     usage(argv[0]);
@@ -1919,18 +3518,76 @@ int main(int argc, char** argv) {
                 pn_wideband_block_frames = parse_size(
                     argv[index],
                     "PN wideband block frame count");
+            } else if (arg == "--pn-wideband-header-observation") {
+                if (++index >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                pn_wideband_header_observation =
+                    parse_pn_wideband_header_observation(argv[index]);
+            } else if (arg == "--pn-wideband-scale-estimator") {
+                if (++index >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                pn_wideband_scale_estimator =
+                    parse_pn_wideband_scale_estimator(argv[index]);
+            } else if (arg == "--pn-wideband-max-span-symbols") {
+                if (++index >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                pn_wideband_max_span_symbols = parse_size(
+                    argv[index],
+                    "PN wideband maximum span");
+            } else if (arg == "--pn-wideband-response-window-offset-adjust") {
+                if (++index >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                pn_wideband_response_window_offset_adjust = static_cast<int>(
+                    parse_signed_size(
+                        argv[index],
+                        "PN wideband response-window offset adjustment"));
+            } else if (arg == "--pn-wideband-body-channel") {
+                if (++index >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                pn_wideband_body_channel_midpoint =
+                    parse_pn_wideband_body_channel_midpoint(argv[index]);
+            } else if (arg == "--pn-csi-demap") {
+                pn_csi_demap = true;
+            } else if (arg == "--pn-csi-weights-out") {
+                if (++index >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                pn_csi_weights_path = argv[index];
             } else if (arg == "--pn-wideband-diagnostics") {
                 if (++index >= argc) {
                     usage(argv[0]);
                     return 2;
                 }
                 wideband_diagnostics_path = argv[index];
+            } else if (arg == "--pn-wideband-frame-diagnostics") {
+                if (++index >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                wideband_frame_diagnostics_path = argv[index];
             } else if (arg == "--frame-residual-diagnostics") {
                 if (++index >= argc) {
                     usage(argv[0]);
                     return 2;
                 }
                 frame_residual_diagnostics_path = argv[index];
+            } else if (arg == "--normalization-diagnostics") {
+                if (++index >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                normalization_diagnostics_path = argv[index];
             } else if (arg == "--source-carrier-residual") {
                 if (++index >= argc) {
                     usage(argv[0]);
@@ -1944,6 +3601,19 @@ int main(int argc, char** argv) {
                     return 2;
                 }
                 source_carrier_residual_diagnostics_path = argv[index];
+            } else if (arg == "--source-carrier-channel") {
+                if (++index >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                source_carrier_channel_rules.push_back(
+                    parse_source_carrier_channel_rule(argv[index]));
+            } else if (arg == "--source-carrier-channel-diagnostics-out") {
+                if (++index >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                source_carrier_channel_diagnostics_path = argv[index];
             } else if (arg == "--pn-mmse") {
                 if (++index >= argc) {
                     usage(argv[0]);
@@ -1958,12 +3628,76 @@ int main(int argc, char** argv) {
                     return 2;
                 }
                 normalization = parse_normalization(argv[index]);
+            } else if (arg == "--data-dd-refine") {
+                data_dd_options.enabled = true;
+            } else if (arg == "--data-dd-max-relative-error") {
+                if (++index >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                data_dd_options.max_relative_error = parse_float(
+                    argv[index],
+                    "data DD maximum relative error");
+            } else if (arg == "--data-dd-min-reliable-carriers") {
+                if (++index >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                data_dd_options.min_reliable_carriers = parse_size(
+                    argv[index],
+                    "data DD minimum reliable carrier count");
+            } else if (arg == "--data-dd-max-axis-inner-fraction") {
+                if (++index >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                data_dd_options.max_axis_inner_fraction = parse_float(
+                    argv[index],
+                    "data DD maximum axis-inner fraction");
+            } else if (arg == "--data-dd-max-hard-bit-bias") {
+                if (++index >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                data_dd_options.max_hard_bit_bias = parse_float(
+                    argv[index],
+                    "data DD maximum hard-bit bias");
             } else if (arg == "--system-info-index") {
                 if (++index >= argc) {
                     usage(argv[0]);
                     return 2;
                 }
-                system_info_index = parse_size(argv[index], "system information index");
+                const auto value = std::string_view{argv[index]};
+                if (value == "auto") {
+                    system_info_auto = true;
+                } else {
+                    system_info_index = parse_size(argv[index], "system information index");
+                    system_info_auto = false;
+                }
+            } else if (arg == "--system-info-auto-observation-frames") {
+                if (++index >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                system_info_auto_observation_frames = parse_size(
+                    argv[index],
+                    "system information auto observation frames");
+            } else if (arg == "--system-info-auto-min-metric") {
+                if (++index >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                system_info_auto_min_metric = parse_float(
+                    argv[index],
+                    "system information auto minimum metric");
+            } else if (arg == "--system-info-auto-min-margin") {
+                if (++index >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                system_info_auto_min_margin = parse_float(
+                    argv[index],
+                    "system information auto minimum margin");
             } else if (arg == "--no-normalize") {
                 normalization = Normalization::none;
             } else if (arg == "-h" || arg == "--help") {
@@ -1975,6 +3709,8 @@ int main(int argc, char** argv) {
         }
         if (positional.size() > 2 || pn_channel_taps == 0 || pn_channel_taps > 511
             || pn_wideband_block_frames == 0
+            || pn_wideband_max_span_symbols == 0
+            || pn_wideband_max_span_symbols > 511
             || timing_search_radius > dtmb::core::kPn945HeaderSymbols
             || timing_trajectory_fit_points > 256
             || !std::isfinite(timing_trajectory_max_innovation_samples)
@@ -1997,6 +3733,18 @@ int main(int argc, char** argv) {
                 > std::numeric_limits<std::size_t>::max()
                     / (dtmb::core::kPn945FrameSymbols * 2)
                     - 1
+            || !std::isfinite(data_dd_options.max_axis_inner_fraction)
+            || data_dd_options.max_axis_inner_fraction < 0.0F
+            || data_dd_options.max_axis_inner_fraction > 1.0F
+            || !std::isfinite(data_dd_options.max_hard_bit_bias)
+            || data_dd_options.max_hard_bit_bias < 0.0F
+            || system_info_auto_observation_frames == 0
+            || !std::isfinite(system_info_auto_min_metric)
+            || system_info_auto_min_metric < 0.0F
+            || system_info_auto_min_metric > 1.0F
+            || !std::isfinite(system_info_auto_min_margin)
+            || system_info_auto_min_margin < 0.0F
+            || system_info_auto_min_margin > 1.0F
             || phase_offset > std::numeric_limits<std::size_t>::max() / 2) {
             usage(argv[0]);
             return 2;
@@ -2016,10 +3764,52 @@ int main(int argc, char** argv) {
             throw std::invalid_argument(
                 "--timing-trajectory-fit-points must be at least 2");
         }
+        if (!timing_trajectory_seed_path.empty()
+            && timing_trajectory_interval_frames == 0) {
+            throw std::invalid_argument(
+                "--timing-trajectory-seed requires "
+                "--timing-trajectory-interval-frames");
+        }
+        if (timing_trajectory_frame_index_offset != 0
+            && timing_trajectory_interval_frames == 0) {
+            throw std::invalid_argument(
+                "--timing-trajectory-frame-index-offset requires "
+                "--timing-trajectory-interval-frames");
+        }
+        if (timing_trajectory_offset_origin_samples != 0.0
+            && timing_trajectory_interval_frames == 0) {
+            throw std::invalid_argument(
+                "--timing-trajectory-offset-origin-samples requires "
+                "--timing-trajectory-interval-frames");
+        }
+        if (timing_trajectory_offset_origin_samples != 0.0
+            && timing_trajectory_seed_path.empty()) {
+            throw std::invalid_argument(
+                "--timing-trajectory-offset-origin-samples requires "
+                "--timing-trajectory-seed");
+        }
+        if (!timing_trajectory_state_out_path.empty()
+            && timing_trajectory_interval_frames == 0) {
+            throw std::invalid_argument(
+                "--timing-trajectory-state-out requires "
+                "--timing-trajectory-interval-frames");
+        }
+        if (timing_trajectory_state_out_frame != 0
+            && timing_trajectory_state_out_path.empty()) {
+            throw std::invalid_argument(
+                "--timing-trajectory-state-out-frame requires "
+                "--timing-trajectory-state-out");
+        }
         if (timing_trajectory_local_search && timing_trajectory_interval_frames == 0) {
             throw std::invalid_argument(
                 "--timing-trajectory-local-search requires "
                 "--timing-trajectory-interval-frames");
+        }
+        if (!timing_trajectory_local_search_scoped_min_improvements.empty()
+            && !timing_trajectory_local_search) {
+            throw std::invalid_argument(
+                "--timing-trajectory-local-search-scoped-min-improvement requires "
+                "--timing-trajectory-local-search");
         }
         if (timing_trajectory_local_search_min_improvement != 0.0F
             && !timing_trajectory_local_search) {
@@ -2027,8 +3817,30 @@ int main(int argc, char** argv) {
                 "--timing-trajectory-local-search-min-improvement requires "
                 "--timing-trajectory-local-search");
         }
+        if (timing_trajectory_local_search_transient
+            && !timing_trajectory_local_search) {
+            throw std::invalid_argument(
+                "--timing-trajectory-local-search-transient requires "
+                "--timing-trajectory-local-search");
+        }
+        if (!timing_trajectory_local_search_transient_ranges.empty()
+            && !timing_trajectory_local_search) {
+            throw std::invalid_argument(
+                "--timing-trajectory-local-search-transient-range requires "
+                "--timing-trajectory-local-search");
+        }
         if (pn_mmse.automatic && pn_estimator != PnEstimator::wideband) {
             throw std::invalid_argument("--pn-mmse auto requires --pn-estimator wideband");
+        }
+        if (data_dd_options.enabled && normalization != Normalization::qam64) {
+            throw std::invalid_argument("--data-dd-refine requires --normalization qam64");
+        }
+        if (data_dd_options.max_relative_error <= 0.0F) {
+            throw std::invalid_argument("--data-dd-max-relative-error must be positive");
+        }
+        if (data_dd_options.min_reliable_carriers > dtmb::core::kC3780DataSymbols) {
+            throw std::invalid_argument(
+                "--data-dd-min-reliable-carriers exceeds C3780 data carrier count");
         }
         for (const auto& rule : source_carrier_residual_rules) {
             if (rule.carrier >= dtmb::core::kC3780DataSymbols) {
@@ -2040,6 +3852,49 @@ int main(int argc, char** argv) {
             && source_carrier_residual_diagnostics_path.empty()) {
             throw std::invalid_argument(
                 "--source-carrier-residual requires --source-carrier-residual-diagnostics-out");
+        }
+        for (const auto& rule : source_carrier_channel_rules) {
+            if (rule.carrier >= dtmb::core::kC3780DataSymbols) {
+                throw std::invalid_argument(
+                    "source carrier channel carrier is outside the C3780 data span");
+            }
+        }
+        if (!source_carrier_channel_rules.empty()
+            && source_carrier_channel_diagnostics_path.empty()) {
+            throw std::invalid_argument(
+                "--source-carrier-channel requires --source-carrier-channel-diagnostics-out");
+        }
+        if (!source_carrier_channel_rules.empty()
+            && (equalizer != Equalizer::pn || pn_estimator != PnEstimator::wideband)) {
+            throw std::invalid_argument(
+                "--source-carrier-channel requires --equalizer pn --pn-estimator wideband");
+        }
+        if (!wideband_frame_diagnostics_path.empty()
+            && (equalizer != Equalizer::pn || pn_estimator != PnEstimator::wideband)) {
+            throw std::invalid_argument(
+                "--pn-wideband-frame-diagnostics requires --equalizer pn --pn-estimator wideband");
+        }
+        if (pn_csi_demap
+            && (equalizer != Equalizer::pn || pn_estimator != PnEstimator::wideband)) {
+            throw std::invalid_argument(
+                "--pn-csi-demap requires --equalizer pn --pn-estimator wideband");
+        }
+        if (pn_csi_demap && pn_csi_weights_path.empty()) {
+            throw std::invalid_argument(
+                "--pn-csi-demap requires --pn-csi-weights-out");
+        }
+        if (!pn_csi_demap && !pn_csi_weights_path.empty()) {
+            throw std::invalid_argument(
+                "--pn-csi-weights-out requires --pn-csi-demap");
+        }
+        if (pn_csi_demap && normalization != Normalization::qam64) {
+            throw std::invalid_argument(
+                "--pn-csi-demap requires --normalization qam64");
+        }
+        if (pn_csi_demap
+            && !pn_mmse.automatic
+            && pn_mmse.noise_variance <= 0.0F) {
+            throw std::invalid_argument("--pn-csi-demap requires PN MMSE equalization");
         }
         if (!positional.empty()) {
             input_path = positional[0];
@@ -2053,6 +3908,14 @@ int main(int argc, char** argv) {
         std::unique_ptr<std::ofstream> output_file;
         auto& input = input_stream(input_path, input_file);
         auto& output = output_stream(output_path, output_file);
+        std::ofstream pn_csi_weights;
+        if (!pn_csi_weights_path.empty()) {
+            pn_csi_weights.open(pn_csi_weights_path, std::ios::binary);
+            if (!pn_csi_weights) {
+                throw std::runtime_error(
+                    "failed to open PN CSI weights output: " + pn_csi_weights_path);
+            }
+        }
         std::ofstream wideband_diagnostics;
         if (!wideband_diagnostics_path.empty()) {
             wideband_diagnostics.open(wideband_diagnostics_path, std::ios::binary);
@@ -2068,11 +3931,48 @@ int main(int argc, char** argv) {
                 << "phase_agreement,per_frame_noise_tap_power,noise_variance,"
                 << "truncated_energy_fraction,dc_offset_i,dc_offset_q\n";
         }
+        std::ofstream wideband_frame_diagnostics;
+        if (!wideband_frame_diagnostics_path.empty()) {
+            wideband_frame_diagnostics.open(
+                wideband_frame_diagnostics_path,
+                std::ios::binary);
+            if (!wideband_frame_diagnostics) {
+                throw std::runtime_error(
+                    "failed to open PN wideband frame diagnostics: "
+                    + wideband_frame_diagnostics_path);
+            }
+            wideband_frame_diagnostics
+                << "source_frame,model_index,model_frame_index,"
+                << "sample_start,next_sample_start,pn_phase,next_pn_phase,"
+                << "model_pn_phase,model_next_pn_phase,"
+                << "response_scale_real,response_scale_imag,"
+                << "response_scale_abs,response_scale_phase_rad,"
+                << "next_tap_phase_drift_rad,next_tap_coherence,"
+                << "next_to_current_tap_power,"
+                << "next_sampled_carrier_shape_change_rms,"
+                << "next_sampled_carrier_shape_change_max,"
+                << "slot0_next_sampled_carrier_shape_change_rms,"
+                << "slot0_next_sampled_carrier_shape_change_max,"
+                << "slot1_next_sampled_carrier_shape_change_rms,"
+                << "slot1_next_sampled_carrier_shape_change_max,"
+                << "slot2_next_sampled_carrier_shape_change_rms,"
+                << "slot2_next_sampled_carrier_shape_change_max,"
+                << "model_rotation_symbols,model_dominant_tap_index,"
+                << "model_span_symbols,model_significant_taps,"
+                << "model_phase_agreement,model_noise_variance,"
+                << "model_truncated_energy_fraction,dc_offset_i,dc_offset_q\n";
+        }
         SourceCarrierResidualDiagnostics source_carrier_residuals(
             source_carrier_residual_diagnostics_path,
             source_carrier_residual_rules);
+        SourceCarrierChannelDiagnostics source_carrier_channels(
+            source_carrier_channel_diagnostics_path,
+            source_carrier_channel_rules);
         TimingDiagnostics timing_diagnostics(timing_diagnostics_path);
         FrameResidualDiagnostics frame_residuals(frame_residual_diagnostics_path);
+        FrameNormalizationDiagnostics normalization_diagnostics(
+            normalization_diagnostics_path,
+            normalization);
 
         auto worker_count = requested_workers;
         if (worker_count == 0) {
@@ -2152,6 +4052,32 @@ int main(int argc, char** argv) {
         ReplayInput replay_input(input, std::move(startup_ci8));
         const auto phase_bytes = phase_offset * 2;
         const auto discarded_phase_bytes = discard_bytes(replay_input, phase_bytes);
+        const auto timing_trajectory_seed = load_timing_trajectory_seed(
+            timing_trajectory_seed_path);
+        if (timing_trajectory_seed.frame_index_offset.has_value()) {
+            if (timing_trajectory_frame_index_offset != 0
+                && timing_trajectory_frame_index_offset
+                    != *timing_trajectory_seed.frame_index_offset) {
+                throw std::invalid_argument(
+                    "timing trajectory seed frame-index metadata conflicts with CLI");
+            }
+            timing_trajectory_frame_index_offset =
+                *timing_trajectory_seed.frame_index_offset;
+        }
+        if (system_info_auto && normalization == Normalization::system_info) {
+            throw std::invalid_argument(
+                "--system-info-index auto requires qam64, qam64-amplitude, or no normalization");
+        }
+        if (timing_trajectory_seed.offset_origin_samples.has_value()) {
+            if (timing_trajectory_offset_origin_samples != 0.0
+                && timing_trajectory_offset_origin_samples
+                    != *timing_trajectory_seed.offset_origin_samples) {
+                throw std::invalid_argument(
+                    "timing trajectory seed offset-origin metadata conflicts with CLI");
+            }
+            timing_trajectory_offset_origin_samples =
+                *timing_trajectory_seed.offset_origin_samples;
+        }
         TrackingFrameReader frame_reader(
             replay_input,
             phase_offset,
@@ -2160,10 +4086,35 @@ int main(int argc, char** argv) {
             timing_trajectory_interval_frames,
             timing_trajectory_fit_points,
             timing_trajectory_max_innovation_samples,
+            timing_trajectory_seed.points,
+            timing_trajectory_frame_index_offset,
+            timing_trajectory_offset_origin_samples,
+            timing_trajectory_state_out_path,
+            timing_trajectory_state_out_frame,
             timing_trajectory_local_search,
             timing_trajectory_local_search_min_improvement,
+            timing_trajectory_local_search_scoped_min_improvements,
+            timing_trajectory_local_search_transient,
+            timing_trajectory_local_search_transient_ranges,
             &timing_diagnostics);
-        const auto reference = system_info_reference(system_info_index);
+        auto reference_index = system_info_index;
+        auto reference = system_info_reference(reference_index);
+        auto system_info_selector = SystemInfoAutoSelector{
+            system_info_auto_observation_frames,
+            system_info_auto_min_metric,
+            system_info_auto_min_margin,
+        };
+        const auto observe_system_information = [&](const FrameWork& frame) {
+            if (!system_info_auto) {
+                return;
+            }
+            system_info_selector.observe(frame.logical_cf32);
+            const auto& selection = system_info_selector.selection();
+            if (selection.locked && selection.index != reference_index) {
+                reference_index = selection.index;
+                reference = system_info_reference(reference_index);
+            }
+        };
 
         std::size_t frame_count = 0;
         std::size_t input_frame_count = 0;
@@ -2208,12 +4159,24 @@ int main(int argc, char** argv) {
                     reference,
                     pn_channel_taps,
                     frequency_shift_hz,
-                    pn_mmse.noise_variance);
+                    pn_mmse.noise_variance,
+                    data_dd_options,
+                    data_dd_stats);
                 if (frame_count == 0) {
                     first_pn_phase = result.pn_phase;
                 }
                 last_pn_phase = result.pn_phase;
                 frame_residuals.observe(frame_count, current.data_cf32);
+                observe_system_information(current);
+                normalization_diagnostics.observe(
+                    frame_count,
+                    current.normalization_stats,
+                    true,
+                    result.pn_phase,
+                    result.next_pn_phase,
+                    result.pn_phase,
+                    result.next_pn_phase,
+                    0U);
                 source_carrier_residuals.observe(frame_count, current.data_cf32);
                 write_all(output, current.data_cf32);
                 ++frame_count;
@@ -2258,8 +4221,12 @@ int main(int argc, char** argv) {
                 const auto model = build_wideband_model(
                     frames,
                     frequency_shift_hz,
-                    dc_offset);
+                    dc_offset,
+                    pn_wideband_scale_estimator,
+                    pn_wideband_header_observation,
+                    pn_wideband_max_span_symbols);
                 ++wideband_model_count;
+                const auto model_index = wideband_model_count - 1;
                 wideband_model_stats.observe(model);
                 wideband_span_symbols = model.template_taps.size() / 2;
                 wideband_significant_taps = model.significant_taps;
@@ -2273,7 +4240,7 @@ int main(int argc, char** argv) {
                 const auto output_count = std::min(pn_wideband_block_frames, remaining);
                 if (wideband_diagnostics.is_open()) {
                     wideband_diagnostics
-                        << (wideband_model_count - 1) << ','
+                        << model_index << ','
                         << frame_count << ','
                         << available << ','
                         << output_count << ','
@@ -2318,7 +4285,12 @@ int main(int argc, char** argv) {
                                     frame,
                                     frequency_shift_hz,
                                     noise_variance,
-                                    dc_offset);
+                                    dc_offset,
+                                    pn_wideband_response_window_offset_adjust,
+                                    pn_wideband_body_channel_midpoint,
+                                    pn_csi_demap,
+                                    data_dd_options,
+                                    data_dd_stats);
                             }
                         } catch (...) {
                             worker_errors[worker] = std::current_exception();
@@ -2341,13 +4313,85 @@ int main(int argc, char** argv) {
                     }
                     last_pn_phase = result.pn_phase;
                     const auto output_frame_index = output_frame_base + frame;
+                    if (wideband_frame_diagnostics.is_open()) {
+                        const auto response_scale = std::complex<float>{
+                            model.frame_response_scales[frame * 2],
+                            model.frame_response_scales[frame * 2 + 1],
+                        };
+                        const auto transition =
+                            pn_tap_transition_stats(
+                                model,
+                                frame,
+                                noise_variance);
+                        wideband_frame_diagnostics
+                            << output_frame_index << ','
+                            << model_index << ','
+                            << frame << ','
+                            << frames[frame].sample_start << ','
+                            << frames[frame + 1].sample_start << ','
+                            << result.pn_phase << ','
+                            << result.next_pn_phase << ','
+                            << model.frame_pn_phases[frame] << ','
+                            << model.frame_pn_phases[frame + 1] << ','
+                            << response_scale.real() << ','
+                            << response_scale.imag() << ','
+                            << std::abs(response_scale) << ','
+                            << std::atan2(
+                                   response_scale.imag(),
+                                   response_scale.real()) << ','
+                            << transition.phase_rad << ','
+                            << transition.coherence << ','
+                            << transition.next_to_current_power << ','
+                            << transition.sampled_carrier_shape_change_rms << ','
+                            << transition.sampled_carrier_shape_change_max << ','
+                            << transition.slot_sampled_carrier_shape_change_rms[0] << ','
+                            << transition.slot_sampled_carrier_shape_change_max[0] << ','
+                            << transition.slot_sampled_carrier_shape_change_rms[1] << ','
+                            << transition.slot_sampled_carrier_shape_change_max[1] << ','
+                            << transition.slot_sampled_carrier_shape_change_rms[2] << ','
+                            << transition.slot_sampled_carrier_shape_change_max[2] << ','
+                            << model.rotation_symbols << ','
+                            << model.dominant_tap_index << ','
+                            << (model.template_taps.size() / 2) << ','
+                            << model.significant_taps << ','
+                            << model.phase_agreement << ','
+                            << model.noise_variance << ','
+                            << model.truncated_energy_fraction << ','
+                            << dc_offset.real() << ','
+                            << dc_offset.imag() << '\n';
+                        if (!wideband_frame_diagnostics) {
+                            throw std::runtime_error(
+                                "failed to write PN wideband frame diagnostics");
+                        }
+                    }
                     frame_residuals.observe(
                         output_frame_index,
                         frames[frame].data_cf32);
+                    observe_system_information(frames[frame]);
+                    normalization_diagnostics.observe(
+                        output_frame_index,
+                        frames[frame].normalization_stats,
+                        true,
+                        result.pn_phase,
+                        result.next_pn_phase,
+                        model.frame_pn_phases[frame],
+                        model.frame_pn_phases[frame + 1U],
+                        model.rotation_symbols);
                     source_carrier_residuals.observe(
                         output_frame_index,
                         frames[frame].data_cf32);
+                    source_carrier_channels.observe(
+                        output_frame_index,
+                        model_index,
+                        frame,
+                        model,
+                        noise_variance,
+                        1.0e-3F,
+                        pn_wideband_response_window_offset_adjust);
                     write_all(output, frames[frame].data_cf32);
+                    if (pn_csi_weights.is_open()) {
+                        write_all(pn_csi_weights, frames[frame].csi_weights);
+                    }
                     ++frame_count;
                 }
                 if (output_count < pn_wideband_block_frames
@@ -2397,7 +4441,9 @@ int main(int argc, char** argv) {
                                     frame_batch[frame],
                                     normalization,
                                     reference,
-                                    frequency_shift_hz);
+                                    frequency_shift_hz,
+                                    data_dd_options,
+                                    data_dd_stats);
                             }
                         } catch (...) {
                             worker_errors[worker] = std::current_exception();
@@ -2416,6 +4462,16 @@ int main(int argc, char** argv) {
                     frame_residuals.observe(
                         frame_count + frame,
                         frame_batch[frame].data_cf32);
+                    observe_system_information(frame_batch[frame]);
+                    normalization_diagnostics.observe(
+                        frame_count + frame,
+                        frame_batch[frame].normalization_stats,
+                        false,
+                        0U,
+                        0U,
+                        0U,
+                        0U,
+                        0U);
                     source_carrier_residuals.observe(
                         frame_count + frame,
                         frame_batch[frame].data_cf32);
@@ -2425,8 +4481,10 @@ int main(int argc, char** argv) {
             }
         }
         source_carrier_residuals.close();
+        source_carrier_channels.close();
         timing_diagnostics.close();
         frame_residuals.close();
+        normalization_diagnostics.close();
 
         std::cerr << "front_end=" << (auto_sync ? "auto" : "pinned") << "_pn945_"
                   << (equalizer == Equalizer::pn ? "pn_equalized" : "flat")
@@ -2450,10 +4508,33 @@ int main(int argc, char** argv) {
                   << timing_trajectory_fit_points << '\n'
                   << "timing_trajectory_max_innovation_samples="
                   << timing_trajectory_max_innovation_samples << '\n'
+                  << "timing_trajectory_seed="
+                  << (timing_trajectory_seed_path.empty()
+                          ? "none"
+                          : timing_trajectory_seed_path)
+                  << '\n'
+                  << "timing_trajectory_frame_index_offset="
+                  << timing_trajectory_frame_index_offset << '\n'
+                  << "timing_trajectory_offset_origin_samples="
+                  << timing_trajectory_offset_origin_samples << '\n'
+                  << "timing_trajectory_state_out="
+                  << (timing_trajectory_state_out_path.empty()
+                          ? "none"
+                          : timing_trajectory_state_out_path)
+                  << '\n'
+                  << "timing_trajectory_state_out_frame="
+                  << timing_trajectory_state_out_frame << '\n'
                   << "timing_trajectory_local_search="
                   << (timing_trajectory_local_search ? "true" : "false") << '\n'
+                  << "timing_trajectory_local_search_transient="
+                  << (timing_trajectory_local_search_transient ? "true" : "false") << '\n'
+                  << "timing_trajectory_local_search_transient_ranges="
+                  << timing_trajectory_local_search_transient_ranges.size() << '\n'
                   << "timing_trajectory_local_search_min_improvement="
                   << timing_trajectory_local_search_min_improvement << '\n'
+                  << "timing_trajectory_local_search_scoped_min_improvement_rules="
+                  << timing_trajectory_local_search_scoped_min_improvements.size()
+                  << '\n'
                   << "timing_diagnostics="
                   << (timing_diagnostics_path.empty() ? "none" : timing_diagnostics_path)
                   << '\n'
@@ -2484,6 +4565,20 @@ int main(int argc, char** argv) {
                   << '\n'
                   << "pn_channel_taps=" << pn_channel_taps << '\n'
                   << "pn_wideband_block_frames=" << pn_wideband_block_frames << '\n'
+                  << "pn_wideband_header_observation="
+                  << pn_wideband_header_observation_name(
+                         pn_wideband_header_observation)
+                  << '\n'
+                  << "pn_wideband_scale_estimator="
+                  << pn_wideband_scale_estimator_name(pn_wideband_scale_estimator)
+                  << '\n'
+                  << "pn_wideband_max_span_symbols="
+                  << pn_wideband_max_span_symbols << '\n'
+                  << "pn_wideband_response_window_offset_adjust="
+                  << pn_wideband_response_window_offset_adjust << '\n'
+                  << "pn_wideband_body_channel="
+                  << (pn_wideband_body_channel_midpoint ? "midpoint" : "current")
+                  << '\n'
                   << "pn_wideband_model_count=" << wideband_model_count << '\n'
                   << "pn_wideband_span_min_symbols=" << wideband_model_stats.span_min << '\n'
                   << "pn_wideband_span_max_symbols=" << wideband_model_stats.span_max << '\n'
@@ -2519,10 +4614,24 @@ int main(int argc, char** argv) {
                   << "pn_wideband_diagnostics="
                   << (wideband_diagnostics_path.empty() ? "none" : wideband_diagnostics_path)
                   << '\n'
+                  << "pn_wideband_frame_diagnostics="
+                  << (wideband_frame_diagnostics_path.empty()
+                          ? "none"
+                          : wideband_frame_diagnostics_path)
+                  << '\n'
+                  << "pn_csi_demap=" << (pn_csi_demap ? "true" : "false") << '\n'
+                  << "pn_csi_weights="
+                  << (pn_csi_weights_path.empty() ? "none" : pn_csi_weights_path)
+                  << '\n'
                   << "frame_residual_diagnostics="
                   << (frame_residual_diagnostics_path.empty()
                           ? "none"
                           : frame_residual_diagnostics_path)
+                  << '\n'
+                  << "normalization_diagnostics="
+                  << (normalization_diagnostics_path.empty()
+                          ? "none"
+                          : normalization_diagnostics_path)
                   << '\n'
                   << "source_carrier_residual_rule_count="
                   << source_carrier_residual_rules.size() << '\n'
@@ -2531,6 +4640,41 @@ int main(int argc, char** argv) {
                           ? "none"
                           : source_carrier_residual_diagnostics_path)
                   << '\n'
+                  << "source_carrier_channel_rule_count="
+                  << source_carrier_channel_rules.size() << '\n'
+                  << "source_carrier_channel_diagnostics="
+                  << (source_carrier_channel_diagnostics_path.empty()
+                          ? "none"
+                          : source_carrier_channel_diagnostics_path)
+                  << '\n'
+                  << "data_dd_refine_enabled="
+                  << (data_dd_options.enabled ? "true" : "false") << '\n'
+                  << "data_dd_max_relative_error="
+                  << data_dd_options.max_relative_error << '\n'
+                  << "data_dd_min_reliable_carriers="
+                  << data_dd_options.min_reliable_carriers << '\n'
+                  << "data_dd_max_axis_inner_fraction="
+                  << data_dd_options.max_axis_inner_fraction << '\n'
+                  << "data_dd_max_hard_bit_bias="
+                  << data_dd_options.max_hard_bit_bias << '\n'
+                  << "data_dd_observed_frames=" << data_dd_stats.observed_frames << '\n'
+                  << "data_dd_refined_frames=" << data_dd_stats.refined_frames << '\n'
+                  << "data_dd_rejected_frames=" << data_dd_stats.rejected_frames << '\n'
+                  << "data_dd_reliable_carrier_rejected_frames="
+                  << data_dd_stats.reliable_carrier_rejected_frames << '\n'
+                  << "data_dd_axis_inner_rejected_frames="
+                  << data_dd_stats.axis_inner_rejected_frames << '\n'
+                  << "data_dd_hard_bit_bias_rejected_frames="
+                  << data_dd_stats.hard_bit_bias_rejected_frames << '\n'
+                  << "data_dd_reliable_carriers_min="
+                  << (data_dd_stats.observed_frames == 0
+                          ? 0
+                          : data_dd_stats.min_reliable_carriers)
+                  << '\n'
+                  << "data_dd_reliable_carriers_max="
+                  << data_dd_stats.max_reliable_carriers << '\n'
+                  << "data_dd_reliable_carriers_mean="
+                  << data_dd_stats.mean_reliable_carriers() << '\n'
                   << "remove_dc=" << (remove_dc ? "true" : "false") << '\n'
                   << "pn_mmse="
                   << (pn_mmse.automatic
@@ -2545,9 +4689,35 @@ int main(int argc, char** argv) {
                   << "normalization="
                   << (normalization == Normalization::system_info
                           ? "system-info"
-                          : normalization == Normalization::qam64 ? "qam64" : "none")
+                          : normalization == Normalization::qam64
+                              ? "qam64"
+                              : normalization == Normalization::qam64_amplitude
+                                  ? "qam64-amplitude"
+                                  : "none")
                   << '\n'
-                  << "system_info_index=" << system_info_index << '\n';
+                  << "system_info_index="
+                  << (system_info_auto
+                          ? system_info_selector.selection().index
+                          : system_info_index)
+                  << '\n'
+                  << "system_info_auto="
+                  << (system_info_auto ? "true" : "false") << '\n'
+                  << "system_info_auto_complete="
+                  << (system_info_selector.selection().complete ? "true" : "false")
+                  << '\n'
+                  << "system_info_auto_locked="
+                  << (system_info_selector.selection().locked ? "true" : "false")
+                  << '\n'
+                  << "system_info_auto_observations="
+                  << system_info_selector.selection().observations << '\n'
+                  << "system_info_auto_metric="
+                  << system_info_selector.selection().metric << '\n'
+                  << "system_info_auto_runner_up_index="
+                  << system_info_selector.selection().runner_up_index << '\n'
+                  << "system_info_auto_runner_up_metric="
+                  << system_info_selector.selection().runner_up_metric << '\n'
+                  << "system_info_auto_margin="
+                  << system_info_selector.selection().margin << '\n';
         const auto timing_stats = frame_reader.stats();
         std::cerr << "timing_tracker_enabled="
                   << (timing_stats.enabled ? "true" : "false") << '\n'
@@ -2571,6 +4741,8 @@ int main(int argc, char** argv) {
                   << timing_stats.trajectory_reacquisitions << '\n'
                   << "timing_trajectory_accepted_points="
                   << timing_stats.trajectory_accepted_points << '\n'
+                  << "timing_trajectory_seed_points="
+                  << timing_stats.trajectory_seed_points << '\n'
                   << "timing_trajectory_low_metric_fallbacks="
                   << timing_stats.trajectory_low_metric_fallbacks << '\n'
                   << "timing_trajectory_innovation_rejections="
@@ -2599,10 +4771,17 @@ int main(int argc, char** argv) {
                   << timing_stats.trajectory_local_last_improvement << '\n'
                   << "timing_trajectory_local_max_improvement="
                   << timing_stats.trajectory_local_max_improvement << '\n'
+                  << "timing_trajectory_local_scoped_min_improvement_rules="
+                  << timing_trajectory_local_search_scoped_min_improvements.size()
+                  << '\n'
+                  << "timing_trajectory_local_transient_ranges="
+                  << timing_trajectory_local_search_transient_ranges.size() << '\n'
                   << "timing_trajectory_shadow_searches="
                   << timing_stats.trajectory_shadow_searches << '\n'
                   << "timing_trajectory_shadow_hits="
                   << timing_stats.trajectory_shadow_hits << '\n'
+                  << "timing_trajectory_shadow_reanchors="
+                  << timing_stats.trajectory_shadow_reanchors << '\n'
                   << "timing_trajectory_shadow_last_delta_samples="
                   << timing_stats.trajectory_shadow_last_delta << '\n'
                   << "timing_trajectory_shadow_max_abs_delta_samples="

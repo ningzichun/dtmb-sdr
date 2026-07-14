@@ -29,10 +29,16 @@ struct Ci8PowerStatsOptions {
     std::size_t min_parallel_samples = 1U << 20U;
 };
 
+enum class QamSoftDemapMethod {
+    max_log,
+    log_sum_exp,
+};
+
 struct QamSoftDemapOptions {
     float noise_variance = 1.0F;
     std::size_t requested_workers = 0;
     std::size_t min_parallel_symbols = 1U << 14U;
+    QamSoftDemapMethod method = QamSoftDemapMethod::max_log;
 };
 
 struct Pn945EqualizeOptions {
@@ -40,11 +46,28 @@ struct Pn945EqualizeOptions {
     float regularization = 1.0e-3F;
     float response_floor = 1.0e-6F;
     float noise_variance = -1.0F;
+    int response_window_offset_adjust = 0;
+    bool interpolate_body_channel = false;
+    bool mmse_unbias = false;
+    float mmse_unbias_gain_floor = 0.25F;
+    std::span<float> interleaved_channel_power{};
 };
 
 struct Pn945EqualizeResult {
     std::size_t pn_phase = 0;
     std::size_t next_pn_phase = 0;
+};
+
+enum class Pn945WidebandScaleEstimator {
+    dominant_tap,
+    least_squares_template,
+    masked_frame_taps,
+};
+
+enum class Pn945HeaderObservation {
+    core_only,
+    core_postfix_average,
+    core_cyclic_safe_average,
 };
 
 struct Pn945WidebandModelOptions {
@@ -53,6 +76,10 @@ struct Pn945WidebandModelOptions {
     std::size_t max_span_symbols = 217;
     float min_relative_power = 1.0e-5F;
     float regularization = 1.0e-3F;
+    Pn945WidebandScaleEstimator scale_estimator =
+        Pn945WidebandScaleEstimator::dominant_tap;
+    Pn945HeaderObservation header_observation =
+        Pn945HeaderObservation::core_only;
 };
 
 struct Pn945WidebandChannelModel {
@@ -61,8 +88,10 @@ struct Pn945WidebandChannelModel {
     std::size_t rotation_symbols = 0;
     std::vector<float> template_taps;
     std::vector<float> template_response_fft;
+    std::vector<std::uint8_t> template_tap_mask;
     std::vector<std::size_t> frame_pn_phases;
     std::vector<float> frame_response_scales;
+    std::vector<float> frame_template_taps;
     std::size_t significant_taps = 0;
     std::size_t dominant_tap_index = 0;
     std::size_t frame_count = 0;
@@ -70,6 +99,10 @@ struct Pn945WidebandChannelModel {
     float per_frame_noise_tap_power = 0.0F;
     float noise_variance = 0.0F;
     float truncated_energy_fraction = 0.0F;
+    Pn945WidebandScaleEstimator scale_estimator =
+        Pn945WidebandScaleEstimator::dominant_tap;
+    Pn945HeaderObservation header_observation =
+        Pn945HeaderObservation::core_only;
 };
 
 struct Pn945AcquisitionOptions {
@@ -288,7 +321,8 @@ private:
 [[nodiscard]] DtmbBchDecodeStats dtmb_bch_descramble_message_bits(
     std::span<const std::uint8_t> ldpc_message_bits,
     std::span<std::uint8_t> output_bytes,
-    bool correct = true);
+    bool correct = true,
+    std::size_t scrambler_skip_bits = 0);
 
 [[nodiscard]] Ci8PowerStats ci8_power_stats(
     std::span<const std::int8_t> interleaved_iq,
@@ -300,6 +334,10 @@ void qam64_soft_demodulate_cf32(
     QamSoftDemapOptions options = {});
 
 void qam64_normalize_cf32(
+    std::span<const float> interleaved_symbols,
+    std::span<float> output_symbols);
+
+void qam64_normalize_amplitude_cf32(
     std::span<const float> interleaved_symbols,
     std::span<float> output_symbols);
 

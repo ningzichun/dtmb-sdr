@@ -18,12 +18,18 @@ namespace {
 constexpr std::size_t kBchMessageBits = 752;
 constexpr std::size_t kBchCodeBits = 762;
 constexpr std::size_t kBchParityBits = kBchCodeBits - kBchMessageBits;
-constexpr std::array<std::uint8_t, 11> kBchGeneratorBits{
-    1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1,
-};
-constexpr std::array<std::uint8_t, 15> kScramblerInitialState{
-    1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-};
+// Bit N stores the former array state[N].  Keeping the 15-bit LFSR packed
+// avoids shifting fifteen separate bytes for every BCH payload bit.
+constexpr std::uint16_t kScramblerInitialState = 0x00A9U;
+constexpr std::uint16_t kScramblerStateMask = 0x7FFFU;
+
+[[nodiscard]] std::uint8_t advance_scrambler(std::uint16_t& scrambler) {
+    const auto next_scrambler_bit = static_cast<std::uint8_t>(
+        ((scrambler >> 13U) ^ (scrambler >> 14U)) & 1U);
+    scrambler = static_cast<std::uint16_t>(
+        ((scrambler << 1U) & kScramblerStateMask) | next_scrambler_bit);
+    return next_scrambler_bit;
+}
 
 void validate_graph(const LdpcSparseGraph& graph) {
     if (graph.check_offsets.empty() || graph.check_offsets.front() != 0) {
@@ -75,22 +81,16 @@ std::uint16_t bch_syndrome_key(std::span<const std::uint8_t> bits) {
     if (bits.size() != kBchCodeBits) {
         throw std::invalid_argument("BCH codeword requires 762 bits");
     }
-    std::array<std::uint8_t, kBchCodeBits> work{};
-    std::copy(bits.begin(), bits.end(), work.begin());
-    for (std::size_t index = 0; index < kBchCodeBits - kBchParityBits; ++index) {
-        if (work[index] == 0) {
-            continue;
-        }
-        for (std::size_t bit = 0; bit < kBchGeneratorBits.size(); ++bit) {
-            work[index + bit] ^= kBchGeneratorBits[bit];
+    constexpr std::uint16_t generator =
+        (1U << kBchParityBits) | (1U << 3U) | 1U;
+    std::uint16_t remainder = 0;
+    for (const auto bit : bits) {
+        remainder = static_cast<std::uint16_t>((remainder << 1U) | bit);
+        if ((remainder & (1U << kBchParityBits)) != 0U) {
+            remainder ^= generator;
         }
     }
-
-    std::uint16_t key = 0;
-    for (std::size_t index = kBchCodeBits - kBchParityBits; index < kBchCodeBits; ++index) {
-        key = static_cast<std::uint16_t>((key << 1U) | work[index]);
-    }
-    return key;
+    return remainder;
 }
 
 const std::array<int, 1U << kBchParityBits>& bch_single_error_table() {
@@ -449,7 +449,8 @@ LdpcDecodeResult ldpc_decode_layered_min_sum_sparse(
 DtmbBchDecodeStats dtmb_bch_descramble_message_bits(
     std::span<const std::uint8_t> ldpc_message_bits,
     std::span<std::uint8_t> output_bytes,
-    bool correct) {
+    bool correct,
+    std::size_t scrambler_skip_bits) {
     if (ldpc_message_bits.empty() || (ldpc_message_bits.size() % kBchCodeBits) != 0) {
         throw std::invalid_argument("LDPC message bits must contain whole BCH blocks");
     }
@@ -465,23 +466,26 @@ DtmbBchDecodeStats dtmb_bch_descramble_message_bits(
     if (output_bytes.size() < payload_bytes) {
         throw std::invalid_argument("BCH output byte span is too small");
     }
-    std::fill(output_bytes.begin(), output_bytes.begin() + payload_bytes, 0);
-
     DtmbBchDecodeStats stats;
     stats.block_count = block_count;
     stats.block_clean.assign(block_count, 1U);
     stats.block_corrected_errors.assign(block_count, 0U);
     auto scrambler = kScramblerInitialState;
-    std::size_t output_bit = 0;
+    for (std::size_t bit = 0; bit < scrambler_skip_bits; ++bit) {
+        (void)advance_scrambler(scrambler);
+    }
+    std::size_t output_byte = 0;
     std::array<std::uint8_t, kBchCodeBits> codeword{};
     for (std::size_t block = 0; block < block_count; ++block) {
         const auto input = ldpc_message_bits.subspan(block * kBchCodeBits, kBchCodeBits);
-        std::copy(input.begin(), input.end(), codeword.begin());
-        const auto syndrome = bch_syndrome_key(codeword);
+        auto decoded_codeword = input;
+        const auto syndrome = bch_syndrome_key(input);
         if (syndrome != 0) {
             const auto position = correct ? bch_single_error_table()[syndrome] : -1;
             if (position >= 0) {
+                std::copy(input.begin(), input.end(), codeword.begin());
                 codeword[static_cast<std::size_t>(position)] ^= 1U;
+                decoded_codeword = codeword;
                 ++stats.corrected_errors;
                 stats.block_corrected_errors[block] = 1U;
             } else {
@@ -490,17 +494,15 @@ DtmbBchDecodeStats dtmb_bch_descramble_message_bits(
             }
         }
 
-        for (std::size_t bit = 0; bit < kBchMessageBits; ++bit) {
-            const auto next_scrambler_bit = static_cast<std::uint8_t>(scrambler[13] ^ scrambler[14]);
-            const auto decoded = static_cast<std::uint8_t>(codeword[bit] ^ next_scrambler_bit);
-            if (decoded != 0) {
-                output_bytes[output_bit / 8] |= static_cast<std::uint8_t>(1U << (7U - (output_bit % 8)));
+        for (std::size_t byte = 0; byte < kBchMessageBits / 8U; ++byte) {
+            std::uint8_t decoded_byte = 0;
+            for (std::size_t bit = 0; bit < 8U; ++bit) {
+                decoded_byte = static_cast<std::uint8_t>(
+                    (decoded_byte << 1U)
+                    | (decoded_codeword[byte * 8U + bit]
+                       ^ advance_scrambler(scrambler)));
             }
-            for (std::size_t index = scrambler.size() - 1; index > 0; --index) {
-                scrambler[index] = scrambler[index - 1];
-            }
-            scrambler[0] = next_scrambler_bit;
-            ++output_bit;
+            output_bytes[output_byte++] = decoded_byte;
         }
     }
     return stats;

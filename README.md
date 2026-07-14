@@ -1,249 +1,158 @@
 # dtmb-sdr
 
-A software-defined DTMB (Digital Terrestrial Multimedia Broadcasting, GB 20600-2006) receiver. Takes IQ samples from a capture file or any supported SDR and decodes them into MPEG-TS video, audio, and subtitle streams.
-
-This project was developed with **AI-assisted hardware-specific debugging and DSP implementation** -- using large-language-model agents for iterative signal-chain diagnosis, LDPC/FEC fixture generation, carrier-mapping audits, and real-RF experiment coordination across the full PHY stack.
-
-## What It Does
+A minimal, vendor-neutral DTMB receiver. It accepts interleaved signed 8-bit
+complex samples (CI8) from a file or standard input and emits MPEG transport
+stream packets to a file or standard output.
 
 ```text
-IQ input (file or SDR)
- -> PN945 frame sync + coarse/fine CFO correction
- -> C=3780 OFDM FFT + frequency deinterleave + MMSE channel equalization
- -> Mode1/Mode2 convolutional symbol deinterleave
- -> 64-QAM soft demap (float32 LLR)
- -> LDPC (normalized min-sum) + BCH(762,752) + descrambler
- -> MPEG-TS output
+CI8 file/stdin
+  -> sample-rate conversion
+  -> PN945 synchronization and C=3780 equalization
+  -> QAM64 deinterleaving and soft demapping
+  -> LDPC, BCH, and descrambling
+  -> MPEG-TS file/stdout
 ```
 
-Recovers 1920x1080 H.264 video, AC-3 audio, and DVB subtitles from real over-the-air UHF DTMB broadcasts.
-
-## Input Sources
-
-| Source | Format | Notes |
-|--------|--------|-------|
-| **Capture file** | CI8 (interleaved int8 I/Q) | Primary offline workflow; any SDR can produce these |
-| **SDR (live)** | Via libhackrf, SoapySDR, or GNU Radio | Real-time capture and decode pipeline |
-| **Synthetic** | Generated test fixtures | For development and validation without hardware |
-
-The receiver is input-agnostic. Any source that provides complex baseband samples at the correct rate works. The SDR adapter layer is separate from the core demodulator.
-
-## Proof of Operation
-
-The following ffprobe output was produced from a **live SDR capture** at 602 MHz (16 Msps, external 10 MHz reference clock). The receiver decoded the RF into valid MPEG-TS containing multiple TV programs:
-
-```
-ffprobe output from live 602 MHz capture (40s, real RF):
-
-  Program 1:
-    Stream #0: h264  video  1920x1080  (25 frames decoded)
-    Stream #1: ac3   audio             (23 frames decoded)
-    Stream #2: ac3   audio             (20 frames decoded)
-    Stream #3: ac3   audio             (22 frames decoded)
-    Stream #4: dvb_subtitle
-    Stream #5: dvb_subtitle
-    Stream #6: dvb_subtitle
-
-  Program 2:
-    Stream #0: h264  video  1920x1080  (28 frames decoded)
-    Stream #1: ac3   audio             (12 frames decoded)
-    Stream #2: ac3   audio             (18 frames decoded)
-    Stream #3: ac3   audio             (25 frames decoded)
-    Stream #4: dvb_subtitle
-    Stream #5: dvb_subtitle
-    Stream #6: dvb_subtitle
-
-  Program 3:
-    Stream #0: h264  video  1920x1080  (23 frames decoded)
-    Stream #1: ac3   audio             (23 frames decoded)
-    Stream #2: ac3   audio             (20 frames decoded)
-    Stream #3: ac3   audio             (22 frames decoded)
-    Stream #4: dvb_subtitle
-
-  Container: MPEG-TS, 19.07s, 7.21 MB, ~3.0 Mbps
-  Format:    epg data + 3x h264 1080p + 9x ac3 audio + 8x dvb_subtitle
-```
-
-Key metrics from the best validated run:
-- **LDPC convergence:** 95.47% of selected codewords
-- **TS syntax:** 48,366 valid packets, zero sync errors, zero TEI
-- **Capture:** zero dropped bytes, external 10 MHz clock reference
-
-## Architecture
-
-```text
-core/cpp/          Portable C++20 demodulator library (no OS-specific APIs)
-  src/               Core DSP: PN sync, C3780 FFT, channel estimation, FEC
-  tools/             Pipe-shaped CLI executables (stdin/stdout streaming)
-  include/dtmb/      Public headers
-
-python/dtmb/       Python reference implementation and offline tools
-  data/              LDPC parity-check matrices (.alist), generator data
-
-adapters/          SDR integration layer (pluggable backends)
-scripts/           Pipeline orchestration and synthetic test generation
-tests/             Core algorithm tests (PN, QAM, LDPC, BCH, TS, interleaver)
-```
-
-The demodulator core has no SDR dependencies. SDR-specific code lives entirely in `adapters/` and the acquisition tools, keeping the signal processing portable and testable without hardware.
-
-## Prerequisites
-
-- **C++20 compiler** (GCC 12+, Clang 15+, or MSVC 2022+)
-- **CMake 3.20+**
-- **Python 3.10+** with numpy, scipy
-- **ffmpeg/ffprobe** (for TS inspection and video extraction)
-- **SDR library** (optional, for live capture -- e.g. libhackrf, SoapySDR)
-- Optional: external 10 MHz reference clock for frequency accuracy
+Hardware acquisition is intentionally outside this repository. Any application
+that can produce CI8 bytes at a known sample rate can feed the receiver.
 
 ## Build
 
-```bash
-# C++ core library and tools
-cmake -B build/core-cpp core/cpp
-cmake --build build/core-cpp -j$(nproc)
-
-# Python package
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev,dsp]"
-
-# Run tests
-ctest --test-dir build/core-cpp --output-on-failure
-pytest tests/
-```
-
-Or use the Makefile shortcut:
+Requirements are CMake 3.20+, a C++20 compiler, and Python 3.10+.
 
 ```bash
-make -f pipeline.mk native-core PYTHON=python
+python -m pip install -e ".[dev]"
+cmake -S core/cpp -B build/core-cpp -DDTMB_CORE_BUILD_TESTS=ON
+cmake --build build/core-cpp --config Release
+ctest --test-dir build/core-cpp -C Release --output-on-failure
+pytest
 ```
 
-## Usage
-
-### Decode a Capture File
-
-The primary workflow takes a CI8 IQ capture and produces MPEG-TS:
+## Decode a CI8 file
 
 ```bash
-build/core-cpp/dtmb_core_c3780_extract \
-    --auto-sync --equalizer pn --pn-estimator wideband \
-    --pn-wideband-block-frames 2 --pn-mmse 0.004 \
-    --remove-dc --normalization qam64 --system-info-index 22 \
-    capture.ci8 - \
-  | build/core-cpp/dtmb_core_deinterleave_qam64 \
-    --mode mode2 --phase 0 --workers 8 - - \
-  | build/core-cpp/dtmb_core_ldpc_bch_decode \
-    --fec-rate 2 \
-    --alist python/dtmb/data/dtmb_ldpc_rate2.alist \
-    --codewords-per-frame 3 --workers 3 \
-    --hard-h-gate-threshold 0.43 \
-    --clean-frames-only --mark-discontinuities \
-    --insert-discontinuity-packets - - \
-  > output.ts
-
-# Inspect the result
-ffprobe -show_streams -show_programs output.ts
+dtmb-decode \
+  --input capture.ci8 \
+  --input-rate 16000000 \
+  --output recovered.ts \
+  --acceleration cpu \
+  --error-policy continue
 ```
 
-Any tool that records complex int8 I/Q at the appropriate sample rate can produce the input file. The pipe-shaped tools read from stdin and write to stdout, so they compose naturally.
+The default profile is QAM64, FEC rate 0.6, interleaver mode 2
+(`--system-info-index 22`). Profiles 19 through 24 select the supported QAM64
+FEC/interleaver combinations.
 
-### Live SDR Capture + Decode
+Strict mode is the default. `--error-policy continue` omits unclean frames and
+adds MPEG-TS discontinuity indications before later clean output.
 
-For live RF, pipe the SDR output directly into the decoder:
+## Optional CUDA LDPC acceleration
+
+CPU decoding is the portable baseline. Build the optional CUDA LDPC backend
+when a supported NVIDIA toolchain is available:
 
 ```bash
-# Example with the included acquisition tool:
-build/core-cpp/dtmb_core_hackrf_acquire \
-    --frequency 602000000 --sample-rate 16000000 \
-    --bandwidth 12000000 --amp 0 --lna-gain 24 --vga-gain 14 \
-    --duration 20 --output - \
-  | build/core-cpp/dtmb_core_c3780_extract \
-    --auto-sync --equalizer pn --pn-estimator wideband \
-    --pn-wideband-block-frames 2 --pn-mmse 0.004 \
-    --remove-dc --normalization qam64 --system-info-index 22 - - \
-  | build/core-cpp/dtmb_core_deinterleave_qam64 \
-    --mode mode2 --phase 0 --workers 8 - - \
-  | build/core-cpp/dtmb_core_ldpc_bch_decode \
-    --fec-rate 2 \
-    --alist python/dtmb/data/dtmb_ldpc_rate2.alist \
-    --codewords-per-frame 3 --workers 3 \
-    --hard-h-gate-threshold 0.43 \
-    --clean-frames-only --mark-discontinuities \
-    --insert-discontinuity-packets - - \
-  > live.ts
+cmake -S core/cpp -B build/core-cpp-cuda \
+  -DDTMB_CORE_ENABLE_CUDA_LDPC=ON \
+  -DDTMB_CORE_BUILD_TESTS=ON
+cmake --build build/core-cpp-cuda --config Release
 ```
 
-Other SDR tools (e.g. `rx_sdr`, `hackrf_transfer`, GNU Radio) can substitute the first stage as long as they output CI8 to stdout.
-
-### Python Offline Tools
+Then select it explicitly:
 
 ```bash
-# Detect DTMB frames in an IQ recording
-python -m dtmb.detect capture.ci8 --sample-rate 16000000 --pn-search
-
-# Run the Python reference receiver
-python -m dtmb.receiver capture.ci8 --sample-rate 16000000 --mode pn945
-
-# Analyze TS packet structure
-python -m dtmb.ts output.ts
-
-# Generate synthetic test fixture (no hardware needed)
-python scripts/generate_synthetic_ts.py
+dtmb-decode \
+  --bin-dir build/core-cpp-cuda \
+  --input capture.ci8 \
+  --input-rate 16000000 \
+  --output recovered.ts \
+  --acceleration cuda
 ```
 
-### Make Pipeline (Full Automated Run)
+The CUDA backend batches LDPC codewords and reports host-to-device, kernel,
+device-to-host, and total timing metrics. CPU remains available as the
+correctness and portability reference.
+
+### Parallelism and observed acceleration
+
+The receiver uses independent concurrency at several stages:
+
+- multithreaded rational resampling and PN acquisition;
+- worker-parallel C=3780 frame equalization;
+- chunked QAM64 deinterleaving and soft demapping;
+- batched LDPC decoding on either CPU workers or CUDA kernels.
+
+One observed live-pipeline comparison used 12 CPU workers and 256-frame FEC
+batches. The CPU path processed 198,660 codewords in 30.95 seconds of measured
+FEC batch time (about 6,419 codewords/s). The CUDA path processed 267,486
+codewords in 17.22 seconds of measured FEC batch time (about 15,534
+codewords/s), while 10.41 seconds were attributed to CUDA transfer plus kernel
+execution. After normalizing by processed codewords, the observed FEC-stage
+throughput improvement was approximately 2.4x.
+
+These runs did not use an identical retained LLR stream, so the figure is an
+operational observation rather than a controlled cross-machine benchmark.
+Performance depends on the proportion of early-rejected codewords, iteration
+count, batch size, CPU, GPU, and memory-transfer overhead. Reproducible release
+claims should use the same retained LLR input and compare byte-identical output.
+
+## Decode a pipe
+
+Use `-` for stdin or stdout:
 
 ```bash
-# Synthetic loopback test (no hardware needed)
-make -f pipeline.mk synthetic
-
-# Live capture + full decode pipeline
-make -f pipeline.mk native-live-stream \
-    FREQUENCY=602000000 \
-    NATIVE_LIVE_SAMPLE_RATE=16000000 \
-    NATIVE_LIVE_BANDWIDTH=12000000 \
-    AMP=0 LNA_GAIN=24 VGA_GAIN=14 \
-    NATIVE_LIVE_DURATION=20 \
-    NATIVE_SYSTEM_INFO_INDEX=22 \
-    NATIVE_LIVE_OUTPUT=output.ts
+ci8-producing-command |
+  dtmb-decode --input - --input-rate 16000000 --output recovered.ts
 ```
 
-## Supported DTMB Modes
+The source command is deliberately unspecified: the receiver depends only on
+the byte-stream contract, not an SDR vendor or device API.
 
-| Parameter | Supported Values |
-|-----------|-----------------|
-| PN header | PN420, PN595, PN945 |
-| FFT size | C=3780 (8 MHz channel) |
-| QAM | 4-QAM, 16-QAM, 64-QAM |
-| FEC rate | 0.4 (rate 1), 0.6 (rate 2), 0.8 (rate 3) |
-| Interleaver | Mode 1, Mode 2 |
-| LDPC | Normalized min-sum, configurable iterations |
-| BCH | BCH(762,752) |
+## Play while decoding
 
-## Current Status
+With ffplay:
 
-The receiver decodes real over-the-air DTMB broadcasts into valid MPEG-TS with H.264 video, AC-3 audio, and DVB subtitles. LDPC convergence exceeds 95% on selected codewords under good RF conditions. The output contains clean TS islands with complete video keyframes; continuous gap-free playback across an entire capture is still in progress.
+```bash
+ci8-producing-command |
+  dtmb-decode --input - --input-rate 16000000 --output - --error-policy continue |
+  ffplay -fflags nobuffer -flags low_delay -f mpegts -
+```
 
-Known limitations:
-- Decode throughput is below real-time (roughly 10x slower than wall-clock)
-- Contiguous H.264 PES coverage has gaps under weak RF conditions
-- Single-frequency operation (no automatic channel scanning yet)
+With VLC:
 
-## Standard Reference
+```bash
+ci8-producing-command |
+  dtmb-decode --input - --input-rate 16000000 --output - --error-policy continue |
+  vlc - --demux=ts
+```
 
-This implementation follows **GB 20600-2006** (Framing Structure, Channel Coding and Modulation for Digital Television Terrestrial Broadcasting System). LDPC parity-check matrices, PN sequences, system information tables, and constellation mappings are extracted directly from the standard.
+Playback quality depends on RF quality and FEC cleanliness. A player detecting
+a service is not evidence that the complete stream is error-free.
 
-## AI-Assisted Development
+## Inspect MPEG-TS output
 
-This project was developed using AI coding agents for hardware-specific debugging and DSP implementation:
+```bash
+dtmb-ts-analyze recovered.ts
+ffprobe -v error -show_programs -show_streams recovered.ts
+```
 
-- **Signal chain diagnosis:** Iterative debugging of carrier mapping, deinterleaver chronology, QAM bit-plane ordering, and LDPC/FEC framing against real RF captures
-- **Fixture-driven correctness audits:** Generating tagged synthetic frames to verify every stage of the receive chain (FFT bin to logical carrier to data-only index to FEC codeword)
-- **Real-RF experiment coordination:** Systematic parameter sweeps with gated promotion criteria, trial logging, and artifact provenance tracking
-- **Standard extraction:** Translating GB 20600-2006 tables into code-testable fixtures and parity-check matrices
+## Scope
 
-The development workflow demonstrates that AI agents can be effective collaborators on low-level hardware/DSP projects where correctness depends on exact bit-level layout, physical-layer timing, and standards compliance.
+Included:
+
+- portable C++20 receive stages;
+- CI8 file and stdin integration;
+- MPEG-TS file and stdout output;
+- required LDPC matrices;
+- core and pipeline-construction tests.
+
+Not included:
+
+- SDR drivers or hardware-control code;
+- capture recipes, device identifiers, frequencies, gains, or locations;
+- signal-generation, scanning, UI, visualization, sweep, or research tooling;
+- real broadcast captures or derived analysis artifacts.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE) and [THIRD_PARTY.md](THIRD_PARTY.md).

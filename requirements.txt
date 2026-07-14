@@ -1,9 +1,1 @@
-# gr-dtmb pinned development requirements.
-# Kept narrow to the offline receiver/fixture path:
-# numpy/scipy for DSP, pytest for tests, psutil for profile_run.py,
-# matplotlib for default pipeline PNG visual artifacts.
-numpy>=1.26,<2.3
-scipy>=1.11
 pytest>=8
-psutil>=5.9
-matplotlib>=3.8
