@@ -1,29 +1,68 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["scikit-build-core>=0.10"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "dtmb-sdr"
-version = "0.2.0"
+version = "0.3.0"
 description = "Vendor-neutral CI8 stream to MPEG-TS DTMB receiver"
 readme = "README.md"
 requires-python = ">=3.10"
+keywords = ["dtmb", "sdr", "mpeg-ts", "digital television", "signal processing"]
+license = { file = "LICENSE" }
+authors = [{ name = "dtmb-sdr contributors" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: MacOS",
+  "Operating System :: MacOS :: MacOS X",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: C++",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Multimedia :: Video",
+  "Topic :: Scientific/Engineering",
+]
+
+[project.urls]
+Homepage = "https://github.com/ningzichun/dtmb-sdr"
+Issues = "https://github.com/ningzichun/dtmb-sdr/issues"
+Source = "https://github.com/ningzichun/dtmb-sdr"
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["build>=1", "pytest>=8"]
 
 [project.scripts]
 dtmb-decode = "dtmb.decode:main"
 dtmb-ts-analyze = "dtmb.ts:main"
 
-[tool.setuptools]
-package-dir = {"" = "python"}
+[tool.scikit-build]
+cmake.source-dir = "core/cpp"
+cmake.build-type = "Release"
+wheel.packages = ["python/dtmb"]
+wheel.py-api = "py3"
+sdist.include = [
+  "core/cpp/**",
+  "python/dtmb/**",
+  "tests/**",
+  "README.md",
+  "LICENSE",
+  "THIRD_PARTY.md",
+]
 
-[tool.setuptools.packages.find]
-where = ["python"]
-
-[tool.setuptools.package-data]
-dtmb = ["data/*.alist"]
+[tool.scikit-build.cmake.define]
+DTMB_CORE_BUILD_TESTS = "OFF"
+DTMB_CORE_ENABLE_CUDA_LDPC = "OFF"
+DTMB_CORE_ENABLE_FFTW = "OFF"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

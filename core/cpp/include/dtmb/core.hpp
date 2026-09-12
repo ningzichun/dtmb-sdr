@@ -41,6 +41,19 @@ struct QamSoftDemapOptions {
     QamSoftDemapMethod method = QamSoftDemapMethod::max_log;
 };
 
+struct C3780Qam64IntegerTimingOptions {
+    int max_delta_samples = 2;
+    double min_mse_improvement = 0.25;
+};
+
+struct C3780Qam64IntegerTimingResult {
+    // Positive delta removes exp(+j*2*pi*physical_bin*delta/3780).
+    int delta_samples = 0;
+    double baseline_mse = 0.0;
+    double corrected_mse = 0.0;
+    double relative_improvement = 0.0;
+};
+
 struct Pn945EqualizeOptions {
     std::size_t channel_taps = 8;
     float regularization = 1.0e-3F;
@@ -80,6 +93,10 @@ struct Pn945WidebandModelOptions {
         Pn945WidebandScaleEstimator::dominant_tap;
     Pn945HeaderObservation header_observation =
         Pn945HeaderObservation::core_only;
+    // Optional trusted transmitted phase for each header, in source order.
+    // Empty retains independent phase detection. This span is used only by
+    // build_pn945_wideband_channel_model_cf32, not retained in the model.
+    std::span<const std::size_t> expected_phases;
 };
 
 struct Pn945WidebandChannelModel {
@@ -103,6 +120,9 @@ struct Pn945WidebandChannelModel {
         Pn945WidebandScaleEstimator::dominant_tap;
     Pn945HeaderObservation header_observation =
         Pn945HeaderObservation::core_only;
+    // Cached observations are needed to restore data leaked into the current
+    // header by channel taps before the selected sample origin.
+    std::vector<float> frame_headers_cf32;
 };
 
 struct Pn945AcquisitionOptions {
@@ -110,6 +130,28 @@ struct Pn945AcquisitionOptions {
     float hit_threshold = 0.35F;
     std::size_t requested_workers = 0;
 };
+
+struct Pn945ScheduleAlignment {
+    bool valid = false;
+    std::size_t observations = 0;
+    std::size_t superframe_index = 0;
+    int phase_bias = 0;
+    double mean_squared_error = 0.0;
+    double runner_up_error = 0.0;
+    std::size_t inliers = 0;
+};
+
+// Fits only the first complete 200-frame PN945 superframe observation window.
+// The phase bias is a header-window displacement, not decoded-payload state.
+[[nodiscard]] Pn945ScheduleAlignment fit_pn945_phase_schedule(
+    std::span<const std::size_t> observed_phases);
+
+[[nodiscard]] std::size_t pn945_phase_for_frame(std::size_t superframe_index) noexcept;
+
+// Normalized coherent correlation of the 511 PN core chips at a known phase.
+// Independent of constant complex gain; the header must contain 945 CI8 samples.
+[[nodiscard]] float pn945_known_phase_metric_ci8(
+    std::span<const std::int8_t> interleaved_header, std::size_t phase);
 
 struct Pn945AcquisitionResult {
     std::size_t phase_offset = 0;
@@ -340,6 +382,18 @@ void qam64_normalize_cf32(
 void qam64_normalize_amplitude_cf32(
     std::span<const float> interleaved_symbols,
     std::span<float> output_symbols);
+
+// Operates on one already normalized, frequency-deinterleaved data frame,
+// before the convolutional symbol deinterleaver. Uses only that frame's
+// distance to the 64QAM alphabet, with no decoder or payload observations.
+// A rejected candidate leaves the input byte-identical. The caller opts in.
+[[nodiscard]] C3780Qam64IntegerTimingResult c3780_qam64_integer_timing_correct_cf32(
+    std::span<float> interleaved_data_symbols,
+    C3780Qam64IntegerTimingOptions options = {});
+
+// Sliced residual used for current-frame confidence, not a true SNR estimate.
+[[nodiscard]] double c3780_qam64_frame_mse_cf32(
+    std::span<const float> interleaved_data_symbols);
 
 void mixed_radix_fft_forward_cf32(
     std::span<const float> interleaved_time_samples,

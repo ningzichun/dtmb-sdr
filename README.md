@@ -20,6 +20,17 @@ that can produce CI8 bytes at a known sample rate can feed the receiver.
 
 Requirements are CMake 3.20+, a C++20 compiler, and Python 3.10+.
 
+For a released platform wheel, installation is simply:
+
+```bash
+pip install dtmb-sdr
+```
+
+The wheel contains the native receiver executables and required LDPC data; no
+separate source checkout or CMake build is required.
+
+To build from a source checkout:
+
 ```bash
 python -m pip install -e ".[dev]"
 cmake -S core/cpp -B build/core-cpp -DDTMB_CORE_BUILD_TESTS=ON
@@ -27,6 +38,15 @@ cmake --build build/core-cpp --config Release
 ctest --test-dir build/core-cpp -C Release --output-on-failure
 pytest
 ```
+
+Build a distributable wheel with:
+
+```bash
+python -m build --wheel
+```
+
+Prebuilt wheels use the portable CPU decoder. CUDA requires a source build with
+a supported NVIDIA toolkit.
 
 ## Decode a CI8 file
 
@@ -73,29 +93,6 @@ The CUDA backend batches LDPC codewords and reports host-to-device, kernel,
 device-to-host, and total timing metrics. CPU remains available as the
 correctness and portability reference.
 
-### Parallelism and observed acceleration
-
-The receiver uses independent concurrency at several stages:
-
-- multithreaded rational resampling and PN acquisition;
-- worker-parallel C=3780 frame equalization;
-- chunked QAM64 deinterleaving and soft demapping;
-- batched LDPC decoding on either CPU workers or CUDA kernels.
-
-One observed live-pipeline comparison used 12 CPU workers and 256-frame FEC
-batches. The CPU path processed 198,660 codewords in 30.95 seconds of measured
-FEC batch time (about 6,419 codewords/s). The CUDA path processed 267,486
-codewords in 17.22 seconds of measured FEC batch time (about 15,534
-codewords/s), while 10.41 seconds were attributed to CUDA transfer plus kernel
-execution. After normalizing by processed codewords, the observed FEC-stage
-throughput improvement was approximately 2.4x.
-
-These runs did not use an identical retained LLR stream, so the figure is an
-operational observation rather than a controlled cross-machine benchmark.
-Performance depends on the proportion of early-rejected codewords, iteration
-count, batch size, CPU, GPU, and memory-transfer overhead. Reproducible release
-claims should use the same retained LLR input and compare byte-identical output.
-
 ## Decode a pipe
 
 Use `-` for stdin or stdout:
@@ -122,9 +119,33 @@ With VLC:
 
 ```bash
 ci8-producing-command |
-  dtmb-decode --input - --input-rate 16000000 --output - --error-policy continue |
+  dtmb-decode --input - --input-rate 16000000 --output - \
+    --error-policy continue |
   vlc - --demux=ts
 ```
+
+The producer owns the SDR device, tuning and capture policy. `dtmb-decode`
+only consumes CI8 bytes, so the same receiver command works with a
+hardware adapter, a vendor utility or another SDR framework on any platform.
+Keep diagnostics on stderr; stdout is binary MPEG-TS.
+
+Long-running receiver controls are explicit and off by default. A deployment
+that has independently validated them for its RF environment can enable:
+
+```bash
+ci8-producing-command |
+  dtmb-decode --input - --input-rate 16000000 --output - \
+    --pn-schedule-tracking \
+    --source-frame-confidence inverse-mse \
+    --resample-headroom-db 6 \
+    --error-policy continue |
+  vlc - --demux=ts
+```
+
+The receiver inserts bounded 64 MiB queues after bulk stages by default so
+capture, frontend, demapping and FEC can progress concurrently. Use
+`--pipeline-buffer-mib 0` only for controlled diagnostics. These options are
+not universal RF defaults and do not replace transport or codec validation.
 
 Playback quality depends on RF quality and FEC cleanliness. A player detecting
 a service is not evidence that the complete stream is error-free.

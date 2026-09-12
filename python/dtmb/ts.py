@@ -9,6 +9,8 @@ import json
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from .sip import DTMB_SIP_PID, DtmbSip, parse_dtmb_sip_packet
+
 
 TS_SYNC_BYTE = 0x47
 TS_PACKET_SIZE = 188
@@ -93,6 +95,65 @@ class TsContinuityError:
 
 
 @dataclass(frozen=True)
+class TsPcrPidSummary:
+    """PCR timing summary for one PID."""
+
+    pid: int
+    pcr_count: int
+    discontinuity_indicator_count: int
+    backwards_jump_count: int
+    repeated_pcr_count: int
+    first_packet_index: int | None
+    last_packet_index: int | None
+    first_pcr_ticks: int | None
+    last_pcr_ticks: int | None
+    first_pcr_seconds: float | None
+    last_pcr_seconds: float | None
+    estimated_bitrate_bps: float | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "pid": self.pid,
+            "pid_hex": f"0x{self.pid:04x}",
+            "pcr_count": self.pcr_count,
+            "discontinuity_indicator_count": self.discontinuity_indicator_count,
+            "backwards_jump_count": self.backwards_jump_count,
+            "repeated_pcr_count": self.repeated_pcr_count,
+            "first_packet_index": self.first_packet_index,
+            "last_packet_index": self.last_packet_index,
+            "first_pcr_ticks": self.first_pcr_ticks,
+            "last_pcr_ticks": self.last_pcr_ticks,
+            "first_pcr_seconds": self.first_pcr_seconds,
+            "last_pcr_seconds": self.last_pcr_seconds,
+            "estimated_bitrate_bps": self.estimated_bitrate_bps,
+        }
+
+
+@dataclass(frozen=True)
+class TsPcrSummary:
+    """PCR timing diagnostics across all PIDs."""
+
+    pcr_pid_count: int
+    pcr_count: int
+    discontinuity_indicator_count: int
+    backwards_jump_count: int
+    repeated_pcr_count: int
+    monotonic: bool
+    top_pids: tuple[TsPcrPidSummary, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "pcr_pid_count": self.pcr_pid_count,
+            "pcr_count": self.pcr_count,
+            "discontinuity_indicator_count": self.discontinuity_indicator_count,
+            "backwards_jump_count": self.backwards_jump_count,
+            "repeated_pcr_count": self.repeated_pcr_count,
+            "monotonic": self.monotonic,
+            "top_pids": [summary.to_dict() for summary in self.top_pids],
+        }
+
+
+@dataclass(frozen=True)
 class TsPidSummary:
     """Per-PID stream statistics."""
 
@@ -148,9 +209,13 @@ class TsStreamSummary:
     continuity_error_count: int
     continuity_duplicate_count: int
     discontinuity_indicator_count: int
+    pcr: TsPcrSummary
     pid_count: int
     top_pids: tuple[TsPidSummary, ...]
     continuity_errors: tuple[TsContinuityError, ...]
+    dtmb_sip_packet_count: int = 0
+    dtmb_sip_error_count: int = 0
+    dtmb_sip_interval_error_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -169,9 +234,13 @@ class TsStreamSummary:
             "continuity_error_count": self.continuity_error_count,
             "continuity_duplicate_count": self.continuity_duplicate_count,
             "discontinuity_indicator_count": self.discontinuity_indicator_count,
+            "pcr": self.pcr.to_dict(),
             "pid_count": self.pid_count,
             "top_pids": [summary.to_dict() for summary in self.top_pids],
             "continuity_errors": [error.to_dict() for error in self.continuity_errors],
+            "dtmb_sip_packet_count": self.dtmb_sip_packet_count,
+            "dtmb_sip_error_count": self.dtmb_sip_error_count,
+            "dtmb_sip_interval_error_count": self.dtmb_sip_interval_error_count,
         }
 
 
@@ -279,6 +348,8 @@ def analyze_ts_packets(
     packets that contain payload bytes. Adaptation-only packets do not advance
     the expected payload continuity counter, and packets with the discontinuity
     indicator reset the continuity check for that PID.
+    GB/T 28434 SIPs have a fixed zero counter; their complete syntax and
+    mode-derived one-second packet intervals are checked separately.
     """
 
     if top_pids is not None and top_pids < 0:
@@ -301,9 +372,14 @@ def analyze_ts_packets(
     continuity_error_count = 0
     continuity_duplicate_count = 0
     discontinuity_indicator_count = 0
+    dtmb_sip_packet_count = 0
+    dtmb_sip_error_count = 0
+    dtmb_sip_interval_error_count = 0
+    previous_sip: tuple[int, DtmbSip] | None = None
 
     pid_counts: Counter[int] = Counter()
     pid_stats: dict[int, dict[str, Any]] = {}
+    pcr_stats: dict[int, dict[str, Any]] = {}
     last_payload_cc: dict[int, int] = {}
     continuity_errors: list[TsContinuityError] = []
 
@@ -356,6 +432,17 @@ def analyze_ts_packets(
             stats["discontinuity_indicator_count"] += 1
             if header.pid != TS_NULL_PID:
                 last_payload_cc.pop(header.pid, None)
+            if header.pid == DTMB_SIP_PID:
+                previous_sip = None
+        pcr_ticks = _adaptation_pcr_ticks(buffer, header)
+        if pcr_ticks is not None:
+            _record_pcr(
+                pcr_stats,
+                pid=header.pid,
+                packet_index=packet_index,
+                pcr_ticks=pcr_ticks,
+                discontinuity=discontinuity,
+            )
 
         if not header.has_payload:
             continue
@@ -363,6 +450,21 @@ def analyze_ts_packets(
         stats["payload_packet_count"] += 1
         if header.pid == TS_NULL_PID:
             continue
+
+        if header.pid == DTMB_SIP_PID:
+            sip = parse_dtmb_sip_packet(buffer)
+            if sip is not None:
+                dtmb_sip_packet_count += 1
+                if previous_sip is not None:
+                    previous_index, previous_info = previous_sip
+                    if packet_index - previous_index != previous_info.packets_per_second:
+                        dtmb_sip_interval_error_count += 1
+                        dtmb_sip_error_count += 1
+                previous_sip = packet_index, sip
+                last_payload_cc.pop(header.pid, None)
+                continue
+            if dtmb_sip_packet_count or buffer[:3] == b"\x47\x40\x15":
+                dtmb_sip_error_count += 1
 
         previous = last_payload_cc.get(header.pid)
         if discontinuity or previous is None:
@@ -387,6 +489,11 @@ def analyze_ts_packets(
                     )
                 )
         last_payload_cc[header.pid] = header.continuity_counter
+
+    if (previous_sip is not None
+            and packet_count - 1 - previous_sip[0] >= previous_sip[1].packets_per_second):
+        dtmb_sip_interval_error_count += 1
+        dtmb_sip_error_count += 1
 
     summaries = tuple(
         sorted(
@@ -436,9 +543,13 @@ def analyze_ts_packets(
         continuity_error_count=continuity_error_count,
         continuity_duplicate_count=continuity_duplicate_count,
         discontinuity_indicator_count=discontinuity_indicator_count,
+        pcr=_pcr_summary(pcr_stats),
         pid_count=len(pid_counts),
         top_pids=summaries,
         continuity_errors=tuple(continuity_errors),
+        dtmb_sip_packet_count=dtmb_sip_packet_count,
+        dtmb_sip_error_count=dtmb_sip_error_count,
+        dtmb_sip_interval_error_count=dtmb_sip_interval_error_count,
     )
 
 
@@ -673,7 +784,11 @@ def _adaptation_field_valid(
     if not header.has_adaptation_field:
         return True
     adaptation_length = int(packet[4])
-    return 5 + adaptation_length <= TS_PACKET_SIZE
+    if 5 + adaptation_length > TS_PACKET_SIZE:
+        return False
+    if adaptation_length >= 1 and bool(int(packet[5]) & 0x10):
+        return adaptation_length >= 7
+    return True
 
 
 def _adaptation_discontinuity_indicator(
@@ -686,6 +801,118 @@ def _adaptation_discontinuity_indicator(
     if adaptation_length < 1 or 5 + adaptation_length > TS_PACKET_SIZE:
         return False
     return bool(int(packet[5]) & 0x80)
+
+
+def _adaptation_pcr_ticks(
+    packet: memoryview,
+    header: TsPacketHeader,
+) -> int | None:
+    if not header.has_adaptation_field:
+        return None
+    adaptation_length = int(packet[4])
+    if adaptation_length < 7 or 5 + adaptation_length > TS_PACKET_SIZE:
+        return None
+    flags = int(packet[5])
+    if not flags & 0x10:
+        return None
+    b0, b1, b2, b3, b4, b5 = (int(packet[index]) for index in range(6, 12))
+    pcr_base = (b0 << 25) | (b1 << 17) | (b2 << 9) | (b3 << 1) | (b4 >> 7)
+    pcr_ext = ((b4 & 0x01) << 8) | b5
+    return pcr_base * 300 + pcr_ext
+
+
+def _record_pcr(
+    pcr_stats: dict[int, dict[str, Any]],
+    *,
+    pid: int,
+    packet_index: int,
+    pcr_ticks: int,
+    discontinuity: bool,
+) -> None:
+    stats = pcr_stats.setdefault(
+        pid,
+        {
+            "pcr_count": 0,
+            "discontinuity_indicator_count": 0,
+            "backwards_jump_count": 0,
+            "repeated_pcr_count": 0,
+            "first_packet_index": None,
+            "last_packet_index": None,
+            "first_pcr_ticks": None,
+            "last_pcr_ticks": None,
+        },
+    )
+    previous_ticks = stats["last_pcr_ticks"]
+    if previous_ticks is not None:
+        if pcr_ticks < previous_ticks:
+            stats["backwards_jump_count"] += 1
+        elif pcr_ticks == previous_ticks:
+            stats["repeated_pcr_count"] += 1
+    if discontinuity:
+        stats["discontinuity_indicator_count"] += 1
+    if stats["first_pcr_ticks"] is None:
+        stats["first_pcr_ticks"] = pcr_ticks
+        stats["first_packet_index"] = packet_index
+    stats["last_pcr_ticks"] = pcr_ticks
+    stats["last_packet_index"] = packet_index
+    stats["pcr_count"] += 1
+
+
+def _pcr_summary(pcr_stats: dict[int, dict[str, Any]]) -> TsPcrSummary:
+    pid_summaries = tuple(
+        sorted(
+            (
+                _pcr_pid_summary(pid, values)
+                for pid, values in pcr_stats.items()
+            ),
+            key=lambda item: (-item.pcr_count, item.pid),
+        )
+    )
+    return TsPcrSummary(
+        pcr_pid_count=len(pid_summaries),
+        pcr_count=sum(item.pcr_count for item in pid_summaries),
+        discontinuity_indicator_count=sum(
+            item.discontinuity_indicator_count for item in pid_summaries
+        ),
+        backwards_jump_count=sum(item.backwards_jump_count for item in pid_summaries),
+        repeated_pcr_count=sum(item.repeated_pcr_count for item in pid_summaries),
+        monotonic=all(item.backwards_jump_count == 0 for item in pid_summaries),
+        top_pids=pid_summaries,
+    )
+
+
+def _pcr_pid_summary(pid: int, values: dict[str, Any]) -> TsPcrPidSummary:
+    first_ticks = values["first_pcr_ticks"]
+    last_ticks = values["last_pcr_ticks"]
+    first_packet_index = values["first_packet_index"]
+    last_packet_index = values["last_packet_index"]
+    bitrate = None
+    if (
+        first_ticks is not None
+        and last_ticks is not None
+        and first_packet_index is not None
+        and last_packet_index is not None
+        and last_ticks > first_ticks
+        and last_packet_index > first_packet_index
+    ):
+        seconds = (last_ticks - first_ticks) / 27_000_000.0
+        bitrate = ((last_packet_index - first_packet_index) * TS_PACKET_SIZE * 8) / seconds
+    return TsPcrPidSummary(
+        pid=pid,
+        pcr_count=int(values["pcr_count"]),
+        discontinuity_indicator_count=int(values["discontinuity_indicator_count"]),
+        backwards_jump_count=int(values["backwards_jump_count"]),
+        repeated_pcr_count=int(values["repeated_pcr_count"]),
+        first_packet_index=first_packet_index,
+        last_packet_index=last_packet_index,
+        first_pcr_ticks=first_ticks,
+        last_pcr_ticks=last_ticks,
+        first_pcr_seconds=(
+            first_ticks / 27_000_000.0 if first_ticks is not None else None
+        ),
+        last_pcr_seconds=last_ticks / 27_000_000.0 if last_ticks is not None else None,
+        estimated_bitrate_bps=bitrate,
+    )
 
 
 def _positive_int(value: str) -> int:

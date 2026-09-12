@@ -1,4 +1,5 @@
 #include "dtmb/core.hpp"
+#include "dtmb/transport.hpp"
 
 #include "binary_stdio.hpp"
 #include "ldpc_cuda_backend.hpp"
@@ -87,6 +88,7 @@ void usage(const char* program) {
         << " [--select-mode2-source-frame-window FIRST:LAST]"
         << " [--select-mode2-source-frame-window-for-frame-range FEC_FIRST:FEC_LAST:SOURCE_FIRST:SOURCE_LAST]"
         << " [--decode-batch-frames N]"
+        << " [--score-initial-syndrome]"
         << " [--early-syndrome-reject-ratio off|X]"
         << " [--clean-frames-only] [--fail-on-unclean-frame] [--mark-discontinuities]"
         << " [--emit-clean-codewords]"
@@ -2589,6 +2591,7 @@ int main(int argc, char** argv) {
     bool mark_discontinuities = false;
     bool insert_discontinuity_packets = false;
     std::size_t frame_index_offset = 0;
+    bool score_initial_syndrome = false;
     float early_syndrome_reject_ratio = -1.0F;
     std::optional<std::size_t> hard_h_gate_window_codewords;
     std::optional<std::size_t> hard_h_gate_step_codewords;
@@ -2884,6 +2887,8 @@ int main(int argc, char** argv) {
                     return 2;
                 }
                 decode_batch_frames = parse_size(argv[index], "decode batch frames");
+            } else if (arg == "--score-initial-syndrome") {
+                score_initial_syndrome = true;
             } else if (arg == "--early-syndrome-reject-ratio") {
                 if (++index >= argc) {
                     usage(argv[0]);
@@ -3209,6 +3214,8 @@ int main(int argc, char** argv) {
 
         dtmb::tools::configure_binary_stdio(input_path == "-", output_path == "-");
         const auto profile = profile_for_rate(fec_rate);
+        const auto initial_syndrome_scoring_enabled =
+            score_initial_syndrome || early_syndrome_reject_ratio >= 0.0F;
         const auto retry_enabled =
             !retry_llr_clips.empty()
             || !retry_llr_scales.empty()
@@ -3522,7 +3529,7 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 const auto pid = ts_pid(packet);
-                if (pid == kTsNullPid) {
+                if (pid == kTsNullPid || dtmb::core::is_dtmb_sip_packet(packet)) {
                     continue;
                 }
                 const auto continuity_counter = ts_continuity_counter(packet);
@@ -3905,7 +3912,9 @@ int main(int argc, char** argv) {
                 << ",\"converged_codewords\":" << frame_converged_codewords
                 << ",\"ldpc_iterations\":" << frame_ldpc_iterations
                 << ",\"initial_syndrome_scored\":"
-                << (early_syndrome_reject_ratio >= 0.0F ? "true" : "false")
+                << (decoded_frame != nullptr && initial_syndrome_scoring_enabled
+                        ? "true"
+                        : "false")
                 << ",\"initial_syndrome_weight\":" << frame_initial_syndrome_weight
                 << ",\"early_rejected_codewords\":" << frame_early_rejected_codewords
                 << ",\"final_syndrome_weight\":" << frame_final_syndrome_weight
@@ -4240,8 +4249,10 @@ int main(int argc, char** argv) {
                             profile.full_codeword_bits(),
                             decoded_span.begin());
                         decoded_frame.results[codeword] = cuda_result.results[batch_index];
-                        decoded_frame.initial_syndrome_weights[codeword] =
-                            cuda_result.initial_syndrome_weights[batch_index];
+                        if (initial_syndrome_scoring_enabled) {
+                            decoded_frame.initial_syndrome_weights[codeword] =
+                                cuda_result.initial_syndrome_weights[batch_index];
+                        }
                         decoded_frame.early_rejected[codeword] =
                             cuda_result.early_rejected[batch_index];
                         baseline_ready[job_index] = 1U;
@@ -4427,6 +4438,10 @@ int main(int argc, char** argv) {
                     if (primary_llr_clip.has_value()) {
                         primary_llr_scratch.resize(profile.full_codeword_bits());
                     }
+                    std::vector<std::uint8_t> initial_hard_bits_scratch;
+                    if (initial_syndrome_scoring_enabled) {
+                        initial_hard_bits_scratch.resize(profile.full_codeword_bits());
+                    }
                     for (std::size_t job_index = worker;
                          job_index < jobs.size();
                          job_index += effective_workers) {
@@ -4457,25 +4472,43 @@ int main(int argc, char** argv) {
                             if (ldpc_accel == LdpcAccel::cuda) {
                                 ++cuda_ldpc_cpu_fallback_codewords;
                             }
-                            if (early_syndrome_reject_ratio >= 0.0F) {
+                            if (initial_syndrome_scoring_enabled) {
                                 for (std::size_t bit = 0; bit < profile.full_codeword_bits(); ++bit) {
-                                    decoded_span[bit] =
+                                    initial_hard_bits_scratch[bit] =
                                         baseline_llr_span[bit] < 0.0F ? 1U : 0U;
                                 }
                                 const auto initial = dtmb::core::ldpc_syndrome_weight(
-                                    decoded_span,
+                                    initial_hard_bits_scratch,
                                     graph);
                                 decoded_frame.initial_syndrome_weights[codeword] = initial;
-                                const auto initial_ratio =
-                                    static_cast<float>(initial)
-                                    / static_cast<float>(graph.check_count());
-                                if (initial == 0) {
-                                    decoded_frame.results[codeword] =
-                                        dtmb::core::LdpcDecodeResult{0, true, 0};
-                                } else if (initial_ratio >= early_syndrome_reject_ratio) {
-                                    decoded_frame.results[codeword] =
-                                        dtmb::core::LdpcDecodeResult{0, false, initial};
-                                    decoded_frame.early_rejected[codeword] = 1U;
+                                if (early_syndrome_reject_ratio >= 0.0F) {
+                                    const auto initial_ratio =
+                                        static_cast<float>(initial)
+                                        / static_cast<float>(graph.check_count());
+                                    if (initial == 0) {
+                                        std::copy(
+                                            initial_hard_bits_scratch.begin(),
+                                            initial_hard_bits_scratch.end(),
+                                            decoded_span.begin());
+                                        decoded_frame.results[codeword] =
+                                            dtmb::core::LdpcDecodeResult{0, true, 0};
+                                    } else if (
+                                        initial_ratio >= early_syndrome_reject_ratio) {
+                                        std::copy(
+                                            initial_hard_bits_scratch.begin(),
+                                            initial_hard_bits_scratch.end(),
+                                            decoded_span.begin());
+                                        decoded_frame.results[codeword] =
+                                            dtmb::core::LdpcDecodeResult{0, false, initial};
+                                        decoded_frame.early_rejected[codeword] = 1U;
+                                    } else {
+                                        decoded_frame.results[codeword] =
+                                            dtmb::core::ldpc_decode_min_sum_sparse(
+                                                baseline_llr_span,
+                                                graph,
+                                                decoded_span,
+                                                decode_options);
+                                    }
                                 } else {
                                     decoded_frame.results[codeword] =
                                         dtmb::core::ldpc_decode_min_sum_sparse(
@@ -5891,6 +5924,10 @@ int main(int argc, char** argv) {
                   << "batch_total_ms=" << batch_total_ms << '\n'
                   << "converged_codewords=" << converged_count << '\n'
                   << "ldpc_iterations=" << iteration_count << '\n'
+                  << "score_initial_syndrome="
+                  << (score_initial_syndrome ? "true" : "false") << '\n'
+                  << "initial_syndrome_scoring="
+                  << (initial_syndrome_scoring_enabled ? "true" : "false") << '\n'
                   << "early_syndrome_reject_ratio="
                   << (early_syndrome_reject_ratio >= 0.0F
                           ? std::to_string(early_syndrome_reject_ratio)

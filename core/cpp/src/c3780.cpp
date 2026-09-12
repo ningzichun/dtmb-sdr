@@ -480,6 +480,112 @@ void qam64_normalize_amplitude_cf32(
     }
 }
 
+double c3780_qam64_frame_mse_cf32(std::span<const float> symbols) {
+    if (symbols.size() != kC3780DataSymbols * 2) {
+        throw std::invalid_argument("frame confidence requires 3744 CF32 data symbols");
+    }
+    double sum = 0.0;
+    for (const auto value : symbols) {
+        if (!std::isfinite(value)) {
+            throw std::invalid_argument("frame confidence requires finite symbols");
+        }
+        const auto error = static_cast<double>(value) - nearest_qam64_level(value);
+        sum += error * error;
+    }
+    return sum / static_cast<double>(kC3780DataSymbols);
+}
+
+C3780Qam64IntegerTimingResult c3780_qam64_integer_timing_correct_cf32(
+    std::span<float> interleaved_data_symbols,
+    C3780Qam64IntegerTimingOptions options) {
+    if (interleaved_data_symbols.size() != kC3780DataSymbols * 2) {
+        throw std::invalid_argument(
+            "integer timing correction needs exactly 3744 normalized CF32 data symbols");
+    }
+    if (options.max_delta_samples < 1 || options.max_delta_samples > 2
+        || !std::isfinite(options.min_mse_improvement)
+        || options.min_mse_improvement <= 0.0
+        || options.min_mse_improvement > 1.0) {
+        throw std::invalid_argument(
+            "integer timing correction needs max delta 1..2 and MSE improvement in (0,1]");
+    }
+    if (!std::all_of(
+            interleaved_data_symbols.begin(), interleaved_data_symbols.end(),
+            [](float value) { return std::isfinite(value); })) {
+        throw std::invalid_argument("integer timing correction needs finite symbols");
+    }
+
+    // The data order excludes the 36 inserted system-information positions.
+    // Keep the original unsigned FFT bin when rotating a logical data symbol.
+    // Static immutable tables are shared safely by frontend worker threads.
+    static const auto rotations = [] {
+        std::array<std::array<std::complex<double>, kC3780DataSymbols>, 5> result{};
+        const auto mapping = build_logical_to_physical();
+        const auto system_info_mask = build_system_info_mask();
+        std::size_t carrier = 0;
+        for (std::size_t logical = 0; logical < kC3780FrameBodySymbols; ++logical) {
+            if (system_info_mask[logical]) {
+                continue;
+            }
+            for (int delta = -2; delta <= 2; ++delta) {
+                const auto angle = -2.0 * std::numbers::pi_v<double>
+                    * static_cast<double>(mapping[logical]) * static_cast<double>(delta)
+                    / static_cast<double>(kC3780FrameBodySymbols);
+                result[static_cast<std::size_t>(delta + 2)][carrier] =
+                    std::polar(1.0, angle);
+            }
+            ++carrier;
+        }
+        return result;
+    }();
+    auto rotated_symbol = [&](std::size_t carrier, int delta) {
+        const auto value = std::complex<double>{
+            interleaved_data_symbols[carrier * 2],
+            interleaved_data_symbols[carrier * 2 + 1],
+        } * rotations[static_cast<std::size_t>(delta + 2)][carrier];
+        return Complex{static_cast<float>(value.real()), static_cast<float>(value.imag())};
+    };
+    std::array<double, 5> mse{};
+    int best_delta = -options.max_delta_samples;
+    double best_mse = std::numeric_limits<double>::infinity();
+    for (int delta = -options.max_delta_samples; delta <= options.max_delta_samples; ++delta) {
+        double error_sum = 0.0;
+        for (std::size_t carrier = 0; carrier < kC3780DataSymbols; ++carrier) {
+            const auto value = rotated_symbol(carrier, delta);
+            const auto error_real = static_cast<double>(value.real())
+                - nearest_qam64_level(value.real());
+            const auto error_imag = static_cast<double>(value.imag())
+                - nearest_qam64_level(value.imag());
+            error_sum += error_real * error_real + error_imag * error_imag;
+        }
+        const auto score = error_sum / static_cast<double>(kC3780DataSymbols);
+        mse[static_cast<std::size_t>(delta + 2)] = score;
+        // Ascending candidates and a strict comparison match argmin's first tie.
+        if (score < best_mse) {
+            best_mse = score;
+            best_delta = delta;
+        }
+    }
+    const auto baseline = mse[2];
+    if (!std::isfinite(baseline) || !std::isfinite(best_mse)) {
+        throw std::invalid_argument("integer timing correction symbol power overflow");
+    }
+    C3780Qam64IntegerTimingResult result{0, baseline, baseline, 0.0};
+    const auto improvement = baseline > 0.0 ? (baseline - best_mse) / baseline : 0.0;
+    if (best_delta == 0 || improvement < options.min_mse_improvement) {
+        return result;
+    }
+    for (std::size_t carrier = 0; carrier < kC3780DataSymbols; ++carrier) {
+        const auto corrected = rotated_symbol(carrier, best_delta);
+        interleaved_data_symbols[carrier * 2] = corrected.real();
+        interleaved_data_symbols[carrier * 2 + 1] = corrected.imag();
+    }
+    result.delta_samples = best_delta;
+    result.corrected_mse = best_mse;
+    result.relative_improvement = improvement;
+    return result;
+}
+
 void mixed_radix_fft_forward_cf32(
     std::span<const float> interleaved_time_samples,
     std::span<float> interleaved_frequency_bins) {

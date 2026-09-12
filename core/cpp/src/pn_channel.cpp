@@ -284,7 +284,8 @@ void repair_low_energy_pn_dc_response(
     std::size_t channel_taps,
     float regularization,
     Pn945HeaderObservation observation = Pn945HeaderObservation::core_only,
-    std::size_t safe_prefix_skip = kPn945PrefixSymbols) {
+    std::size_t safe_prefix_skip = kPn945PrefixSymbols,
+    std::size_t safe_postfix_skip = 0) {
     std::vector<float> observed(kPn945CoreSymbols * 2);
     for (std::size_t index = 0; index < kPn945CoreSymbols; ++index) {
         const auto main_sample = kPn945PrefixSymbols + index;
@@ -294,7 +295,7 @@ void repair_low_energy_pn_dc_response(
         };
         std::size_t observation_count = 1;
         if (observation != Pn945HeaderObservation::core_only
-            && index < kPn945PrefixSymbols) {
+            && index < kPn945PrefixSymbols - safe_postfix_skip) {
             const auto postfix_sample =
                 kPn945PrefixSymbols + kPn945CoreSymbols + index;
             value += Complex{
@@ -395,8 +396,13 @@ void repair_low_energy_pn_dc_response(
     return {best_start % mask.size(), std::min(best_length, mask.size())};
 }
 
-void dilate_linear_mask(std::vector<bool>& mask, std::size_t guard_taps) {
-    if (guard_taps == 0) {
+void dilate_circular_mask(std::vector<bool>& mask, std::size_t guard_taps) {
+    if (guard_taps == 0 || mask.empty()
+        || std::none_of(mask.begin(), mask.end(), [](bool value) { return value; })) {
+        return;
+    }
+    if (guard_taps >= mask.size() / 2) {
+        std::fill(mask.begin(), mask.end(), true);
         return;
     }
     const auto source = mask;
@@ -404,11 +410,10 @@ void dilate_linear_mask(std::vector<bool>& mask, std::size_t guard_taps) {
         if (!source[index]) {
             continue;
         }
-        const auto start = index > guard_taps ? index - guard_taps : 0;
-        const auto stop = std::min(source.size(), index + guard_taps + 1);
-        std::fill(mask.begin() + static_cast<std::ptrdiff_t>(start),
-                  mask.begin() + static_cast<std::ptrdiff_t>(stop),
-                  true);
+        for (std::size_t delta = 1; delta <= guard_taps; ++delta) {
+            mask[(index + delta) % mask.size()] = true;
+            mask[(index + mask.size() - delta) % mask.size()] = true;
+        }
     }
 }
 
@@ -623,6 +628,89 @@ void dilate_linear_mask(std::vector<bool>& mask, std::size_t guard_taps) {
     return result;
 }
 
+void restore_pn_boundaries(
+    std::span<float> restored,
+    std::span<const float> current_header,
+    std::span<const float> next_header,
+    std::size_t phase,
+    std::size_t next_phase,
+    std::span<const Complex> current_taps,
+    std::span<const Complex> next_taps,
+    int tap_origin) {
+    if (tap_origin == 0) {
+        // Preserve the established causal path, including its arithmetic order.
+        const auto tail_length = std::min<std::size_t>(
+            std::max(current_taps.size(), next_taps.size()) - 1, kC3780FrameBodySymbols);
+        for (std::size_t sample = 0; sample < tail_length; ++sample) {
+            auto body = Complex{restored[sample * 2], restored[sample * 2 + 1]};
+            body -= convolved_pn_header_sample(phase, current_taps, kPn945HeaderSymbols + sample);
+            const auto observed_next = Complex{next_header[sample * 2], next_header[sample * 2 + 1]};
+            body += observed_next - convolved_pn_header_sample(next_phase, next_taps, sample);
+            restored[sample * 2] = body.real();
+            restored[sample * 2 + 1] = body.imag();
+        }
+        return;
+    }
+    const auto first_delay = tap_origin;
+    const auto last_delay = tap_origin + static_cast<int>(
+        std::max(current_taps.size(), next_taps.size())) - 1;
+    if (first_delay <= -static_cast<int>(kPn945HeaderSymbols)
+        || last_delay >= static_cast<int>(kPn945HeaderSymbols)) {
+        throw std::invalid_argument("PN945 channel exceeds available adjacent headers");
+    }
+    if (first_delay < 0 && current_header.size() != kPn945HeaderSymbols * 2) {
+        throw std::invalid_argument("PN945 precursor restoration requires the current received header");
+    }
+    // Tap rotation is a storage convention. PN boundary cancellation must use
+    // the original transmitted phase and signed physical tap positions.
+    phase = static_cast<std::size_t>((static_cast<int>(phase) + tap_origin + 511) % 511);
+    next_phase = static_cast<std::size_t>((static_cast<int>(next_phase) + tap_origin + 511) % 511);
+    for (int sample = 0; sample < last_delay; ++sample) {
+        auto body = Complex{restored[sample * 2], restored[sample * 2 + 1]};
+        for (std::size_t tap = 0; tap < current_taps.size(); ++tap) {
+            const auto delay = tap_origin + static_cast<int>(tap);
+            if (delay > sample) {
+                body -= current_taps[tap] * pn945_header_symbol(
+                    phase, static_cast<std::size_t>(static_cast<int>(kPn945HeaderSymbols) + sample - delay));
+            }
+        }
+        auto residual = Complex{next_header[sample * 2], next_header[sample * 2 + 1]};
+        for (std::size_t tap = 0; tap < next_taps.size(); ++tap) {
+            const auto delay = tap_origin + static_cast<int>(tap);
+            if (delay <= sample) {
+                residual -= next_taps[tap] * pn945_header_symbol(
+                    next_phase, static_cast<std::size_t>(sample - delay));
+            }
+        }
+        body += residual;
+        restored[sample * 2] = body.real();
+        restored[sample * 2 + 1] = body.imag();
+    }
+    for (int sample = first_delay; sample < 0; ++sample) {
+        const auto output_sample = static_cast<int>(kC3780FrameBodySymbols) + sample;
+        auto body = Complex{restored[output_sample * 2], restored[output_sample * 2 + 1]};
+        for (std::size_t tap = 0; tap < next_taps.size(); ++tap) {
+            const auto delay = tap_origin + static_cast<int>(tap);
+            if (delay <= sample) {
+                body -= next_taps[tap] * pn945_header_symbol(
+                    next_phase, static_cast<std::size_t>(sample - delay));
+            }
+        }
+        const auto header_sample = static_cast<int>(kPn945HeaderSymbols) + sample;
+        auto residual = Complex{current_header[header_sample * 2], current_header[header_sample * 2 + 1]};
+        for (std::size_t tap = 0; tap < current_taps.size(); ++tap) {
+            const auto delay = tap_origin + static_cast<int>(tap);
+            if (delay > sample) {
+                residual -= current_taps[tap] * pn945_header_symbol(
+                    phase, static_cast<std::size_t>(header_sample - delay));
+            }
+        }
+        body += residual;
+        restored[output_sample * 2] = body.real();
+        restored[output_sample * 2 + 1] = body.imag();
+    }
+}
+
 void restore_and_equalize_transition(
     std::span<const float> interleaved_time_body,
     std::span<const float> interleaved_next_header,
@@ -637,7 +725,9 @@ void restore_and_equalize_transition(
     int response_window_offset,
     bool mmse_unbias,
     float mmse_unbias_gain_floor,
-    std::span<float> interleaved_channel_power) {
+    std::span<float> interleaved_channel_power,
+    std::span<const float> current_header = {},
+    int tap_origin = 0) {
     if (current_taps.empty() || next_taps.empty() || body_taps.empty()) {
         throw std::invalid_argument("PN945 transition equalizer taps must not be empty");
     }
@@ -653,24 +743,8 @@ void restore_and_equalize_transition(
     }
     thread_local std::vector<float> restored;
     restored.assign(interleaved_time_body.begin(), interleaved_time_body.end());
-    const auto tail_length = std::min<std::size_t>(
-        std::max(current_taps.size(), next_taps.size()) - 1,
-        kC3780FrameBodySymbols);
-    for (std::size_t sample = 0; sample < tail_length; ++sample) {
-        auto body = Complex{restored[sample * 2], restored[sample * 2 + 1]};
-        body -= convolved_pn_header_sample(
-            phase,
-            current_taps,
-            kPn945HeaderSymbols + sample);
-        const auto observed_next = Complex{
-            interleaved_next_header[sample * 2],
-            interleaved_next_header[sample * 2 + 1],
-        };
-        body += observed_next
-            - convolved_pn_header_sample(next_phase, next_taps, sample);
-        restored[sample * 2] = body.real();
-        restored[sample * 2 + 1] = body.imag();
-    }
+    restore_pn_boundaries(restored, current_header, interleaved_next_header,
+                          phase, next_phase, current_taps, next_taps, tap_origin);
 
     thread_local std::vector<float> padded_taps;
     thread_local std::vector<float> response;
@@ -730,7 +804,9 @@ void restore_and_equalize(
     int response_window_offset,
     bool mmse_unbias,
     float mmse_unbias_gain_floor,
-    std::span<float> interleaved_channel_power) {
+    std::span<float> interleaved_channel_power,
+    std::span<const float> current_header = {},
+    int tap_origin = 0) {
     restore_and_equalize_transition(
         interleaved_time_body,
         interleaved_next_header,
@@ -745,7 +821,9 @@ void restore_and_equalize(
         response_window_offset,
         mmse_unbias,
         mmse_unbias_gain_floor,
-        interleaved_channel_power);
+        interleaved_channel_power,
+        current_header,
+        tap_origin);
 }
 
 void restore_and_equalize_with_template_response(
@@ -762,7 +840,9 @@ void restore_and_equalize_with_template_response(
     int response_window_offset,
     bool mmse_unbias,
     float mmse_unbias_gain_floor,
-    std::span<float> interleaved_channel_power) {
+    std::span<float> interleaved_channel_power,
+    std::span<const float> current_header = {},
+    int tap_origin = 0) {
     if (template_response_fft.size() < kC3780FrameBodySymbols * 2) {
         throw std::invalid_argument("wideband PN945 template response FFT is too small");
     }
@@ -778,20 +858,8 @@ void restore_and_equalize_with_template_response(
     }
     thread_local std::vector<float> restored;
     restored.assign(interleaved_time_body.begin(), interleaved_time_body.end());
-    const auto tail_length = std::min<std::size_t>(
-        taps.size() - 1,
-        kC3780FrameBodySymbols);
-    for (std::size_t sample = 0; sample < tail_length; ++sample) {
-        auto body = Complex{restored[sample * 2], restored[sample * 2 + 1]};
-        body -= convolved_pn_header_sample(phase, taps, kPn945HeaderSymbols + sample);
-        const auto observed_next = Complex{
-            interleaved_next_header[sample * 2],
-            interleaved_next_header[sample * 2 + 1],
-        };
-        body += observed_next - convolved_pn_header_sample(next_phase, taps, sample);
-        restored[sample * 2] = body.real();
-        restored[sample * 2 + 1] = body.imag();
-    }
+    restore_pn_boundaries(restored, current_header, interleaved_next_header,
+                          phase, next_phase, taps, taps, tap_origin);
 
     mixed_radix_fft_forward_cf32(restored, interleaved_equalized_spectrum);
     for (std::size_t bin = 0; bin < kC3780FrameBodySymbols; ++bin) {
@@ -834,6 +902,91 @@ void restore_and_equalize_with_template_response(
 }
 
 }  // namespace
+
+std::size_t pn945_phase_for_frame(std::size_t index) noexcept {
+    index %= 200;
+    if (index > 100) index = 200 - index;
+    return index == 0 ? 0 : ((index % 2) != 0 ? (index + 1) / 2 : 511 - index / 2);
+}
+
+float pn945_known_phase_metric_ci8(
+    std::span<const std::int8_t> header, std::size_t phase) {
+    if (header.size() != kPn945HeaderSymbols * 2 || phase >= kPn945CoreSymbols) {
+        throw std::invalid_argument("known-phase PN945 metric needs a complete header and phase 0..510");
+    }
+    double sum_i = 0.0;
+    double sum_q = 0.0;
+    double power = 0.0;
+    for (std::size_t n = 0; n < kPn945CoreSymbols; ++n) {
+        const auto i = static_cast<double>(header[(n + kPn945PrefixSymbols) * 2]);
+        const auto q = static_cast<double>(header[(n + kPn945PrefixSymbols) * 2 + 1]);
+        const auto chip = pn945_core_chips()[(n + phase) % kPn945CoreSymbols];
+        sum_i += chip * i;
+        sum_q += chip * q;
+        power += i * i + q * q;
+    }
+    if (power == 0.0) return 0.0F;
+    return static_cast<float>(std::sqrt((sum_i * sum_i + sum_q * sum_q)
+        / (kPn945CoreSymbols * power)));
+}
+
+Pn945ScheduleAlignment fit_pn945_phase_schedule(
+    std::span<const std::size_t> observed_phases) {
+    constexpr std::size_t period = 200;
+    Pn945ScheduleAlignment result;
+    result.observations = std::min(observed_phases.size(), period);
+    for (const auto phase : observed_phases.first(result.observations)) {
+        if (phase >= kPn945CoreSymbols) {
+            throw std::invalid_argument("PN945 phase must be in 0..510");
+        }
+    }
+    if (result.observations < period) {
+        return result;
+    }
+    const auto phase_at = [](std::size_t index) {
+        return static_cast<int>(pn945_phase_for_frame(index));
+    };
+    const auto distance = [](int observed, int expected) {
+        return (observed - expected + 2 * 511 + 255) % 511 - 255;
+    };
+    std::array<double, period> costs;
+    costs.fill(std::numeric_limits<double>::infinity());
+    std::array<int, period> biases{};
+    for (std::size_t origin = 0; origin < period; ++origin) {
+        for (int bias = -217; bias <= 217; ++bias) {
+            double sum = 0.0;
+            for (std::size_t frame = 0; frame < period; ++frame) {
+                const auto error = distance(static_cast<int>(observed_phases[frame]),
+                    phase_at(origin + frame) + bias);
+                sum += std::min(error * error, 25);
+            }
+            const auto cost = sum / period;
+            if (cost < costs[origin]
+                || (cost == costs[origin] && std::abs(bias) < std::abs(biases[origin]))) {
+                costs[origin] = cost;
+                biases[origin] = bias;
+            }
+        }
+    }
+    result.superframe_index = static_cast<std::size_t>(
+        std::distance(costs.begin(), std::min_element(costs.begin(), costs.end())));
+    result.phase_bias = biases[result.superframe_index];
+    result.mean_squared_error = costs[result.superframe_index];
+    result.runner_up_error = std::numeric_limits<double>::infinity();
+    for (std::size_t origin = 0; origin < period; ++origin) {
+        if (origin != result.superframe_index) {
+            result.runner_up_error = std::min(result.runner_up_error, costs[origin]);
+        }
+    }
+    for (std::size_t frame = 0; frame < period; ++frame) {
+        result.inliers += std::abs(distance(static_cast<int>(observed_phases[frame]),
+            phase_at(result.superframe_index + frame) + result.phase_bias)) <= 1;
+    }
+    result.valid = result.mean_squared_error <= 1.0
+        && result.runner_up_error - result.mean_squared_error >= 0.25
+        && result.inliers * 20 >= period * 19;
+    return result;
+}
 
 std::size_t pn945_detect_phase_cf32(std::span<const float> interleaved_header) {
     if (interleaved_header.size() != kPn945HeaderSymbols * 2) {
@@ -1040,6 +1193,14 @@ Pn945WidebandChannelModel build_pn945_wideband_channel_model_cf32(
         throw std::invalid_argument("invalid wideband PN945 model options");
     }
     const auto frame_count = interleaved_headers.size() / header_stride;
+    if (!options.expected_phases.empty() && options.expected_phases.size() != frame_count) {
+        throw std::invalid_argument("wideband PN945 phase count must match the header count");
+    }
+    for (const auto phase : options.expected_phases) {
+        if (phase >= kPn945CoreSymbols) {
+            throw std::invalid_argument("wideband PN945 expected phase must be in 0..510");
+        }
+    }
     std::vector<std::size_t> phases(frame_count);
     std::vector<std::vector<Complex>> rows;
     std::vector<std::vector<Complex>> structure_rows;
@@ -1048,7 +1209,8 @@ Pn945WidebandChannelModel build_pn945_wideband_channel_model_cf32(
     std::array<std::size_t, kPn945CoreSymbols> phase_counts{};
     for (std::size_t frame = 0; frame < frame_count; ++frame) {
         const auto header = interleaved_headers.subspan(frame * header_stride, header_stride);
-        phases[frame] = pn945_detect_phase_cf32(header);
+        phases[frame] = options.expected_phases.empty()
+            ? pn945_detect_phase_cf32(header) : options.expected_phases[frame];
         ++phase_counts[phases[frame]];
         rows.push_back(estimate_channel_taps(
             header,
@@ -1132,11 +1294,15 @@ Pn945WidebandChannelModel build_pn945_wideband_channel_model_cf32(
         }
     }
     const auto per_frame_noise = median(std::move(per_frame_noise_samples));
-    const auto [gap_start, gap_length] = longest_circular_false_run(mask);
+    // Guard while the impulse response is still circular. Cutting at the first
+    // significant tap before dilation silently discarded every leading guard
+    // tap, including weak physical precursors immediately before that tap.
+    auto guarded_mask = mask;
+    dilate_circular_mask(guarded_mask, options.guard_taps);
+    const auto [gap_start, gap_length] = longest_circular_false_run(guarded_mask);
     const auto rotation = (gap_start + gap_length) % kPn945CoreSymbols;
     auto rotated_taps = rotate_left(mean_taps, rotation);
-    auto rotated_mask = rotate_left(mask, rotation);
-    dilate_linear_mask(rotated_mask, options.guard_taps);
+    auto rotated_mask = rotate_left(guarded_mask, rotation);
     std::size_t span = 1;
     for (std::size_t tap = 0; tap < rotated_mask.size(); ++tap) {
         if (rotated_mask[tap]) {
@@ -1144,8 +1310,20 @@ Pn945WidebandChannelModel build_pn945_wideband_channel_model_cf32(
         }
     }
     span = std::min(span, options.max_span_symbols);
-    if (options.header_observation == Pn945HeaderObservation::core_cyclic_safe_average) {
-        const auto safe_prefix_skip = std::min(span - 1, kPn945PrefixSymbols);
+    auto first_delay = static_cast<int>(rotation);
+    if (first_delay > static_cast<int>(kPn945CoreSymbols / 2)) {
+        first_delay -= static_cast<int>(kPn945CoreSymbols);
+    }
+    const auto last_delay = first_delay + static_cast<int>(span) - 1;
+    if (options.header_observation == Pn945HeaderObservation::core_cyclic_safe_average
+        || (options.header_observation == Pn945HeaderObservation::core_postfix_average
+            && first_delay < 0)) {
+        // Only repeated PN samples unaffected by adjacent data are usable.
+        // These bounds are physical delays, not offsets in the rotated array.
+        const auto safe_prefix_skip = static_cast<std::size_t>(
+            std::clamp(last_delay, 0, static_cast<int>(kPn945PrefixSymbols)));
+        const auto safe_postfix_skip = static_cast<std::size_t>(
+            std::clamp(-first_delay, 0, static_cast<int>(kPn945PrefixSymbols)));
         for (std::size_t frame = 0; frame < frame_count; ++frame) {
             const auto header = interleaved_headers.subspan(frame * header_stride, header_stride);
             rows[frame] = estimate_channel_taps(
@@ -1154,7 +1332,8 @@ Pn945WidebandChannelModel build_pn945_wideband_channel_model_cf32(
                 kPn945CoreSymbols,
                 options.regularization,
                 options.header_observation,
-                safe_prefix_skip);
+                safe_prefix_skip,
+                safe_postfix_skip);
         }
     }
     std::vector<float> template_taps(span * 2, 0.0F);
@@ -1199,7 +1378,7 @@ Pn945WidebandChannelModel build_pn945_wideband_channel_model_cf32(
     if (uses_masked_frame_taps(options.scale_estimator)) {
         frame_template_taps.assign(frame_count * span * 2, 0.0F);
     }
-    const auto reference = Complex{
+    const auto dominant_reference = Complex{
         template_taps[dominant_tap * 2],
         template_taps[dominant_tap * 2 + 1],
     };
@@ -1273,7 +1452,7 @@ Pn945WidebandChannelModel build_pn945_wideband_channel_model_cf32(
                 rows[frame][(dominant_tap + rotation) % kPn945CoreSymbols];
             scale = bounded_wideband_response_scale(
                 anchor,
-                reference,
+                dominant_reference,
                 per_frame_noise);
         }
         frame_response_scales[frame * 2] = scale.real();
@@ -1300,6 +1479,7 @@ Pn945WidebandChannelModel build_pn945_wideband_channel_model_cf32(
             : 0.0F,
         options.scale_estimator,
         options.header_observation,
+        std::vector<float>(interleaved_headers.begin(), interleaved_headers.end()),
     };
 }
 
@@ -1362,7 +1542,9 @@ Pn945EqualizeResult pn945_equalize_c3780_frame_wideband_cf32(
             -signed_rotation + options.response_window_offset_adjust,
             options.mmse_unbias,
             options.mmse_unbias_gain_floor,
-            options.interleaved_channel_power);
+            options.interleaved_channel_power,
+            interleaved_header,
+            signed_rotation);
         return Pn945EqualizeResult{phase, next_phase};
     }
     if (uses_masked_frame_taps(model.scale_estimator)) {
@@ -1378,7 +1560,9 @@ Pn945EqualizeResult pn945_equalize_c3780_frame_wideband_cf32(
             -signed_rotation + options.response_window_offset_adjust,
             options.mmse_unbias,
             options.mmse_unbias_gain_floor,
-            options.interleaved_channel_power);
+            options.interleaved_channel_power,
+            interleaved_header,
+            signed_rotation);
         return Pn945EqualizeResult{phase, next_phase};
     }
     restore_and_equalize_with_template_response(
@@ -1395,7 +1579,9 @@ Pn945EqualizeResult pn945_equalize_c3780_frame_wideband_cf32(
         -signed_rotation + options.response_window_offset_adjust,
         options.mmse_unbias,
         options.mmse_unbias_gain_floor,
-        options.interleaved_channel_power);
+        options.interleaved_channel_power,
+        interleaved_header,
+        signed_rotation);
     return Pn945EqualizeResult{phase, next_phase};
 }
 
@@ -1423,6 +1609,10 @@ Pn945EqualizeResult pn945_equalize_c3780_frame_wideband_cached_cf32(
         || (model_frame_index + 1) * 2 + 1 >= model.frame_response_scales.size()) {
         throw std::invalid_argument("wideband PN945 cached frame index is outside model state");
     }
+    const auto header_values = kPn945HeaderSymbols * 2;
+    const auto current_header = model_frame_index < model.frame_headers_cf32.size() / header_values
+        ? std::span<const float>(model.frame_headers_cf32).subspan(model_frame_index * header_values, header_values)
+        : std::span<const float>{};
     const auto phase = model.frame_pn_phases[model_frame_index];
     const auto next_phase = model.frame_pn_phases[model_frame_index + 1];
     const auto response_scale = Complex{
@@ -1459,7 +1649,9 @@ Pn945EqualizeResult pn945_equalize_c3780_frame_wideband_cached_cf32(
             -signed_rotation + options.response_window_offset_adjust,
             options.mmse_unbias,
             options.mmse_unbias_gain_floor,
-            options.interleaved_channel_power);
+            options.interleaved_channel_power,
+            current_header,
+            signed_rotation);
         return Pn945EqualizeResult{phase, next_phase};
     }
     if (uses_masked_frame_taps(model.scale_estimator)) {
@@ -1475,7 +1667,9 @@ Pn945EqualizeResult pn945_equalize_c3780_frame_wideband_cached_cf32(
             -signed_rotation + options.response_window_offset_adjust,
             options.mmse_unbias,
             options.mmse_unbias_gain_floor,
-            options.interleaved_channel_power);
+            options.interleaved_channel_power,
+            current_header,
+            signed_rotation);
         return Pn945EqualizeResult{phase, next_phase};
     }
     restore_and_equalize_with_template_response(
@@ -1492,7 +1686,9 @@ Pn945EqualizeResult pn945_equalize_c3780_frame_wideband_cached_cf32(
         -signed_rotation + options.response_window_offset_adjust,
         options.mmse_unbias,
         options.mmse_unbias_gain_floor,
-        options.interleaved_channel_power);
+        options.interleaved_channel_power,
+        current_header,
+        signed_rotation);
     return Pn945EqualizeResult{phase, next_phase};
 }
 

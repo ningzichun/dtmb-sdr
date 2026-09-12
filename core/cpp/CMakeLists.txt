@@ -1,10 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(dtmb_core VERSION 0.2.0 LANGUAGES C CXX)
+project(dtmb_core VERSION 0.3.0 LANGUAGES C CXX)
 
 option(DTMB_CORE_BUILD_TESTS "Build dtmb-core tests" ON)
 option(DTMB_CORE_ENABLE_CUDA_LDPC "Build the optional CUDA LDPC backend" OFF)
 option(DTMB_CORE_ENABLE_FFTW "Use FFTW3f when available" ON)
+
+find_package(Threads REQUIRED)
 
 if(DTMB_CORE_ENABLE_CUDA_LDPC)
   enable_language(CUDA)
@@ -20,12 +22,14 @@ add_library(dtmb_core
   src/frame_sync.cpp
   src/pn_channel.cpp
   src/resampler.cpp
+  src/transport.cpp
 )
 add_library(dtmb::core ALIAS dtmb_core)
 target_compile_features(dtmb_core PUBLIC cxx_std_20)
 target_include_directories(dtmb_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
+target_link_libraries(dtmb_core PUBLIC Threads::Threads)
 
 if(DTMB_CORE_ENABLE_FFTW)
   find_path(FFTW3F_INCLUDE_DIR NAMES fftw3.h HINTS ENV CONDA_PREFIX
@@ -54,6 +58,10 @@ target_link_libraries(dtmb_core_c3780_extract PRIVATE dtmb::core)
 add_executable(dtmb_core_deinterleave_qam64 tools/deinterleave_qam64.cpp)
 target_link_libraries(dtmb_core_deinterleave_qam64 PRIVATE dtmb::core)
 
+add_executable(dtmb_core_pipe_buffer tools/pipe_buffer.cpp)
+target_compile_features(dtmb_core_pipe_buffer PRIVATE cxx_std_20)
+target_link_libraries(dtmb_core_pipe_buffer PRIVATE Threads::Threads)
+
 add_library(dtmb_ldpc_h_gate_support STATIC tools/ldpc_h_gate.cpp)
 target_compile_features(dtmb_ldpc_h_gate_support PUBLIC cxx_std_20)
 target_include_directories(dtmb_ldpc_h_gate_support PUBLIC tools)
@@ -74,6 +82,15 @@ add_executable(dtmb_core_ldpc_bch_decode tools/ldpc_bch_decode.cpp)
 target_link_libraries(dtmb_core_ldpc_bch_decode PRIVATE
   dtmb_ldpc_h_gate_support
   dtmb_ldpc_cuda_backend
+)
+
+install(TARGETS
+  dtmb_core_ci8_resample
+  dtmb_core_c3780_extract
+  dtmb_core_deinterleave_qam64
+  dtmb_core_ldpc_bch_decode
+  dtmb_core_pipe_buffer
+  RUNTIME DESTINATION dtmb/bin
 )
 
 if(DTMB_CORE_BUILD_TESTS)

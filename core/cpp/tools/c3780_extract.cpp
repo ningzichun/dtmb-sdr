@@ -157,24 +157,31 @@ struct FrameNormalizationStats {
     float qam_minus_system_info_phase_rad = 0.0F;
     float qam_minus_system_info_phase_mod_pi_over_2_rad = 0.0F;
     int qam_minus_system_info_quadrant = 0;
+    bool integer_timing_evaluated = false;
+    dtmb::core::C3780Qam64IntegerTimingResult integer_timing{};
 };
 
 struct FrameWork {
-    FrameWork()
+    explicit FrameWork(bool integer_timing_correction = false)
         : header_ci8(dtmb::core::kPn945HeaderSymbols * 2),
+          post_body_header_ci8(dtmb::core::kPn945HeaderSymbols * 2),
           body_ci8(dtmb::core::kC3780FrameBodySymbols * 2),
           header_cf32(dtmb::core::kPn945HeaderSymbols * 2),
+          post_body_header_cf32(dtmb::core::kPn945HeaderSymbols * 2),
           body_cf32(dtmb::core::kC3780FrameBodySymbols * 2),
           spectrum_cf32(dtmb::core::kC3780FrameBodySymbols * 2),
           logical_cf32(dtmb::core::kC3780FrameBodySymbols * 2),
           data_cf32(dtmb::core::kC3780DataSymbols * 2),
           channel_power_spectrum_cf32(dtmb::core::kC3780FrameBodySymbols * 2),
           channel_power_logical_cf32(dtmb::core::kC3780FrameBodySymbols * 2),
-          csi_weights(dtmb::core::kC3780DataSymbols) {}
+          csi_weights(dtmb::core::kC3780DataSymbols),
+          integer_timing_correction_enabled(integer_timing_correction) {}
 
     std::vector<std::int8_t> header_ci8;
+    std::vector<std::int8_t> post_body_header_ci8;
     std::vector<std::int8_t> body_ci8;
     std::vector<float> header_cf32;
+    std::vector<float> post_body_header_cf32;
     std::vector<float> body_cf32;
     std::vector<float> spectrum_cf32;
     std::vector<float> logical_cf32;
@@ -184,6 +191,35 @@ struct FrameWork {
     std::vector<float> csi_weights;
     FrameNormalizationStats normalization_stats;
     std::size_t sample_start = 0;
+    int signal_phase_bias = 0;
+    std::optional<std::size_t> known_pn_phase;
+    bool post_body_header_valid = false;
+    bool integer_timing_correction_enabled = false;
+};
+
+constexpr dtmb::core::C3780Qam64IntegerTimingOptions kIntegerTimingOptions{};
+
+struct IntegerTimingCorrectionStats {
+    std::size_t observed_frames = 0;
+    std::size_t corrected_frames = 0;
+    std::array<std::size_t, 5> delta_frames{};
+    int max_abs_delta_samples = 0;
+    double max_relative_improvement = 0.0;
+
+    // Called in output order after frontend workers have joined.
+    void observe(const FrameNormalizationStats& stats) {
+        if (!stats.integer_timing_evaluated) {
+            return;
+        }
+        ++observed_frames;
+        const auto& result = stats.integer_timing;
+        ++delta_frames[static_cast<std::size_t>(result.delta_samples + 2)];
+        if (result.delta_samples != 0) {
+            ++corrected_frames;
+        }
+        max_abs_delta_samples = std::max(max_abs_delta_samples, std::abs(result.delta_samples));
+        max_relative_improvement = std::max(max_relative_improvement, result.relative_improvement);
+    }
 };
 
 void prepare_csi_weights(FrameWork& frame);
@@ -212,6 +248,10 @@ struct TimingTrackerStats {
     std::size_t trajectory_accepted_points = 0;
     std::size_t trajectory_low_metric_fallbacks = 0;
     std::size_t trajectory_innovation_rejections = 0;
+    std::size_t trajectory_forced_resets_requested = 0;
+    std::size_t trajectory_forced_resets_attempted = 0;
+    std::size_t trajectory_forced_resets_accepted = 0;
+    std::size_t trajectory_forced_resets_low_metric = 0;
     bool trajectory_local_search_enabled = false;
     std::size_t trajectory_local_searches = 0;
     std::size_t trajectory_local_hits = 0;
@@ -494,6 +534,7 @@ void usage(const char* program) {
         << " [--timing-trajectory-seed PATH]"
         << " [--timing-trajectory-frame-index-offset N]"
         << " [--timing-trajectory-offset-origin-samples X]"
+        << " [--timing-trajectory-reset-at-frame N]"
         << " [--timing-trajectory-state-out PATH]"
         << " [--timing-trajectory-state-out-frame N]"
         << " [--timing-trajectory-local-search]"
@@ -524,6 +565,10 @@ void usage(const char* program) {
         << " [--pn-mmse off|auto|X]"
         << " [--remove-dc]"
         << " [--normalization system-info|qam64|qam64-amplitude|none]"
+        << " [--qam64-integer-timing-correction]"
+        << " [--pn-schedule-sync]"
+        << " [--pn-schedule-tracking]"
+        << " [--pn-current-header-tracking]"
         << " [--system-info-index N|auto]"
         << " [--system-info-auto-observation-frames N]"
         << " [--system-info-auto-min-metric X]"
@@ -758,6 +803,7 @@ public:
     TrackingFrameReader(
         ReplayInput& input,
         std::size_t phase_offset,
+        int signal_phase_bias,
         std::size_t search_radius,
         float hit_threshold,
         std::size_t trajectory_interval_frames,
@@ -766,6 +812,7 @@ public:
         std::vector<TimingTrajectorySeedPoint> trajectory_seed_points,
         std::size_t trajectory_frame_index_offset,
         double trajectory_offset_origin_samples,
+        std::vector<std::size_t> trajectory_reset_frames,
         std::string trajectory_state_out_path,
         std::size_t trajectory_state_out_frame,
         bool trajectory_local_search,
@@ -775,11 +822,16 @@ public:
         bool trajectory_local_search_transient,
         std::vector<TimingLocalSearchTransientRange>
             trajectory_local_search_transient_ranges,
-        TimingDiagnostics* timing_diagnostics)
+        TimingDiagnostics* timing_diagnostics,
+        std::optional<std::size_t> pn_schedule_origin,
+        bool pn_current_header_tracking)
         : input_(input),
+          pn_schedule_origin_(pn_schedule_origin),
+          pn_current_header_tracking_(pn_current_header_tracking),
           buffer_start_sample_(phase_offset),
           next_expected_sample_(phase_offset),
           trajectory_origin_sample_(phase_offset),
+          signal_phase_bias_(signal_phase_bias),
           search_radius_(search_radius),
           hit_threshold_(hit_threshold),
           trajectory_interval_frames_(trajectory_interval_frames),
@@ -787,6 +839,7 @@ public:
           trajectory_max_innovation_samples_(trajectory_max_innovation_samples),
           trajectory_frame_index_offset_(trajectory_frame_index_offset),
           trajectory_offset_origin_samples_(trajectory_offset_origin_samples),
+          trajectory_reset_frames_(std::move(trajectory_reset_frames)),
           trajectory_state_out_path_(std::move(trajectory_state_out_path)),
           trajectory_state_out_frame_(trajectory_state_out_frame),
           trajectory_local_search_(trajectory_local_search),
@@ -807,6 +860,7 @@ public:
         stats_.trajectory_seed_points = trajectory_seed_points.size();
         stats_.trajectory_frame_index_offset = trajectory_frame_index_offset_;
         stats_.trajectory_offset_origin_samples = trajectory_offset_origin_samples_;
+        stats_.trajectory_forced_resets_requested = trajectory_reset_frames_.size();
         stats_.trajectory_local_search_enabled = trajectory_local_search_;
         trajectory_seeded_restart_ = !trajectory_seed_points.empty();
         for (const auto& point : trajectory_seed_points) {
@@ -824,6 +878,39 @@ public:
     }
 
     bool read(FrameWork& frame, std::size_t& trailing_ci8_bytes) {
+        if (!read_one(frame, trailing_ci8_bytes)) return false;
+        frame.known_pn_phase = pn_schedule_origin_.has_value()
+            ? std::optional<std::size_t>(dtmb::core::pn945_phase_for_frame(
+                *pn_schedule_origin_ + schedule_frame_index_)) : std::nullopt;
+        frame.post_body_header_valid = false;
+        if (pn_current_header_tracking_ && frame.known_pn_phase.has_value()) {
+            const auto body_end = frame.sample_start + dtmb::core::kPn945FrameSymbols;
+            const auto context_end = body_end + dtmb::core::kPn945HeaderSymbols;
+            ensure_until(context_end);
+            if (body_end >= buffer_start_sample_
+                && context_end <= buffer_start_sample_ + buffer_.size() / 2) {
+                std::copy_n(buffer_.data() + (body_end - buffer_start_sample_) * 2,
+                            frame.post_body_header_ci8.size(), frame.post_body_header_ci8.data());
+                frame.post_body_header_valid = true;
+            }
+        }
+        ++schedule_frame_index_;
+        return true;
+    }
+
+    [[nodiscard]] bool pn_schedule_active() const noexcept {
+        return pn_schedule_origin_.has_value();
+    }
+
+    [[nodiscard]] std::size_t pn_schedule_loss_frame() const noexcept {
+        return pn_schedule_loss_frame_;
+    }
+
+    [[nodiscard]] std::size_t pn_schedule_reanchor_confirmed() const noexcept {
+        return pn_schedule_reanchor_confirmed_;
+    }
+
+    bool read_one(FrameWork& frame, std::size_t& trailing_ci8_bytes) {
         if (search_radius_ == 0) {
             return read_untracked(frame, trailing_ci8_bytes);
         }
@@ -867,6 +954,9 @@ public:
             low_metric_fallback = true;
         }
 
+        update_signal_phase_bias(
+            static_cast<std::int64_t>(selected_start)
+            - static_cast<std::int64_t>(next_expected_sample_));
         copy_frame(selected_start, frame);
         if (timing_diagnostics_ != nullptr && timing_diagnostics_->enabled()) {
             const auto offset = static_cast<std::int64_t>(selected_start)
@@ -954,6 +1044,24 @@ private:
             - trajectory_offset_origin_samples_;
     }
 
+    void update_signal_phase_bias(std::int64_t correction) noexcept {
+        // A timing search may recenter the explicit auto-phase adjustment.
+        // Only retain the part that cancels that known signal-relative bias.
+        // Scheduled trajectory drift follows the transmitter clock and must
+        // not become an FFT response-window rotation.
+        if (signal_phase_bias_ > 0 && correction < 0) {
+            const auto reduction = std::min<std::int64_t>(
+                signal_phase_bias_,
+                -correction);
+            signal_phase_bias_ -= static_cast<int>(reduction);
+        } else if (signal_phase_bias_ < 0 && correction > 0) {
+            const auto reduction = std::min<std::int64_t>(
+                -static_cast<std::int64_t>(signal_phase_bias_),
+                correction);
+            signal_phase_bias_ += static_cast<int>(reduction);
+        }
+    }
+
     void fit_trajectory() {
         if (trajectory_points_.empty()) {
             trajectory_intercept_samples_ = 0.0;
@@ -1030,12 +1138,15 @@ private:
     }
 
     TimingShadowResult record_trajectory_shadow_search(std::size_t predicted_start) {
-        constexpr auto half_frame = dtmb::core::kPn945FrameSymbols / 2;
-        const auto search_min = predicted_start > half_frame
-            ? predicted_start - half_frame
+        const auto require_confirmation = pn_current_header_tracking_
+            && pn_schedule_origin_.has_value();
+        const auto radius = require_confirmation
+            ? dtmb::core::kPn945FrameSymbols : dtmb::core::kPn945FrameSymbols / 2;
+        const auto search_min = predicted_start > radius
+            ? predicted_start - radius
             : 0;
         const auto bounded_min = std::max(search_min, buffer_start_sample_);
-        const auto search_max = predicted_start + half_frame;
+        const auto search_max = predicted_start + radius;
         ensure_until(search_max + dtmb::core::kPn945FrameSymbols);
 
         const auto available_end_sample = buffer_start_sample_ + buffer_.size() / 2;
@@ -1047,18 +1158,34 @@ private:
             available_end_sample - dtmb::core::kPn945FrameSymbols);
         auto best_start = std::clamp(predicted_start, bounded_min, bounded_max);
         auto best_metric = metric_at(best_start);
+        std::optional<std::size_t> confirmed_start;
+        auto confirmed_metric = 0.0F;
         for (auto candidate = bounded_min; candidate <= bounded_max; ++candidate) {
             const auto metric = metric_at(candidate);
             if (metric > best_metric) {
                 best_start = candidate;
                 best_metric = metric;
             }
+            // An adjacent frame can give a stronger single-header peak at a
+            // different cyclic phase. Rank only candidates that also match
+            // the three retained past headers, not just that strongest peak.
+            if (require_confirmation && metric >= hit_threshold_
+                && metric > confirmed_metric && schedule_candidate_confirmed(candidate)) {
+                confirmed_start = candidate;
+                confirmed_metric = metric;
+            }
         }
+        if (confirmed_start.has_value()) {
+            best_start = *confirmed_start;
+            best_metric = confirmed_metric;
+        }
+        const auto hit = best_metric >= hit_threshold_
+            && (!require_confirmation || confirmed_start.has_value());
 
         const auto delta = static_cast<std::int64_t>(best_start)
             - static_cast<std::int64_t>(predicted_start);
         ++stats_.trajectory_shadow_searches;
-        stats_.trajectory_shadow_hits += best_metric >= hit_threshold_ ? 1U : 0U;
+        stats_.trajectory_shadow_hits += hit ? 1U : 0U;
         stats_.trajectory_shadow_last_delta = delta;
         stats_.trajectory_shadow_max_abs_delta = std::max(
             stats_.trajectory_shadow_max_abs_delta,
@@ -1069,7 +1196,7 @@ private:
             best_metric);
         return TimingShadowResult{
             true,
-            best_metric >= hit_threshold_,
+            hit,
             best_start,
             delta,
             best_metric,
@@ -1077,6 +1204,20 @@ private:
     }
 
     bool read_trajectory(FrameWork& frame, std::size_t& trailing_ci8_bytes) {
+        const auto global_frame_index = trajectory_frame_index_offset_
+            + trajectory_frame_index_;
+        while (trajectory_reset_frame_index_ < trajectory_reset_frames_.size()
+               && trajectory_reset_frames_[trajectory_reset_frame_index_]
+                   < global_frame_index) {
+            ++trajectory_reset_frame_index_;
+        }
+        const auto forced_reset =
+            trajectory_reset_frame_index_ < trajectory_reset_frames_.size()
+            && trajectory_reset_frames_[trajectory_reset_frame_index_]
+                == global_frame_index;
+        if (forced_reset) {
+            ++trajectory_reset_frame_index_;
+        }
         const auto nominal_start = trajectory_nominal_start(trajectory_frame_index_);
         auto selected_start = apply_trajectory_offset(
             nominal_start,
@@ -1085,7 +1226,8 @@ private:
             selected_start,
             static_cast<double>(trajectory_local_offset_samples_));
         const auto seeded_restart = trajectory_seeded_restart_
-            && trajectory_frame_index_ == 0;
+            && trajectory_frame_index_ == 0
+            && !forced_reset;
         if (seeded_restart) {
             selected_start = nominal_start;
         }
@@ -1103,17 +1245,20 @@ private:
         auto local_correction = false;
         auto local_delta = std::int64_t{0};
         auto shadow = TimingShadowResult{};
-        const auto reacquire_phase =
-            (trajectory_frame_index_offset_ % trajectory_interval_frames_
-             + trajectory_frame_index_ % trajectory_interval_frames_)
-            % trajectory_interval_frames_;
-        const auto reacquire = !seeded_restart && reacquire_phase == 0;
+        const auto cadence_frame = global_frame_index - trajectory_cadence_origin_frame_;
+        const auto reacquire_phase = cadence_frame % trajectory_interval_frames_;
+        const auto reacquire = !seeded_restart
+            && (forced_reset || reacquire_phase == 0);
         if (reacquire) {
-            const auto search_min = selected_start > search_radius_
-                ? selected_start - search_radius_
+            // A forced reset changes only trajectory history and cadence.  It
+            // deliberately preserves the already selected absolute frame
+            // boundary at the reset frame; later anchors may move normally.
+            const auto reacquire_radius = forced_reset ? std::size_t{0} : search_radius_;
+            const auto search_min = selected_start > reacquire_radius
+                ? selected_start - reacquire_radius
                 : 0;
             const auto bounded_min = std::max(search_min, buffer_start_sample_);
-            const auto search_max = selected_start + search_radius_;
+            const auto search_max = selected_start + reacquire_radius;
             ensure_until(search_max + dtmb::core::kPn945FrameSymbols);
 
             const auto available_end_sample = buffer_start_sample_ + buffer_.size() / 2;
@@ -1136,8 +1281,11 @@ private:
             }
             metric = best_metric;
             best_metric_for_event = best_metric;
-            event_name = std::string_view("trajectory_reacquire");
+            event_name = forced_reset
+                ? std::string_view("trajectory_forced_reset")
+                : std::string_view("trajectory_reacquire");
             ++stats_.trajectory_reacquisitions;
+            stats_.trajectory_forced_resets_attempted += forced_reset ? 1U : 0U;
             if (stats_.trajectory_reacquisitions == 1) {
                 stats_.trajectory_min_metric = best_metric;
             } else {
@@ -1145,6 +1293,10 @@ private:
                     std::min(stats_.trajectory_min_metric, best_metric);
             }
             stats_.trajectory_last_metric = best_metric;
+            if (pn_schedule_origin_.has_value()) {
+                pn_schedule_missed_anchors_ = best_metric >= hit_threshold_
+                    ? 0 : pn_schedule_missed_anchors_ + 1;
+            }
             if (best_metric >= hit_threshold_) {
                 const auto observed_offset = static_cast<std::int64_t>(best_start)
                     - static_cast<std::int64_t>(nominal_start);
@@ -1158,7 +1310,18 @@ private:
                 stats_.trajectory_max_abs_innovation = std::max(
                     stats_.trajectory_max_abs_innovation,
                     std::abs(innovation));
-                if (trajectory_points_.size() >= 2
+                if (forced_reset) {
+                    trajectory_points_.clear();
+                    trajectory_local_offset_samples_ = 0;
+                    trajectory_cadence_origin_frame_ = global_frame_index;
+                    add_trajectory_point(trajectory_frame_index_, observed_offset);
+                    selected_start = apply_trajectory_offset(
+                        nominal_start,
+                        trajectory_offset_at(trajectory_frame_index_));
+                    ++stats_.trajectory_forced_resets_accepted;
+                    event_name =
+                        std::string_view("trajectory_forced_reset_accepted");
+                } else if (trajectory_points_.size() >= 2
                     && std::abs(innovation) > trajectory_max_innovation_samples_) {
                     ++stats_.trajectory_innovation_rejections;
                     innovation_rejected = true;
@@ -1175,18 +1338,35 @@ private:
             } else {
                 ++stats_.trajectory_low_metric_fallbacks;
                 low_metric_fallback = true;
-                event_name = std::string_view("trajectory_reacquire_low_metric");
-                shadow = record_trajectory_shadow_search(selected_start);
-                if (shadow.hit) {
-                    selected_start = shadow.selected_start;
-                    metric = shadow.metric;
-                    best_metric_for_event = shadow.metric;
-                    reset_trajectory_at(trajectory_frame_index_, selected_start);
-                    ++stats_.trajectory_shadow_reanchors;
-                    event_name = std::string_view("trajectory_shadow_reanchor");
+                if (forced_reset) {
+                    ++stats_.trajectory_forced_resets_low_metric;
+                    event_name =
+                        std::string_view("trajectory_forced_reset_low_metric");
+                } else {
+                    event_name = std::string_view("trajectory_reacquire_low_metric");
+                    shadow = record_trajectory_shadow_search(selected_start);
+                    if (shadow.hit) {
+                        selected_start = shadow.selected_start;
+                        metric = shadow.metric;
+                        best_metric_for_event = shadow.metric;
+                        reset_trajectory_at(trajectory_frame_index_, selected_start);
+                        ++stats_.trajectory_shadow_reanchors;
+                        // A sample slip need not change the transmitted frame
+                        // sequence. Retain it only when current and past PN
+                        // headers independently confirm the same new boundary.
+                        if (schedule_candidate_confirmed(selected_start)) {
+                            ++pn_schedule_reanchor_confirmed_;
+                            pn_schedule_missed_anchors_ = 0;
+                        } else {
+                            disable_pn_schedule();
+                        }
+                        event_name = std::string_view("trajectory_shadow_reanchor");
+                    }
                 }
             }
-        } else if (trajectory_local_search_) {
+            if (pn_schedule_missed_anchors_ >= 2) disable_pn_schedule();
+        } else if (trajectory_local_search_
+            || (pn_current_header_tracking_ && pn_schedule_origin_.has_value())) {
             const auto predicted_start = selected_start;
             const auto search_min = predicted_start > search_radius_
                 ? predicted_start - search_radius_
@@ -1248,8 +1428,9 @@ private:
             } else if (
                 delta != 0
                 && improvement
-                    < trajectory_local_search_min_improvement_for(
-                        trajectory_frame_index_)) {
+                    < (pn_current_header_tracking_ && pn_schedule_origin_.has_value()
+                        ? 0.005F : trajectory_local_search_min_improvement_for(
+                            trajectory_frame_index_))) {
                 ++stats_.trajectory_local_improvement_rejections;
                 event_name =
                     std::string_view("trajectory_local_improvement_rejected");
@@ -1271,6 +1452,27 @@ private:
             }
         }
 
+        if (pn_current_header_tracking_ && pn_schedule_origin_.has_value()) {
+            pn_schedule_low_headers_ = best_metric_for_event >= hit_threshold_
+                ? 0 : pn_schedule_low_headers_ + 1;
+            if (pn_schedule_low_headers_ != 0
+                && pn_schedule_low_headers_ % kScheduleConfirmationHeaders == 0
+                && !shadow.available) {
+                shadow = record_trajectory_shadow_search(selected_start);
+                if (shadow.hit && schedule_candidate_confirmed(shadow.selected_start)) {
+                    selected_start = shadow.selected_start;
+                    metric = shadow.metric;
+                    best_metric_for_event = shadow.metric;
+                    reset_trajectory_at(trajectory_frame_index_, selected_start);
+                    ++stats_.trajectory_shadow_reanchors;
+                    ++pn_schedule_reanchor_confirmed_;
+                    pn_schedule_missed_anchors_ = 0;
+                    pn_schedule_low_headers_ = 0;
+                    event_name = std::string_view("trajectory_pn_confirmed_reanchor");
+                }
+            }
+        }
+
         ensure_until(selected_start + dtmb::core::kPn945FrameSymbols);
         const auto available_end_sample = buffer_start_sample_ + buffer_.size() / 2;
         if (selected_start < buffer_start_sample_
@@ -1278,6 +1480,9 @@ private:
             trailing_ci8_bytes = buffer_.size();
             return false;
         }
+        update_signal_phase_bias(
+            static_cast<std::int64_t>(selected_start)
+            - static_cast<std::int64_t>(predicted_start));
         copy_frame(selected_start, frame);
         if (timing_diagnostics_ != nullptr && timing_diagnostics_->enabled()) {
             const auto expected_contiguous = trajectory_frame_index_ == 0
@@ -1323,7 +1528,9 @@ private:
         const auto next_scheduled = apply_trajectory_offset(
             next_nominal,
             trajectory_offset_at(trajectory_frame_index_));
-        constexpr auto retained_history = dtmb::core::kPn945FrameSymbols / 2;
+        const auto retained_history = pn_schedule_origin_.has_value()
+            ? (kScheduleConfirmationHeaders + 1) * dtmb::core::kPn945FrameSymbols
+            : dtmb::core::kPn945FrameSymbols / 2;
         discard_before(next_scheduled > retained_history
                            ? next_scheduled - retained_history
                            : 0);
@@ -1362,6 +1569,7 @@ private:
 
     bool read_untracked(FrameWork& frame, std::size_t& trailing_ci8_bytes) {
         frame.sample_start = next_expected_sample_;
+        frame.signal_phase_bias = signal_phase_bias_;
         const auto header_bytes = input_.read(frame.header_ci8);
         if (header_bytes == 0) {
             return false;
@@ -1399,7 +1607,44 @@ private:
 
     [[nodiscard]] float metric_at(std::size_t candidate_start) const {
         const auto relative_start = candidate_start - buffer_start_sample_;
+        if (pn_schedule_origin_.has_value()) {
+            return dtmb::core::pn945_known_phase_metric_ci8(
+                std::span<const std::int8_t>(buffer_).subspan(
+                    relative_start * 2, dtmb::core::kPn945HeaderSymbols * 2),
+                dtmb::core::pn945_phase_for_frame(*pn_schedule_origin_ + schedule_frame_index_));
+        }
         return pn945_ci8_cyclic_extension_metric(buffer_, relative_start);
+    }
+
+    [[nodiscard]] bool schedule_candidate_confirmed(std::size_t candidate_start) const {
+        if (!pn_schedule_origin_.has_value()
+            || schedule_frame_index_ + 1 < kScheduleConfirmationHeaders) {
+            return false;
+        }
+        for (std::size_t back = 0; back < kScheduleConfirmationHeaders; ++back) {
+            const auto distance = back * dtmb::core::kPn945FrameSymbols;
+            if (candidate_start < distance || candidate_start - distance < buffer_start_sample_) {
+                return false;
+            }
+            const auto relative = candidate_start - distance - buffer_start_sample_;
+            if (relative + dtmb::core::kPn945HeaderSymbols > buffer_.size() / 2) {
+                return false;
+            }
+            const auto phase = dtmb::core::pn945_phase_for_frame(
+                *pn_schedule_origin_ + schedule_frame_index_ - back);
+            if (dtmb::core::pn945_known_phase_metric_ci8(
+                    std::span<const std::int8_t>(buffer_).subspan(
+                        relative * 2, dtmb::core::kPn945HeaderSymbols * 2), phase)
+                < hit_threshold_) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void disable_pn_schedule() noexcept {
+        if (pn_schedule_origin_.has_value()) pn_schedule_loss_frame_ = schedule_frame_index_;
+        pn_schedule_origin_.reset();
     }
 
     [[nodiscard]] float trajectory_local_search_min_improvement_for(
@@ -1428,6 +1673,7 @@ private:
     void copy_frame(std::size_t sample_start, FrameWork& frame) const {
         const auto offset = (sample_start - buffer_start_sample_) * 2;
         frame.sample_start = sample_start;
+        frame.signal_phase_bias = signal_phase_bias_;
         std::copy_n(buffer_.data() + offset, frame.header_ci8.size(), frame.header_ci8.data());
         std::copy_n(
             buffer_.data() + offset + frame.header_ci8.size(),
@@ -1474,10 +1720,19 @@ private:
     }
 
     ReplayInput& input_;
+    std::optional<std::size_t> pn_schedule_origin_;
+    bool pn_current_header_tracking_ = false;
+    std::size_t schedule_frame_index_ = 0;
+    std::size_t pn_schedule_missed_anchors_ = 0;
+    std::size_t pn_schedule_loss_frame_ = 0;
+    static constexpr std::size_t kScheduleConfirmationHeaders = 4;
+    std::size_t pn_schedule_low_headers_ = 0;
+    std::size_t pn_schedule_reanchor_confirmed_ = 0;
     std::vector<std::int8_t> buffer_;
     std::size_t buffer_start_sample_ = 0;
     std::size_t next_expected_sample_ = 0;
     std::size_t trajectory_origin_sample_ = 0;
+    int signal_phase_bias_ = 0;
     std::size_t search_radius_ = 0;
     float hit_threshold_ = 0.0F;
     std::size_t trajectory_interval_frames_ = 0;
@@ -1485,6 +1740,9 @@ private:
     double trajectory_max_innovation_samples_ = 0.0;
     std::size_t trajectory_frame_index_offset_ = 0;
     double trajectory_offset_origin_samples_ = 0.0;
+    std::vector<std::size_t> trajectory_reset_frames_;
+    std::size_t trajectory_reset_frame_index_ = 0;
+    std::size_t trajectory_cadence_origin_frame_ = 0;
     std::string trajectory_state_out_path_;
     std::size_t trajectory_state_out_frame_ = 0;
     bool trajectory_local_search_ = false;
@@ -2106,7 +2364,7 @@ dtmb::core::Pn945EqualizeResult process_pn_frame(
 
 dtmb::core::Pn945EqualizeResult process_wideband_pn_frame(
     FrameWork& frame,
-    FrameWork& next_frame,
+    std::span<const float> next_header_cf32,
     Normalization normalization,
     std::span<const float> system_info_reference,
     const dtmb::core::Pn945WidebandChannelModel& model,
@@ -2125,9 +2383,17 @@ dtmb::core::Pn945EqualizeResult process_wideband_pn_frame(
         frame.sample_start + dtmb::core::kPn945HeaderSymbols,
         frequency_shift_hz,
         dc_offset);
+    if (frame.post_body_header_valid && frame.known_pn_phase.has_value()) {
+        // Overlap restoration uses samples immediately after this body. The
+        // next independently selected timing window can start a sample away.
+        convert_ci8_to_cf32(frame.post_body_header_ci8, frame.post_body_header_cf32,
+                           frame.sample_start + dtmb::core::kPn945FrameSymbols,
+                           frequency_shift_hz, dc_offset);
+        next_header_cf32 = frame.post_body_header_cf32;
+    }
     const auto result = dtmb::core::pn945_equalize_c3780_frame_wideband_cached_cf32(
         frame.body_cf32,
-        next_frame.header_cf32,
+        next_header_cf32,
         frame.spectrum_cf32,
         model,
         model_frame_index,
@@ -2161,34 +2427,60 @@ dtmb::core::Pn945EqualizeResult process_wideband_pn_frame(
 
 dtmb::core::Pn945WidebandChannelModel build_wideband_model(
     std::deque<FrameWork>& frames,
+    std::size_t first_frame,
+    std::size_t frame_count,
     float frequency_shift_hz,
     std::complex<float> dc_offset,
     dtmb::core::Pn945WidebandScaleEstimator scale_estimator,
     dtmb::core::Pn945HeaderObservation header_observation,
-    std::size_t max_span_symbols) {
-    std::vector<float> headers;
-    headers.reserve(frames.size() * dtmb::core::kPn945HeaderSymbols * 2);
-    for (auto& frame : frames) {
+    std::size_t max_span_symbols,
+    std::vector<float>& headers) {
+    if (first_frame > frames.size() || frame_count > frames.size() - first_frame) {
+        throw std::out_of_range("PN wideband model frame range is outside buffered frames");
+    }
+    const auto header_values = dtmb::core::kPn945HeaderSymbols * 2U;
+    headers.clear();
+    headers.reserve(frame_count * header_values);
+    std::vector<float> converted_header(header_values);
+    std::vector<std::size_t> expected_phases;
+    const auto have_known_phases = std::any_of(
+        frames.begin() + static_cast<std::ptrdiff_t>(first_frame),
+        frames.begin() + static_cast<std::ptrdiff_t>(first_frame + frame_count),
+        [](const FrameWork& frame) { return frame.known_pn_phase.has_value(); });
+    for (std::size_t index = 0; index < frame_count; ++index) {
+        auto& frame = frames[first_frame + index];
         convert_ci8_to_cf32(
             frame.header_ci8,
-            frame.header_cf32,
+            converted_header,
             frame.sample_start,
             frequency_shift_hz,
             dc_offset);
-        headers.insert(headers.end(), frame.header_cf32.begin(), frame.header_cf32.end());
+        headers.insert(headers.end(), converted_header.begin(), converted_header.end());
+        if (have_known_phases) {
+            expected_phases.push_back(frame.known_pn_phase.has_value()
+                ? *frame.known_pn_phase : dtmb::core::pn945_detect_phase_cf32(converted_header));
+        }
     }
     auto options = dtmb::core::Pn945WidebandModelOptions{};
     options.scale_estimator = scale_estimator;
     options.header_observation = header_observation;
     options.max_span_symbols = max_span_symbols;
+    options.expected_phases = expected_phases;
     return dtmb::core::build_pn945_wideband_channel_model_cf32(headers, options);
 }
 
-std::complex<float> estimate_block_dc_offset(const std::deque<FrameWork>& frames) {
+std::complex<float> estimate_block_dc_offset(
+    const std::deque<FrameWork>& frames,
+    std::size_t first_frame,
+    std::size_t frame_count) {
+    if (first_frame > frames.size() || frame_count > frames.size() - first_frame) {
+        throw std::out_of_range("DC estimate frame range is outside buffered frames");
+    }
     double sum_i = 0.0;
     double sum_q = 0.0;
     std::size_t samples = 0;
-    for (const auto& frame : frames) {
+    for (std::size_t index = 0; index < frame_count; ++index) {
+        const auto& frame = frames[first_frame + index];
         for (const auto* values : {&frame.header_ci8, &frame.body_ci8}) {
             for (std::size_t sample = 0; sample < values->size() / 2; ++sample) {
                 sum_i += (*values)[sample * 2];
@@ -2210,8 +2502,10 @@ bool read_frame(
     ReplayInput& input,
     FrameWork& frame,
     std::size_t& trailing_ci8_bytes,
-    std::size_t& next_sample_start) {
+    std::size_t& next_sample_start,
+    int signal_phase_bias) {
     frame.sample_start = next_sample_start;
+    frame.signal_phase_bias = signal_phase_bias;
     const auto header_bytes = input.read(frame.header_ci8);
     if (header_bytes == 0) {
         return false;
@@ -2308,6 +2602,12 @@ void extract_data_symbols(
     }
     dtmb::core::qam64_normalize_cf32(data, frame.data_cf32);
     update_frame_normalization_stats(frame, data, system_info_reference);
+    if (frame.integer_timing_correction_enabled) {
+        frame.normalization_stats.integer_timing =
+            dtmb::core::c3780_qam64_integer_timing_correct_cf32(
+                frame.data_cf32, kIntegerTimingOptions);
+        frame.normalization_stats.integer_timing_evaluated = true;
+    }
     if (!dd_options.enabled) {
         return;
     }
@@ -2845,7 +3145,10 @@ public:
             << "qam_minus_system_info_phase_mod_pi_over_2_rad,"
             << "qam_minus_system_info_quadrant,qam_residual_ratio,"
             << "pn_metadata_valid,pn_phase,next_pn_phase,model_pn_phase,"
-            << "model_next_pn_phase,model_rotation_symbols\n";
+            << "model_next_pn_phase,model_rotation_symbols,"
+            << "integer_timing_evaluated,integer_timing_delta_samples,"
+            << "integer_timing_baseline_mse,integer_timing_corrected_mse,"
+            << "integer_timing_relative_improvement\n";
     }
 
     FrameNormalizationDiagnostics(const FrameNormalizationDiagnostics&) = delete;
@@ -2895,7 +3198,12 @@ public:
             << next_pn_phase << ','
             << model_pn_phase << ','
             << model_next_pn_phase << ','
-            << model_rotation_symbols << '\n';
+            << model_rotation_symbols << ','
+            << (stats.integer_timing_evaluated ? 1 : 0) << ','
+            << stats.integer_timing.delta_samples << ','
+            << stats.integer_timing.baseline_mse << ','
+            << stats.integer_timing.corrected_mse << ','
+            << stats.integer_timing.relative_improvement << '\n';
         if (!*output_) {
             throw std::runtime_error(
                 "failed to write frame normalization diagnostics: " + path_);
@@ -3259,6 +3567,7 @@ int main(int argc, char** argv) {
     std::string timing_trajectory_seed_path;
     std::size_t timing_trajectory_frame_index_offset = 0;
     double timing_trajectory_offset_origin_samples = 0.0;
+    std::vector<std::size_t> timing_trajectory_reset_frames;
     std::string timing_trajectory_state_out_path;
     std::size_t timing_trajectory_state_out_frame = 0;
     bool timing_trajectory_local_search = false;
@@ -3292,8 +3601,16 @@ int main(int argc, char** argv) {
     auto pn_mmse = PnMmse{};
     bool remove_dc = false;
     bool auto_sync = false;
+    bool pn_schedule_sync = false;
+    bool pn_schedule_tracking = false;
+    bool pn_current_header_tracking = false;
+    dtmb::core::Pn945ScheduleAlignment pn_schedule_alignment;
+    std::size_t pn_schedule_refined_phase = 0;
+    std::optional<std::size_t> pn_schedule_output_origin;
     bool estimate_residual_cfo = true;
     bool phase_offset_set = false;
+    bool qam64_integer_timing_correction = false;
+    auto integer_timing_stats = IntegerTimingCorrectionStats{};
     auto data_dd_options = DataDecisionDirectedOptions{};
     auto data_dd_stats = DataDecisionDirectedStats{};
     std::string wideband_diagnostics_path;
@@ -3320,6 +3637,15 @@ int main(int argc, char** argv) {
                 }
                 phase_offset = parse_size(argv[index], "phase offset");
                 phase_offset_set = true;
+            } else if (arg == "--pn-schedule-sync") {
+                pn_schedule_sync = true;
+            } else if (arg == "--pn-schedule-tracking") {
+                pn_schedule_sync = true;
+                pn_schedule_tracking = true;
+            } else if (arg == "--pn-current-header-tracking") {
+                pn_schedule_sync = true;
+                pn_schedule_tracking = true;
+                pn_current_header_tracking = true;
             } else if (arg == "--auto-sync") {
                 auto_sync = true;
             } else if (arg == "--sync-frames") {
@@ -3406,6 +3732,14 @@ int main(int argc, char** argv) {
                 timing_trajectory_offset_origin_samples = parse_double(
                     argv[index],
                     "timing trajectory offset origin");
+            } else if (arg == "--timing-trajectory-reset-at-frame") {
+                if (++index >= argc) {
+                    usage(argv[0]);
+                    return 2;
+                }
+                timing_trajectory_reset_frames.push_back(parse_size(
+                    argv[index],
+                    "timing trajectory reset frame"));
             } else if (arg == "--timing-trajectory-state-out") {
                 if (++index >= argc) {
                     usage(argv[0]);
@@ -3630,6 +3964,8 @@ int main(int argc, char** argv) {
                 normalization = parse_normalization(argv[index]);
             } else if (arg == "--data-dd-refine") {
                 data_dd_options.enabled = true;
+            } else if (arg == "--qam64-integer-timing-correction") {
+                qam64_integer_timing_correction = true;
             } else if (arg == "--data-dd-max-relative-error") {
                 if (++index >= argc) {
                     usage(argv[0]);
@@ -3764,6 +4100,18 @@ int main(int argc, char** argv) {
             throw std::invalid_argument(
                 "--timing-trajectory-fit-points must be at least 2");
         }
+        if (pn_schedule_sync && !auto_sync) {
+            throw std::invalid_argument("--pn-schedule-sync requires --auto-sync");
+        }
+        if (pn_schedule_tracking && (timing_search_radius == 0
+            || equalizer != Equalizer::pn || pn_estimator != PnEstimator::wideband)) {
+            throw std::invalid_argument(
+                "--pn-schedule-tracking requires PN wideband equalization and timing search");
+        }
+        if (qam64_integer_timing_correction && normalization != Normalization::qam64) {
+            throw std::invalid_argument(
+                "--qam64-integer-timing-correction requires --normalization qam64");
+        }
         if (!timing_trajectory_seed_path.empty()
             && timing_trajectory_interval_frames == 0) {
             throw std::invalid_argument(
@@ -3787,6 +4135,22 @@ int main(int argc, char** argv) {
             throw std::invalid_argument(
                 "--timing-trajectory-offset-origin-samples requires "
                 "--timing-trajectory-seed");
+        }
+        if (!timing_trajectory_reset_frames.empty()
+            && timing_trajectory_interval_frames == 0) {
+            throw std::invalid_argument(
+                "--timing-trajectory-reset-at-frame requires "
+                "--timing-trajectory-interval-frames");
+        }
+        std::sort(
+            timing_trajectory_reset_frames.begin(),
+            timing_trajectory_reset_frames.end());
+        if (std::adjacent_find(
+                timing_trajectory_reset_frames.begin(),
+                timing_trajectory_reset_frames.end())
+            != timing_trajectory_reset_frames.end()) {
+            throw std::invalid_argument(
+                "duplicate --timing-trajectory-reset-at-frame value");
         }
         if (!timing_trajectory_state_out_path.empty()
             && timing_trajectory_interval_frames == 0) {
@@ -3980,7 +4344,13 @@ int main(int argc, char** argv) {
         }
         worker_count = std::max<std::size_t>(worker_count, 1);
         if (batch_frames == 0) {
-            batch_frames = worker_count;
+            constexpr auto max_default_batch_frames = std::size_t{256};
+            const auto expanded = worker_count > max_default_batch_frames / 8U
+                ? max_default_batch_frames
+                : worker_count * 8U;
+            batch_frames = std::max(
+                worker_count,
+                std::min(expanded, max_default_batch_frames));
         }
         if (batch_frames == 0) {
             throw std::invalid_argument("batch frame count must be positive");
@@ -4027,6 +4397,31 @@ int main(int argc, char** argv) {
                 % static_cast<std::int64_t>(dtmb::core::kPn945FrameSymbols));
             if (acquisition.coarse_cfo_valid) {
                 automatic_frequency_shift_hz = -acquisition.coarse_cfo_hz;
+            }
+            if (pn_schedule_sync) {
+                convert_ci8_to_cf32(startup_ci8, startup_cf32, 0, automatic_frequency_shift_hz);
+                std::vector<std::size_t> phases;
+                phases.reserve(200);
+                for (std::size_t frame = 0; frame < 200; ++frame) {
+                    const auto first = acquisition.phase_offset
+                        + frame * dtmb::core::kPn945FrameSymbols;
+                    if (first + dtmb::core::kPn945HeaderSymbols > startup_cf32.size() / 2) break;
+                    phases.push_back(dtmb::core::pn945_detect_phase_cf32(
+                        std::span<const float>(startup_cf32.data() + first * 2,
+                            dtmb::core::kPn945HeaderSymbols * 2)));
+                }
+                pn_schedule_alignment = dtmb::core::fit_pn945_phase_schedule(phases);
+                if (pn_schedule_alignment.valid) {
+                    const auto corrected = static_cast<std::int64_t>(acquisition.phase_offset)
+                        - pn_schedule_alignment.phase_bias + auto_phase_adjustment;
+                    const auto period = static_cast<std::int64_t>(dtmb::core::kPn945FrameSymbols);
+                    phase_offset = static_cast<std::size_t>((corrected % period + period) % period);
+                    pn_schedule_refined_phase = phase_offset;
+                    const auto frame_wrap = (corrected - static_cast<std::int64_t>(phase_offset)) / period;
+                    const auto origin = static_cast<std::int64_t>(pn_schedule_alignment.superframe_index)
+                        - frame_wrap;
+                    pn_schedule_output_origin = static_cast<std::size_t>((origin % 200 + 200) % 200);
+                }
             }
             if (estimate_residual_cfo) {
                 convert_ci8_to_cf32(
@@ -4081,6 +4476,7 @@ int main(int argc, char** argv) {
         TrackingFrameReader frame_reader(
             replay_input,
             phase_offset,
+            static_cast<int>(auto_phase_adjustment),
             timing_search_radius,
             timing_search_threshold,
             timing_trajectory_interval_frames,
@@ -4089,6 +4485,7 @@ int main(int argc, char** argv) {
             timing_trajectory_seed.points,
             timing_trajectory_frame_index_offset,
             timing_trajectory_offset_origin_samples,
+            timing_trajectory_reset_frames,
             timing_trajectory_state_out_path,
             timing_trajectory_state_out_frame,
             timing_trajectory_local_search,
@@ -4096,7 +4493,9 @@ int main(int argc, char** argv) {
             timing_trajectory_local_search_scoped_min_improvements,
             timing_trajectory_local_search_transient,
             timing_trajectory_local_search_transient_ranges,
-            &timing_diagnostics);
+            &timing_diagnostics,
+            pn_schedule_tracking ? pn_schedule_output_origin : std::nullopt,
+            pn_current_header_tracking);
         auto reference_index = system_info_index;
         auto reference = system_info_reference(reference_index);
         auto system_info_selector = SystemInfoAutoSelector{
@@ -4132,14 +4531,15 @@ int main(int argc, char** argv) {
         if (discarded_phase_bytes == phase_bytes
             && equalizer == Equalizer::pn
             && pn_estimator == PnEstimator::compact) {
-            FrameWork current;
-            FrameWork next;
+            FrameWork current(qam64_integer_timing_correction);
+            FrameWork next(qam64_integer_timing_correction);
             auto have_current = timing_search_radius == 0
                 ? read_frame(
                     replay_input,
                     current,
                     trailing_ci8_bytes,
-                    next_sample_start)
+                    next_sample_start,
+                    static_cast<int>(auto_phase_adjustment))
                 : frame_reader.read(current, trailing_ci8_bytes);
             input_frame_count += have_current ? 1U : 0U;
             auto have_next = have_current && (timing_search_radius == 0
@@ -4147,7 +4547,8 @@ int main(int argc, char** argv) {
                     replay_input,
                     next,
                     trailing_ci8_bytes,
-                    next_sample_start)
+                    next_sample_start,
+                    static_cast<int>(auto_phase_adjustment))
                 : frame_reader.read(next, trailing_ci8_bytes));
             input_frame_count += have_next ? 1U : 0U;
             while (have_current && have_next
@@ -4166,6 +4567,7 @@ int main(int argc, char** argv) {
                     first_pn_phase = result.pn_phase;
                 }
                 last_pn_phase = result.pn_phase;
+                integer_timing_stats.observe(current.normalization_stats);
                 frame_residuals.observe(frame_count, current.data_cf32);
                 observe_system_information(current);
                 normalization_diagnostics.observe(
@@ -4186,24 +4588,47 @@ int main(int argc, char** argv) {
                         replay_input,
                         next,
                         trailing_ci8_bytes,
-                        next_sample_start)
+                        next_sample_start,
+                        static_cast<int>(auto_phase_adjustment))
                     : frame_reader.read(next, trailing_ci8_bytes);
                 input_frame_count += have_next ? 1U : 0U;
             }
         } else if (discarded_phase_bytes == phase_bytes
                    && equalizer == Equalizer::pn
                    && pn_estimator == PnEstimator::wideband) {
+            struct WidebandBlockWork {
+                std::size_t frame_offset = 0;
+                std::size_t output_count = 0;
+                std::size_t model_index = 0;
+                std::complex<float> dc_offset{};
+                float noise_variance = 0.0F;
+                dtmb::core::Pn945WidebandChannelModel model;
+                std::vector<float> headers_cf32;
+                std::vector<int> response_window_offset_adjustments;
+            };
+            struct WidebandFrameJob {
+                std::size_t block = 0;
+                std::size_t frame = 0;
+                std::size_t output = 0;
+            };
+
             std::deque<FrameWork> frames;
             bool input_ended = false;
-            while (!input_ended && (max_frames == 0 || frame_count < max_frames)) {
-                while (frames.size() < pn_wideband_block_frames + 1) {
-                    frames.emplace_back();
+            const auto scheduling_batch_frames =
+                std::max(batch_frames, pn_wideband_block_frames);
+            while (max_frames == 0 || frame_count < max_frames) {
+                const auto desired_outputs = max_frames == 0
+                    ? scheduling_batch_frames
+                    : std::min(scheduling_batch_frames, max_frames - frame_count);
+                while (!input_ended && frames.size() < desired_outputs + 1U) {
+                    frames.emplace_back(qam64_integer_timing_correction);
                     const auto frame_ok = timing_search_radius == 0
                         ? read_frame(
                             replay_input,
                             frames.back(),
                             trailing_ci8_bytes,
-                            next_sample_start)
+                            next_sample_start,
+                            static_cast<int>(auto_phase_adjustment))
                         : frame_reader.read(frames.back(), trailing_ci8_bytes);
                     if (!frame_ok) {
                         frames.pop_back();
@@ -4215,78 +4640,145 @@ int main(int argc, char** argv) {
                 if (frames.size() < 2) {
                     break;
                 }
-                const auto dc_offset = remove_dc
-                    ? estimate_block_dc_offset(frames)
-                    : std::complex<float>{};
-                const auto model = build_wideband_model(
-                    frames,
-                    frequency_shift_hz,
-                    dc_offset,
-                    pn_wideband_scale_estimator,
-                    pn_wideband_header_observation,
-                    pn_wideband_max_span_symbols);
-                ++wideband_model_count;
-                const auto model_index = wideband_model_count - 1;
-                wideband_model_stats.observe(model);
-                wideband_span_symbols = model.template_taps.size() / 2;
-                wideband_significant_taps = model.significant_taps;
-                wideband_rotation_symbols = model.rotation_symbols;
-                wideband_auto_noise_variance = model.noise_variance;
-                wideband_last_dc_offset = dc_offset;
                 const auto available = frames.size() - 1;
                 const auto remaining = max_frames == 0
                     ? available
                     : std::min(available, max_frames - frame_count);
-                const auto output_count = std::min(pn_wideband_block_frames, remaining);
-                if (wideband_diagnostics.is_open()) {
-                    wideband_diagnostics
-                        << model_index << ','
-                        << frame_count << ','
-                        << available << ','
-                        << output_count << ','
-                        << model.frame_count << ','
-                        << wideband_span_symbols << ','
-                        << wideband_significant_taps << ','
-                        << model.rotation_symbols << ','
-                        << model.base_pn_phase << ','
-                        << model.pn_phase << ','
-                        << model.dominant_tap_index << ','
-                        << model.phase_agreement << ','
-                        << model.per_frame_noise_tap_power << ','
-                        << model.noise_variance << ','
-                        << model.truncated_energy_fraction << ','
-                        << dc_offset.real() << ','
-                        << dc_offset.imag() << '\n';
-                    if (!wideband_diagnostics) {
-                        throw std::runtime_error(
-                            "failed to write PN wideband diagnostics");
+                const auto output_count = std::min(desired_outputs, remaining);
+                std::vector<WidebandBlockWork> blocks;
+                blocks.reserve(
+                    (output_count + pn_wideband_block_frames - 1U)
+                    / pn_wideband_block_frames);
+                for (std::size_t frame_offset = 0;
+                     frame_offset < output_count;
+                     frame_offset += pn_wideband_block_frames) {
+                    const auto block_output_count = std::min(
+                        pn_wideband_block_frames,
+                        output_count - frame_offset);
+                    const auto model_frame_count = block_output_count + 1U;
+                    const auto dc_offset = remove_dc
+                        ? estimate_block_dc_offset(
+                            frames,
+                            frame_offset,
+                            model_frame_count)
+                        : std::complex<float>{};
+                    std::vector<float> headers_cf32;
+                    auto model = build_wideband_model(
+                        frames,
+                        frame_offset,
+                        model_frame_count,
+                        frequency_shift_hz,
+                        dc_offset,
+                        pn_wideband_scale_estimator,
+                        pn_wideband_header_observation,
+                        pn_wideband_max_span_symbols,
+                        headers_cf32);
+                    const auto model_index = wideband_model_count++;
+                    wideband_model_stats.observe(model);
+                    wideband_span_symbols = model.template_taps.size() / 2;
+                    wideband_significant_taps = model.significant_taps;
+                    wideband_rotation_symbols = model.rotation_symbols;
+                    wideband_auto_noise_variance = model.noise_variance;
+                    wideband_last_dc_offset = dc_offset;
+                    const auto noise_variance = pn_mmse.automatic
+                        ? model.noise_variance
+                        : pn_mmse.noise_variance;
+                    std::vector<int> response_window_offset_adjustments(
+                        block_output_count);
+                    for (std::size_t frame = 0;
+                         frame < block_output_count;
+                         ++frame) {
+                        const auto effective_adjustment = static_cast<std::int64_t>(
+                            pn_wideband_response_window_offset_adjust)
+                            + (frames[frame_offset + frame].known_pn_phase.has_value()
+                                ? 0 : frames[frame_offset + frame].signal_phase_bias);
+                        if (effective_adjustment < std::numeric_limits<int>::min()
+                            || effective_adjustment > std::numeric_limits<int>::max()) {
+                            throw std::runtime_error(
+                                "PN wideband response-window adjustment overflow");
+                        }
+                        response_window_offset_adjustments[frame] =
+                            static_cast<int>(effective_adjustment);
+                    }
+                    if (wideband_diagnostics.is_open()) {
+                        wideband_diagnostics
+                            << model_index << ','
+                            << (frame_count + frame_offset) << ','
+                            << block_output_count << ','
+                            << block_output_count << ','
+                            << model.frame_count << ','
+                            << wideband_span_symbols << ','
+                            << wideband_significant_taps << ','
+                            << model.rotation_symbols << ','
+                            << model.base_pn_phase << ','
+                            << model.pn_phase << ','
+                            << model.dominant_tap_index << ','
+                            << model.phase_agreement << ','
+                            << model.per_frame_noise_tap_power << ','
+                            << model.noise_variance << ','
+                            << model.truncated_energy_fraction << ','
+                            << dc_offset.real() << ','
+                            << dc_offset.imag() << '\n';
+                        if (!wideband_diagnostics) {
+                            throw std::runtime_error(
+                                "failed to write PN wideband diagnostics");
+                        }
+                    }
+                    blocks.push_back(WidebandBlockWork{
+                        frame_offset,
+                        block_output_count,
+                        model_index,
+                        dc_offset,
+                        noise_variance,
+                        std::move(model),
+                        std::move(headers_cf32),
+                        std::move(response_window_offset_adjustments),
+                    });
+                }
+                const auto output_frame_base = frame_count;
+                std::vector<WidebandFrameJob> jobs;
+                jobs.reserve(output_count);
+                for (std::size_t block = 0; block < blocks.size(); ++block) {
+                    for (std::size_t frame = 0;
+                         frame < blocks[block].output_count;
+                         ++frame) {
+                        jobs.push_back(WidebandFrameJob{
+                            block,
+                            frame,
+                            blocks[block].frame_offset + frame,
+                        });
                     }
                 }
-                const auto noise_variance = pn_mmse.automatic
-                    ? model.noise_variance
-                    : pn_mmse.noise_variance;
-                const auto active_workers = std::min(worker_count, output_count);
+                const auto active_workers = std::min(worker_count, jobs.size());
                 std::vector<std::thread> workers;
                 std::vector<std::exception_ptr> worker_errors(active_workers);
                 std::vector<dtmb::core::Pn945EqualizeResult> results(output_count);
+                const auto header_values = dtmb::core::kPn945HeaderSymbols * 2U;
                 workers.reserve(active_workers);
                 for (std::size_t worker = 0; worker < active_workers; ++worker) {
                     workers.emplace_back([&, worker] {
                         try {
-                            for (std::size_t frame = worker;
-                                 frame < output_count;
-                                 frame += active_workers) {
-                                results[frame] = process_wideband_pn_frame(
-                                    frames[frame],
-                                    frames[frame + 1],
+                            for (std::size_t job_index = worker;
+                                 job_index < jobs.size();
+                                 job_index += active_workers) {
+                                const auto& job = jobs[job_index];
+                                const auto& block = blocks[job.block];
+                                const auto next_header_offset =
+                                    (job.frame + 1U) * header_values;
+                                results[job.output] = process_wideband_pn_frame(
+                                    frames[job.output],
+                                    std::span<const float>(
+                                        block.headers_cf32.data()
+                                            + next_header_offset,
+                                        header_values),
                                     normalization,
                                     reference,
-                                    model,
-                                    frame,
+                                    block.model,
+                                    job.frame,
                                     frequency_shift_hz,
-                                    noise_variance,
-                                    dc_offset,
-                                    pn_wideband_response_window_offset_adjust,
+                                    block.noise_variance,
+                                    block.dc_offset,
+                                    block.response_window_offset_adjustments[job.frame],
                                     pn_wideband_body_channel_midpoint,
                                     pn_csi_demap,
                                     data_dd_options,
@@ -4305,96 +4797,103 @@ int main(int argc, char** argv) {
                         std::rethrow_exception(error);
                     }
                 }
-                const auto output_frame_base = frame_count;
-                for (std::size_t frame = 0; frame < output_count; ++frame) {
-                    const auto& result = results[frame];
-                    if (frame_count == 0) {
-                        first_pn_phase = result.pn_phase;
-                    }
-                    last_pn_phase = result.pn_phase;
-                    const auto output_frame_index = output_frame_base + frame;
-                    if (wideband_frame_diagnostics.is_open()) {
-                        const auto response_scale = std::complex<float>{
-                            model.frame_response_scales[frame * 2],
-                            model.frame_response_scales[frame * 2 + 1],
-                        };
-                        const auto transition =
-                            pn_tap_transition_stats(
-                                model,
-                                frame,
-                                noise_variance);
-                        wideband_frame_diagnostics
-                            << output_frame_index << ','
-                            << model_index << ','
-                            << frame << ','
-                            << frames[frame].sample_start << ','
-                            << frames[frame + 1].sample_start << ','
-                            << result.pn_phase << ','
-                            << result.next_pn_phase << ','
-                            << model.frame_pn_phases[frame] << ','
-                            << model.frame_pn_phases[frame + 1] << ','
-                            << response_scale.real() << ','
-                            << response_scale.imag() << ','
-                            << std::abs(response_scale) << ','
-                            << std::atan2(
-                                   response_scale.imag(),
-                                   response_scale.real()) << ','
-                            << transition.phase_rad << ','
-                            << transition.coherence << ','
-                            << transition.next_to_current_power << ','
-                            << transition.sampled_carrier_shape_change_rms << ','
-                            << transition.sampled_carrier_shape_change_max << ','
-                            << transition.slot_sampled_carrier_shape_change_rms[0] << ','
-                            << transition.slot_sampled_carrier_shape_change_max[0] << ','
-                            << transition.slot_sampled_carrier_shape_change_rms[1] << ','
-                            << transition.slot_sampled_carrier_shape_change_max[1] << ','
-                            << transition.slot_sampled_carrier_shape_change_rms[2] << ','
-                            << transition.slot_sampled_carrier_shape_change_max[2] << ','
-                            << model.rotation_symbols << ','
-                            << model.dominant_tap_index << ','
-                            << (model.template_taps.size() / 2) << ','
-                            << model.significant_taps << ','
-                            << model.phase_agreement << ','
-                            << model.noise_variance << ','
-                            << model.truncated_energy_fraction << ','
-                            << dc_offset.real() << ','
-                            << dc_offset.imag() << '\n';
-                        if (!wideband_frame_diagnostics) {
-                            throw std::runtime_error(
-                                "failed to write PN wideband frame diagnostics");
+                for (const auto& block : blocks) {
+                    for (std::size_t frame = 0;
+                         frame < block.output_count;
+                         ++frame) {
+                        const auto buffered_frame = block.frame_offset + frame;
+                        const auto& result = results[buffered_frame];
+                        if (frame_count == 0) {
+                            first_pn_phase = result.pn_phase;
                         }
+                        last_pn_phase = result.pn_phase;
+                        const auto output_frame_index =
+                            output_frame_base + buffered_frame;
+                        auto& output_frame = frames[buffered_frame];
+                        if (wideband_frame_diagnostics.is_open()) {
+                            const auto response_scale = std::complex<float>{
+                                block.model.frame_response_scales[frame * 2],
+                                block.model.frame_response_scales[frame * 2 + 1],
+                            };
+                            const auto transition = pn_tap_transition_stats(
+                                block.model,
+                                frame,
+                                block.noise_variance);
+                            wideband_frame_diagnostics
+                                << output_frame_index << ','
+                                << block.model_index << ','
+                                << frame << ','
+                                << output_frame.sample_start << ','
+                                << frames[buffered_frame + 1U].sample_start << ','
+                                << result.pn_phase << ','
+                                << result.next_pn_phase << ','
+                                << block.model.frame_pn_phases[frame] << ','
+                                << block.model.frame_pn_phases[frame + 1] << ','
+                                << response_scale.real() << ','
+                                << response_scale.imag() << ','
+                                << std::abs(response_scale) << ','
+                                << std::atan2(
+                                       response_scale.imag(),
+                                       response_scale.real()) << ','
+                                << transition.phase_rad << ','
+                                << transition.coherence << ','
+                                << transition.next_to_current_power << ','
+                                << transition.sampled_carrier_shape_change_rms << ','
+                                << transition.sampled_carrier_shape_change_max << ','
+                                << transition.slot_sampled_carrier_shape_change_rms[0] << ','
+                                << transition.slot_sampled_carrier_shape_change_max[0] << ','
+                                << transition.slot_sampled_carrier_shape_change_rms[1] << ','
+                                << transition.slot_sampled_carrier_shape_change_max[1] << ','
+                                << transition.slot_sampled_carrier_shape_change_rms[2] << ','
+                                << transition.slot_sampled_carrier_shape_change_max[2] << ','
+                                << block.model.rotation_symbols << ','
+                                << block.model.dominant_tap_index << ','
+                                << (block.model.template_taps.size() / 2) << ','
+                                << block.model.significant_taps << ','
+                                << block.model.phase_agreement << ','
+                                << block.model.noise_variance << ','
+                                << block.model.truncated_energy_fraction << ','
+                                << block.dc_offset.real() << ','
+                                << block.dc_offset.imag() << '\n';
+                            if (!wideband_frame_diagnostics) {
+                                throw std::runtime_error(
+                                    "failed to write PN wideband frame diagnostics");
+                            }
+                        }
+                        integer_timing_stats.observe(output_frame.normalization_stats);
+                        frame_residuals.observe(
+                            output_frame_index,
+                            output_frame.data_cf32);
+                        observe_system_information(output_frame);
+                        normalization_diagnostics.observe(
+                            output_frame_index,
+                            output_frame.normalization_stats,
+                            true,
+                            result.pn_phase,
+                            result.next_pn_phase,
+                            block.model.frame_pn_phases[frame],
+                            block.model.frame_pn_phases[frame + 1U],
+                            block.model.rotation_symbols);
+                        source_carrier_residuals.observe(
+                            output_frame_index,
+                            output_frame.data_cf32);
+                        source_carrier_channels.observe(
+                            output_frame_index,
+                            block.model_index,
+                            frame,
+                            block.model,
+                            block.noise_variance,
+                            1.0e-3F,
+                            block.response_window_offset_adjustments[frame]);
+                        write_all(output, output_frame.data_cf32);
+                        if (pn_csi_weights.is_open()) {
+                            write_all(pn_csi_weights, output_frame.csi_weights);
+                        }
+                        ++frame_count;
                     }
-                    frame_residuals.observe(
-                        output_frame_index,
-                        frames[frame].data_cf32);
-                    observe_system_information(frames[frame]);
-                    normalization_diagnostics.observe(
-                        output_frame_index,
-                        frames[frame].normalization_stats,
-                        true,
-                        result.pn_phase,
-                        result.next_pn_phase,
-                        model.frame_pn_phases[frame],
-                        model.frame_pn_phases[frame + 1U],
-                        model.rotation_symbols);
-                    source_carrier_residuals.observe(
-                        output_frame_index,
-                        frames[frame].data_cf32);
-                    source_carrier_channels.observe(
-                        output_frame_index,
-                        model_index,
-                        frame,
-                        model,
-                        noise_variance,
-                        1.0e-3F,
-                        pn_wideband_response_window_offset_adjust);
-                    write_all(output, frames[frame].data_cf32);
-                    if (pn_csi_weights.is_open()) {
-                        write_all(pn_csi_weights, frames[frame].csi_weights);
-                    }
-                    ++frame_count;
                 }
-                if (output_count < pn_wideband_block_frames
+                if (output_count < desired_outputs
+                    || input_ended
                     || (max_frames != 0 && frame_count >= max_frames)) {
                     break;
                 }
@@ -4404,6 +4903,9 @@ int main(int argc, char** argv) {
             }
         } else if (discarded_phase_bytes == phase_bytes) {
             std::vector<FrameWork> frame_batch(batch_frames);
+            for (auto& frame : frame_batch) {
+                frame.integer_timing_correction_enabled = qam64_integer_timing_correction;
+            }
             bool input_ended = false;
             while (!input_ended && (max_frames == 0 || frame_count < max_frames)) {
                 std::size_t loaded_frames = 0;
@@ -4414,7 +4916,8 @@ int main(int argc, char** argv) {
                             replay_input,
                             frame_batch[loaded_frames],
                             trailing_ci8_bytes,
-                            next_sample_start)
+                            next_sample_start,
+                            static_cast<int>(auto_phase_adjustment))
                         : frame_reader.read(frame_batch[loaded_frames], trailing_ci8_bytes);
                     if (!frame_ok) {
                         input_ended = true;
@@ -4459,6 +4962,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 for (std::size_t frame = 0; frame < loaded_frames; ++frame) {
+                    integer_timing_stats.observe(frame_batch[frame].normalization_stats);
                     frame_residuals.observe(
                         frame_count + frame,
                         frame_batch[frame].data_cf32);
@@ -4490,6 +4994,22 @@ int main(int argc, char** argv) {
                   << (equalizer == Equalizer::pn ? "pn_equalized" : "flat")
                   << "_c3780\n"
                   << "auto_sync=" << (auto_sync ? "true" : "false") << '\n'
+                  << "pn_schedule_sync=" << (pn_schedule_sync ? "true" : "false") << '\n'
+                  << "pn_schedule_tracking=" << (pn_schedule_tracking ? "true" : "false") << '\n'
+                  << "pn_current_header_tracking=" << (pn_current_header_tracking ? "true" : "false") << '\n'
+                  << "pn_current_header_min_improvement=0.005\n"
+                  << "pn_schedule_tracking_active=" << (frame_reader.pn_schedule_active() ? "true" : "false") << '\n'
+                  << "pn_schedule_loss_frame=" << frame_reader.pn_schedule_loss_frame() << '\n'
+                  << "pn_schedule_reanchor_confirmed=" << frame_reader.pn_schedule_reanchor_confirmed() << '\n'
+                  << "pn_schedule_reanchor_confirmation_headers=4\n"
+                  << "pn_schedule_output_superframe_index=" << pn_schedule_output_origin.value_or(0) << '\n'
+                  << "pn_schedule_locked=" << (pn_schedule_alignment.valid ? "true" : "false") << '\n'
+                  << "pn_schedule_observations=" << pn_schedule_alignment.observations << '\n'
+                  << "pn_schedule_superframe_index=" << pn_schedule_alignment.superframe_index << '\n'
+                  << "pn_schedule_phase_bias=" << pn_schedule_alignment.phase_bias << '\n'
+                  << "pn_schedule_mean_squared_error=" << pn_schedule_alignment.mean_squared_error << '\n'
+                  << "pn_schedule_runner_up_error=" << pn_schedule_alignment.runner_up_error << '\n'
+                  << "pn_schedule_refined_phase=" << pn_schedule_refined_phase << '\n'
                   << "sync_frames=" << sync_frames << '\n'
                   << "acquisition_frames=" << acquisition_frames << '\n'
                   << "sync_hit_threshold=" << sync_hit_threshold << '\n'
@@ -4517,6 +5037,8 @@ int main(int argc, char** argv) {
                   << timing_trajectory_frame_index_offset << '\n'
                   << "timing_trajectory_offset_origin_samples="
                   << timing_trajectory_offset_origin_samples << '\n'
+                  << "timing_trajectory_reset_at_frame_count="
+                  << timing_trajectory_reset_frames.size() << '\n'
                   << "timing_trajectory_state_out="
                   << (timing_trajectory_state_out_path.empty()
                           ? "none"
@@ -4647,6 +5169,28 @@ int main(int argc, char** argv) {
                           ? "none"
                           : source_carrier_channel_diagnostics_path)
                   << '\n'
+                  << "qam64_integer_timing_correction="
+                  << (qam64_integer_timing_correction ? "true" : "false") << '\n'
+                  << "qam64_integer_timing_max_delta_samples="
+                  << kIntegerTimingOptions.max_delta_samples << '\n'
+                  << "qam64_integer_timing_min_mse_improvement="
+                  << kIntegerTimingOptions.min_mse_improvement << '\n'
+                  << "qam64_integer_timing_observed_frames="
+                  << integer_timing_stats.observed_frames << '\n'
+                  << "qam64_integer_timing_corrected_frames="
+                  << integer_timing_stats.corrected_frames << '\n'
+                  << "qam64_integer_timing_minus_2_frames="
+                  << integer_timing_stats.delta_frames[0] << '\n'
+                  << "qam64_integer_timing_minus_1_frames="
+                  << integer_timing_stats.delta_frames[1] << '\n'
+                  << "qam64_integer_timing_plus_1_frames="
+                  << integer_timing_stats.delta_frames[3] << '\n'
+                  << "qam64_integer_timing_plus_2_frames="
+                  << integer_timing_stats.delta_frames[4] << '\n'
+                  << "qam64_integer_timing_max_abs_delta_samples="
+                  << integer_timing_stats.max_abs_delta_samples << '\n'
+                  << "qam64_integer_timing_max_relative_improvement="
+                  << integer_timing_stats.max_relative_improvement << '\n'
                   << "data_dd_refine_enabled="
                   << (data_dd_options.enabled ? "true" : "false") << '\n'
                   << "data_dd_max_relative_error="
@@ -4747,6 +5291,14 @@ int main(int argc, char** argv) {
                   << timing_stats.trajectory_low_metric_fallbacks << '\n'
                   << "timing_trajectory_innovation_rejections="
                   << timing_stats.trajectory_innovation_rejections << '\n'
+                  << "timing_trajectory_forced_resets_requested="
+                  << timing_stats.trajectory_forced_resets_requested << '\n'
+                  << "timing_trajectory_forced_resets_attempted="
+                  << timing_stats.trajectory_forced_resets_attempted << '\n'
+                  << "timing_trajectory_forced_resets_accepted="
+                  << timing_stats.trajectory_forced_resets_accepted << '\n'
+                  << "timing_trajectory_forced_resets_low_metric="
+                  << timing_stats.trajectory_forced_resets_low_metric << '\n'
                   << "timing_trajectory_local_searches="
                   << timing_stats.trajectory_local_searches << '\n'
                   << "timing_trajectory_local_hits="

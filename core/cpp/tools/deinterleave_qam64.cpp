@@ -495,6 +495,8 @@ void usage(const char* program) {
         << " [--dd-llr-confidence-knee X]"
         << " [--dd-llr-confidence-min-scale X]"
         << " [--csi-weights PATH]"
+        << " [--source-frame-mse-weighting]"
+        << " [--source-frame-confidence off|inverse-mse]"
         << " [--noise-variance X] [--soft-demod-method max-log|log-sum-exp]"
         << " [input.cf32|-] [output.llr.f32|-]\n";
 }
@@ -5188,6 +5190,8 @@ int main(int argc, char** argv) {
     std::string input_path = "-";
     std::string output_path = "-";
     std::string csi_weights_path;
+    bool source_frame_mse_weighting = false;
+    bool source_frame_inverse_mse_weighting = false;
     std::string symbols_output_path;
     std::string source_carrier_fixed_complex_gains_path;
     std::vector<std::pair<std::size_t, std::size_t>> output_frame_ranges;
@@ -5235,6 +5239,15 @@ int main(int argc, char** argv) {
                     return 2;
                 }
                 demap_options.noise_variance = parse_float(argv[index], "noise variance");
+            } else if (arg == "--source-frame-confidence") {
+                if (++index >= argc) throw std::invalid_argument("missing source-frame confidence mode");
+                const auto confidence = std::string_view(argv[index]);
+                if (confidence != "off" && confidence != "inverse-mse") {
+                    throw std::invalid_argument("source-frame confidence must be off or inverse-mse");
+                }
+                source_frame_inverse_mse_weighting = confidence == "inverse-mse";
+            } else if (arg == "--source-frame-mse-weighting") {
+                source_frame_mse_weighting = true;
             } else if (arg == "--csi-weights") {
                 if (++index >= argc) {
                     usage(argv[0]);
@@ -5662,6 +5675,15 @@ int main(int argc, char** argv) {
             usage(argv[0]);
             return 2;
         }
+        if (source_frame_mse_weighting && source_frame_inverse_mse_weighting) {
+            throw std::invalid_argument("binary and inverse-MSE source confidence are mutually exclusive");
+        }
+        if (source_frame_mse_weighting || source_frame_inverse_mse_weighting) {
+            // A complete current frame is required before its confidence is known.
+            const auto frames = std::max<std::size_t>(
+                1, chunk_symbols / dtmb::core::kC3780DataSymbols);
+            chunk_symbols = frames * dtmb::core::kC3780DataSymbols;
+        }
         if (!carrier_roll_rules.empty()
             && (chunk_symbols % dtmb::core::kC3780DataSymbols) != 0) {
             throw std::invalid_argument(
@@ -5917,10 +5939,12 @@ int main(int argc, char** argv) {
         if (symbols_output_path == "-") {
             throw std::invalid_argument("--symbols-output does not support stdout");
         }
-        if (!csi_weights_path.empty()
+        const bool use_symbol_weights = !csi_weights_path.empty() || source_frame_mse_weighting
+            || source_frame_inverse_mse_weighting;
+        if (use_symbol_weights
             && (!source_displacement_rules.empty() || !carrier_roll_rules.empty())) {
             throw std::invalid_argument(
-                "--csi-weights is incompatible with source displacement or carrier roll");
+                "symbol confidence weights are incompatible with source displacement or carrier roll");
         }
 
         dtmb::tools::configure_binary_stdio(input_path == "-", output_path == "-");
@@ -6030,6 +6054,10 @@ int main(int argc, char** argv) {
         double csi_weight_sum = 0.0;
         float csi_weight_min = std::numeric_limits<float>::infinity();
         float csi_weight_max = 0.0F;
+        std::size_t mse_scored_frames = 0;
+        std::size_t mse_downweighted_frames = 0;
+        constexpr double mse_threshold = 1.0;
+        constexpr float unreliable_frame_weight = 0.05F;
         while (true) {
             input.read(reinterpret_cast<char*>(input_chunk.data()), input_chunk_bytes);
             const auto bytes_read = input.gcount();
@@ -6042,6 +6070,9 @@ int main(int argc, char** argv) {
 
             const auto symbols_read = static_cast<std::size_t>(bytes_read)
                 / (sizeof(float) * kFloatsPerSymbol);
+            if (use_symbol_weights) {
+                std::fill_n(csi_scalar_chunk.begin(), symbols_read, 1.0F);
+            }
             if (csi_weights_input.is_open()) {
                 const auto csi_bytes = static_cast<std::streamsize>(
                     symbols_read * sizeof(float));
@@ -6052,6 +6083,28 @@ int main(int argc, char** argv) {
                     throw std::runtime_error(
                         "CSI weight count does not match input symbol count");
                 }
+            }
+            if (source_frame_mse_weighting || source_frame_inverse_mse_weighting) {
+                constexpr auto frame_symbols = dtmb::core::kC3780DataSymbols;
+                if ((symbols_read % frame_symbols) != 0) {
+                    throw std::runtime_error("frame confidence input ends inside a C3780 data frame");
+                }
+                for (std::size_t first = 0; first < symbols_read; first += frame_symbols) {
+                    const auto mse = dtmb::core::c3780_qam64_frame_mse_cf32(
+                        std::span<const float>(input_chunk.data() + first * 2, frame_symbols * 2));
+                    ++mse_scored_frames;
+                    const auto frame_weight = source_frame_inverse_mse_weighting
+                        ? static_cast<float>(std::clamp(1.0 / std::max(mse, 1.0e-12), 0.05, 4.0))
+                        : mse > mse_threshold ? unreliable_frame_weight : 1.0F;
+                    mse_downweighted_frames += frame_weight < 1.0F ? 1U : 0U;
+                    if (frame_weight != 1.0F) {
+                        for (auto symbol = first; symbol < first + frame_symbols; ++symbol) {
+                            csi_scalar_chunk[symbol] *= frame_weight;
+                        }
+                    }
+                }
+            }
+            if (use_symbol_weights) {
                 for (std::size_t symbol = 0; symbol < symbols_read; ++symbol) {
                     csi_input_chunk[symbol * 2] = csi_scalar_chunk[symbol];
                     csi_input_chunk[symbol * 2 + 1] = 0.0F;
@@ -6234,7 +6287,7 @@ int main(int argc, char** argv) {
                     useful_input,
                     useful_output,
                     demap_options);
-                if (csi_weights_input.is_open()) {
+                if (use_symbol_weights) {
                     const auto* weights = csi_deinterleaved_chunk.data()
                         + discard_now * kFloatsPerSymbol;
                     for (std::size_t symbol = 0; symbol < useful_symbols; ++symbol) {
@@ -6392,6 +6445,18 @@ int main(int argc, char** argv) {
                           << (stats.gain_abs_sum / applied_chunks) << '\n';
             }
         }
+        std::cerr << "source_frame_mse_weighting="
+                  << (source_frame_mse_weighting ? "true" : "false") << '\n'
+                  << "source_frame_confidence="
+                  << (source_frame_inverse_mse_weighting ? "inverse-mse"
+                      : source_frame_mse_weighting ? "binary-mse" : "off") << '\n'
+                  << "source_frame_confidence_min_weight=0.05\n"
+                  << "source_frame_confidence_max_weight=4\n"
+                  << "chunk_symbols=" << chunk_symbols << '\n'
+                  << "source_frame_mse_threshold=" << mse_threshold << '\n'
+                  << "source_frame_mse_llr_weight=" << unreliable_frame_weight << '\n'
+                  << "source_frame_mse_scored_frames=" << mse_scored_frames << '\n'
+                  << "source_frame_mse_downweighted_frames=" << mse_downweighted_frames << '\n';
         std::cerr << "source_frame_fixed_complex_gain_rule_count="
                   << fixed_complex_gain_stats.size() << '\n';
         for (const auto& stats : fixed_complex_gain_stats) {

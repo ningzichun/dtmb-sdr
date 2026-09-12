@@ -12,6 +12,7 @@ venv/
 build/
 out/
 dist/
+dist-*/
 *.egg-info/
 
 *.iq
@@ -26,3 +27,4 @@ test_vectors/*
 !test_vectors/README.md
 scan_results/
 .DS_Store
+.tmp*/

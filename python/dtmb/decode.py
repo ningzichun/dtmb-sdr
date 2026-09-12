@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -21,16 +22,23 @@ PROFILES = {
 }
 
 
-def _exe(name: str, bin_dir: Path) -> Path:
+def _exe(name: str, bin_dir: Path | None) -> Path:
     suffix = ".exe" if os.name == "nt" else ""
-    candidates = (
-        bin_dir / "Release" / f"{name}{suffix}",
-        bin_dir / f"{name}{suffix}",
-    )
+    package_bin = Path(__file__).resolve().parent / "bin"
+    candidates: list[Path] = []
+    if bin_dir is not None:
+        candidates.extend(
+            [
+                bin_dir / "Release" / f"{name}{suffix}",
+                bin_dir / f"{name}{suffix}",
+            ]
+        )
+    candidates.append(package_bin / f"{name}{suffix}")
     for candidate in candidates:
         if candidate.is_file():
             return candidate.resolve()
-    raise FileNotFoundError(f"missing native executable: {name} in {bin_dir}")
+    searched = ", ".join(str(path) for path in candidates)
+    raise FileNotFoundError(f"missing native executable: {name}; searched {searched}")
 
 
 def build_commands(args: argparse.Namespace) -> list[list[str]]:
@@ -39,37 +47,42 @@ def build_commands(args: argparse.Namespace) -> list[list[str]]:
     if args.system_info_index not in PROFILES:
         raise ValueError("--system-info-index must be 19..24")
     fec_rate, interleaver = PROFILES[args.system_info_index]
+    if not math.isfinite(args.resample_headroom_db) or not 0 <= args.resample_headroom_db <= 24:
+        raise ValueError("--resample-headroom-db must be finite and in 0..24")
+    if args.resample_headroom_db and args.input_rate == SYMBOL_RATE:
+        raise ValueError("--resample-headroom-db requires input-rate conversion")
+    if args.pipeline_buffer_mib < 0:
+        raise ValueError("--pipeline-buffer-mib must be non-negative")
     source = args.input
     commands: list[list[str]] = []
+    resample_gain = 10 ** (-args.resample_headroom_db / 20)
 
     if args.input_rate != SYMBOL_RATE:
-        commands.append(
-            [
-                str(_exe("dtmb_core_ci8_resample", args.bin_dir)),
-                "--input-rate",
-                str(args.input_rate),
-                "--output-rate",
-                str(SYMBOL_RATE),
-                "--workers",
-                str(args.workers),
-                source,
-                "-",
-            ]
-        )
+        resample = [
+            str(_exe("dtmb_core_ci8_resample", args.bin_dir)),
+            "--input-rate", str(args.input_rate),
+            "--output-rate", str(SYMBOL_RATE),
+            "--workers", str(args.workers),
+        ]
+        if args.resample_headroom_db:
+            resample.extend(["--output-scale", format(resample_gain / math.sqrt(45), ".9g")])
+        resample.extend([source, "-"])
+        commands.append(resample)
         source = "-"
 
-    commands.append(
-        [
+    frontend = [
             str(_exe("dtmb_core_c3780_extract", args.bin_dir)),
             "--auto-sync",
-            "--sync-frames",
-            "300",
-            "--acquisition-frames",
-            "16",
-            "--auto-phase-adjustment",
-            "1" if args.input_rate != SYMBOL_RATE else "0",
-            "--workers",
-            str(args.workers),
+            "--sync-frames", "300",
+            "--acquisition-frames", "16",
+            "--auto-phase-adjustment", "1" if args.input_rate == 20_000_000 else "0",
+            "--timing-search-radius", "2",
+            "--timing-search-threshold", "0.45",
+            "--timing-trajectory-interval-frames", "400",
+            "--timing-trajectory-fit-points", "17",
+            "--timing-trajectory-max-innovation-samples", "2",
+            "--workers", str(args.workers),
+            "--batch-frames", str(max(args.workers, min(args.workers * 8, 256))),
             "--equalizer",
             "pn",
             "--pn-estimator",
@@ -78,30 +91,34 @@ def build_commands(args: argparse.Namespace) -> list[list[str]]:
             "8",
             "--pn-wideband-block-frames",
             "2",
+            "--pn-wideband-header-observation", "core-postfix",
+            "--pn-wideband-scale-estimator", "masked-frame-taps",
             "--pn-mmse",
-            "0.004",
+            format(0.004 * resample_gain**2, ".9g"),
             "--remove-dc",
             "--normalization",
             "qam64",
             "--system-info-index",
             str(args.system_info_index),
-            source,
-            "-",
-        ]
-    )
-    commands.append(
-        [
+    ]
+    if args.pn_schedule_tracking:
+        frontend.extend(["--pn-schedule-tracking", "--pn-current-header-tracking"])
+    frontend.extend([source, "-"])
+    commands.append(frontend)
+
+    demap = [
             str(_exe("dtmb_core_deinterleave_qam64", args.bin_dir)),
             "--mode",
             interleaver,
             "--phase",
             "0",
-            "--workers",
-            str(args.workers),
-            "-",
-            "-",
-        ]
-    )
+            "--workers", str(args.workers),
+            "--chunk-symbols", "1048576",
+    ]
+    if args.source_frame_confidence != "off":
+        demap.extend(["--source-frame-confidence", args.source_frame_confidence])
+    demap.extend(["-", "-"])
+    commands.append(demap)
     fec = [
         str(_exe("dtmb_core_ldpc_bch_decode", args.bin_dir)),
         "--fec-rate",
@@ -118,14 +135,35 @@ def build_commands(args: argparse.Namespace) -> list[list[str]]:
         str(args.decode_batch_frames),
         "--max-iterations",
         str(args.max_iterations),
-        "--early-syndrome-reject-ratio",
-        str(args.early_syndrome_reject_ratio),
+        "--retry-max-iterations", "50",
+        "--attenuation", "0.65",
         "--clean-frames-only",
     ]
     if args.error_policy == "continue":
-        fec.extend(["--mark-discontinuities", "--insert-discontinuity-packets"])
+        fec.append("--insert-discontinuity-packets")
+    else:
+        fec.append("--fail-on-unclean-frame")
+    if args.early_syndrome_reject_ratio is not None:
+        fec.extend(["--early-syndrome-reject-ratio", str(args.early_syndrome_reject_ratio)])
     fec.extend(["-", args.output])
     commands.append(fec)
+
+    if args.pipeline_buffer_mib:
+        buffer_bytes = args.pipeline_buffer_mib * 1024 * 1024
+        buffer = str(_exe("dtmb_core_pipe_buffer", args.bin_dir))
+        buffered: list[list[str]] = []
+        for command in commands:
+            buffered.append(command)
+            if Path(command[0]).stem in {
+                "dtmb_core_ci8_resample",
+                "dtmb_core_c3780_extract",
+                "dtmb_core_deinterleave_qam64",
+            }:
+                buffered.append([
+                    buffer, "--buffer-bytes", str(buffer_bytes),
+                    "--chunk-bytes", str(min(1024 * 1024, buffer_bytes)), "-", "-",
+                ])
+        commands = buffered
     return commands
 
 
@@ -154,7 +192,7 @@ def run(commands: list[list[str]]) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    root = Path(__file__).resolve().parents[2]
+    package_dir = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
         prog="dtmb-decode",
         description="Decode a CI8 file or stdin stream into MPEG-TS.",
@@ -165,12 +203,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--system-info-index", type=int, default=22)
     parser.add_argument("--acceleration", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--decode-batch-frames", type=int, default=256)
-    parser.add_argument("--max-iterations", type=int, default=50)
-    parser.add_argument("--early-syndrome-reject-ratio", type=float, default=0.46)
+    parser.add_argument("--max-iterations", type=int, default=300)
+    parser.add_argument("--early-syndrome-reject-ratio", type=float)
     parser.add_argument("--error-policy", choices=("fail", "continue"), default="fail")
     parser.add_argument("--workers", type=int, default=max(1, os.cpu_count() or 1))
-    parser.add_argument("--bin-dir", type=Path, default=root / "build" / "core-cpp")
-    parser.add_argument("--data-dir", type=Path, default=root / "python" / "dtmb" / "data")
+    parser.add_argument("--pn-schedule-tracking", action="store_true")
+    parser.add_argument(
+        "--source-frame-confidence", choices=("off", "inverse-mse"), default="off"
+    )
+    parser.add_argument("--resample-headroom-db", type=float, default=0.0)
+    parser.add_argument(
+        "--pipeline-buffer-mib", type=int, default=64,
+        help="Bounded queue size after each bulk receiver stage (0 disables queues).",
+    )
+    parser.add_argument(
+        "--bin-dir",
+        type=Path,
+        help="Use native executables from this build directory instead of packaged binaries.",
+    )
+    parser.add_argument("--data-dir", type=Path, default=package_dir / "data")
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
