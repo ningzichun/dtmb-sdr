@@ -22,8 +22,10 @@
 namespace {
 
 constexpr std::size_t kFloatsPerSymbol = 2;
-constexpr std::size_t kLlrsPerSymbol = 6;
-constexpr std::array<float, 8> kQam64Levels{-7.0F, -5.0F, -3.0F, -1.0F, 1.0F, 3.0F, 5.0F, 7.0F};
+// Set before reading input; immutable while processing this stream.
+auto qam_mode = dtmb::core::QamMode::qam64;
+const dtmb::core::QamDefinition& qam() { return dtmb::core::qam_definition(qam_mode); }
+std::size_t llrs_per_symbol() { return qam().bits_per_symbol; }
 constexpr double kPi = 3.141592653589793238462643383279502884;
 constexpr std::array<std::size_t, dtmb::core::kC3780SystemInfoSymbols>
     kC3780SystemInfoPositions{
@@ -442,7 +444,7 @@ struct DdLlrConfidenceStats {
 
 void usage(const char* program) {
     std::cerr
-        << "usage: " << program
+        << "usage: " << program << " [--qam 16qam|32qam|64qam]"
         << " --mode mode1|mode2 [--phase N] [--keep-latency]"
         << " [--workers N] [--min-parallel-symbols N] [--chunk-symbols N]"
         << " [--branch-gain-branches CSV]"
@@ -1584,7 +1586,7 @@ std::size_t write_output_frame_ranges(
     const std::vector<std::pair<std::size_t, std::size_t>>& ranges) {
     constexpr std::size_t kOutputSymbolsPerFecFrame =
         dtmb::core::kC3780DataSymbols;
-    const auto symbol_count = llr_values.size() / kLlrsPerSymbol;
+    const auto symbol_count = llr_values.size() / llrs_per_symbol();
     if (ranges.empty()) {
         write_all(output, llr_values);
         return symbol_count;
@@ -1600,8 +1602,8 @@ std::size_t write_output_frame_ranges(
             symbol_count - local_symbol,
             frame_end_symbol - global_symbol);
         if (output_frame_selected(frame_index, ranges)) {
-            const auto first_llr = local_symbol * kLlrsPerSymbol;
-            const auto llr_count = segment_symbols * kLlrsPerSymbol;
+            const auto first_llr = local_symbol * llrs_per_symbol();
+            const auto llr_count = segment_symbols * llrs_per_symbol();
             write_all(output, llr_values.subspan(first_llr, llr_count));
             written_symbols += segment_symbols;
         }
@@ -1643,11 +1645,11 @@ std::size_t write_symbol_output_frame_ranges(
     return written_symbols;
 }
 
-std::size_t nearest_qam64_level_index(float value) noexcept {
+std::size_t nearest_qam_level_index(float value) noexcept {
     std::size_t nearest = 0;
-    auto best_distance = std::abs(value - kQam64Levels[nearest]);
-    for (std::size_t index = 1; index < kQam64Levels.size(); ++index) {
-        const auto level = kQam64Levels[index];
+    auto best_distance = std::abs(value - qam().levels[nearest]);
+    for (std::size_t index = 1; index < qam().levels.size(); ++index) {
+        const auto level = qam().levels[index];
         const auto distance = std::abs(value - level);
         if (distance < best_distance) {
             best_distance = distance;
@@ -1657,18 +1659,18 @@ std::size_t nearest_qam64_level_index(float value) noexcept {
     return nearest;
 }
 
-float nearest_qam64_level(float value) noexcept {
-    return kQam64Levels[nearest_qam64_level_index(value)];
+float nearest_qam_level(float value) noexcept {
+    return qam().levels[nearest_qam_level_index(value)];
 }
 
-std::size_t qam64_point_index(std::size_t real_level, std::size_t imag_level) noexcept {
-    return real_level * kQam64Levels.size() + imag_level;
+std::size_t qam_point_index(std::size_t real_level, std::size_t imag_level) noexcept {
+    return real_level * qam().levels.size() + imag_level;
 }
 
-std::complex<float> qam64_point_from_index(std::size_t index) noexcept {
-    const auto real_level = index / kQam64Levels.size();
-    const auto imag_level = index % kQam64Levels.size();
-    return {kQam64Levels[real_level], kQam64Levels[imag_level]};
+std::complex<float> qam_point_from_index(std::size_t index) noexcept {
+    const auto real_level = index / qam().levels.size();
+    const auto imag_level = index % qam().levels.size();
+    return {qam().levels[real_level], qam().levels[imag_level]};
 }
 
 std::size_t source_symbol_for_output_symbol(
@@ -1782,8 +1784,8 @@ void apply_branch_gain_correction(
                 symbols[symbol * kFloatsPerSymbol],
                 symbols[symbol * kFloatsPerSymbol + 1U]};
             const std::complex<float> nearest{
-                nearest_qam64_level(value.real()),
-                nearest_qam64_level(value.imag())};
+                nearest_qam_level(value.real()),
+                nearest_qam_level(value.imag())};
             const auto nearest_power = std::max(std::abs(nearest), 1.0e-6F);
             const auto relative_error = std::abs(value - nearest) / nearest_power;
             update_frame_diagnostics(
@@ -1823,8 +1825,8 @@ void apply_branch_gain_correction(
                 symbols[symbol * kFloatsPerSymbol],
                 symbols[symbol * kFloatsPerSymbol + 1U]};
             const std::complex<float> nearest{
-                nearest_qam64_level((value / gain).real()),
-                nearest_qam64_level((value / gain).imag())};
+                nearest_qam_level((value / gain).real()),
+                nearest_qam_level((value / gain).imag())};
             const auto nearest_power = std::max(std::abs(nearest), 1.0e-6F);
             const auto corrected = value / gain;
             symbols[symbol * kFloatsPerSymbol] = corrected.real();
@@ -2330,8 +2332,8 @@ void add_source_frame_axis_affine_sample(
     SourceFrameAxisAffineAccumulator& accumulator,
     const std::complex<float>& value) {
     const std::complex<float> nearest{
-        nearest_qam64_level(value.real()),
-        nearest_qam64_level(value.imag())};
+        nearest_qam_level(value.real()),
+        nearest_qam_level(value.imag())};
     ++accumulator.reliable_count;
     accumulator.sum_nearest_real += nearest.real();
     accumulator.sum_nearest_imag += nearest.imag();
@@ -2380,8 +2382,8 @@ AxisAffineFit fit_axis_affine(
             symbols[symbol * kFloatsPerSymbol],
             symbols[symbol * kFloatsPerSymbol + 1U]};
         const std::complex<float> nearest{
-            nearest_qam64_level(value.real()),
-            nearest_qam64_level(value.imag())};
+            nearest_qam_level(value.real()),
+            nearest_qam_level(value.imag())};
         const auto nearest_power = std::max(std::abs(nearest), 1.0e-6F);
         const auto relative_error = std::abs(value - nearest) / nearest_power;
         if (relative_error > options.reliability_threshold) {
@@ -2476,8 +2478,8 @@ void apply_source_frame_axis_affine(
             symbols[symbol * kFloatsPerSymbol],
             symbols[symbol * kFloatsPerSymbol + 1U]};
         const std::complex<float> nearest{
-            nearest_qam64_level(value.real()),
-            nearest_qam64_level(value.imag())};
+            nearest_qam_level(value.real()),
+            nearest_qam_level(value.imag())};
         const auto nearest_power = std::max(std::abs(nearest), 1.0e-6F);
         const auto relative_error = std::abs(value - nearest) / nearest_power;
         if (relative_error <= options.reliability_threshold) {
@@ -2573,8 +2575,8 @@ void apply_source_frame_symbol_gain(
                 symbols[symbol * kFloatsPerSymbol],
                 symbols[symbol * kFloatsPerSymbol + 1U]};
             const std::complex<float> nearest{
-                nearest_qam64_level(value.real()),
-                nearest_qam64_level(value.imag())};
+                nearest_qam_level(value.real()),
+                nearest_qam_level(value.imag())};
             const auto nearest_power = std::max(std::abs(nearest), 1.0e-6F);
             const auto relative_error = std::abs(value - nearest) / nearest_power;
             if (relative_error > options.reliability_threshold) {
@@ -2794,8 +2796,8 @@ void apply_source_carrier_symbol_gain_sequential(
                 symbols[symbol * kFloatsPerSymbol],
                 symbols[symbol * kFloatsPerSymbol + 1U]};
             const std::complex<float> nearest{
-                nearest_qam64_level(value.real()),
-                nearest_qam64_level(value.imag())};
+                nearest_qam_level(value.real()),
+                nearest_qam_level(value.imag())};
             const auto nearest_power = std::max(std::abs(nearest), 1.0e-6F);
             const auto relative_error = std::abs(value - nearest) / nearest_power;
             if (relative_error > options.reliability_threshold) {
@@ -3016,8 +3018,8 @@ void apply_source_carrier_axis_affine(
             symbols[symbol * kFloatsPerSymbol],
             symbols[symbol * kFloatsPerSymbol + 1U]};
         const std::complex<float> nearest{
-            nearest_qam64_level(value.real()),
-            nearest_qam64_level(value.imag())};
+            nearest_qam_level(value.real()),
+            nearest_qam_level(value.imag())};
         const auto nearest_power = std::max(std::abs(nearest), 1.0e-6F);
         const auto relative_error = std::abs(value - nearest) / nearest_power;
         if (relative_error > options.reliability_threshold) {
@@ -3161,8 +3163,8 @@ void apply_source_carrier_linear_affine(
             symbols[symbol * kFloatsPerSymbol],
             symbols[symbol * kFloatsPerSymbol + 1U]};
         const std::complex<float> nearest{
-            nearest_qam64_level(value.real()),
-            nearest_qam64_level(value.imag())};
+            nearest_qam_level(value.real()),
+            nearest_qam_level(value.imag())};
         const auto nearest_power = std::max(std::abs(nearest), 1.0e-6F);
         const auto relative_error = std::abs(value - nearest) / nearest_power;
         if (relative_error > options.reliability_threshold) {
@@ -3323,21 +3325,21 @@ bool axis_quantile_centers(
 
 float remap_axis_quantile(float value, const std::array<float, 8>& centers) {
     if (value <= centers.front()) {
-        const auto slope = (kQam64Levels[1] - kQam64Levels[0])
+        const auto slope = (qam().levels[1] - qam().levels[0])
             / (centers[1] - centers[0]);
-        return kQam64Levels[0] + (value - centers[0]) * slope;
+        return qam().levels[0] + (value - centers[0]) * slope;
     }
     if (value >= centers.back()) {
-        const auto slope = (kQam64Levels[7] - kQam64Levels[6])
+        const auto slope = (qam().levels[7] - qam().levels[6])
             / (centers[7] - centers[6]);
-        return kQam64Levels[7] + (value - centers[7]) * slope;
+        return qam().levels[7] + (value - centers[7]) * slope;
     }
     const auto upper = std::upper_bound(centers.begin(), centers.end(), value);
     const auto high = static_cast<std::size_t>(upper - centers.begin());
     const auto low = high - 1U;
     const auto span = centers[high] - centers[low];
     const auto fraction = (value - centers[low]) / span;
-    return kQam64Levels[low] + fraction * (kQam64Levels[high] - kQam64Levels[low]);
+    return qam().levels[low] + fraction * (qam().levels[high] - qam().levels[low]);
 }
 
 bool axis_centroid_centers(
@@ -3428,11 +3430,11 @@ void apply_source_carrier_axis_centroid(
         }
         const auto real = symbols[symbol * kFloatsPerSymbol];
         const auto imag = symbols[symbol * kFloatsPerSymbol + 1U];
-        const auto real_level = nearest_qam64_level_index(real);
-        const auto imag_level = nearest_qam64_level_index(imag);
+        const auto real_level = nearest_qam_level_index(real);
+        const auto imag_level = nearest_qam_level_index(imag);
         const std::complex<float> nearest{
-            kQam64Levels[real_level],
-            kQam64Levels[imag_level]};
+            qam().levels[real_level],
+            qam().levels[imag_level]};
         const std::complex<float> value{real, imag};
         const auto nearest_power = std::max(std::abs(nearest), 1.0e-6F);
         const auto relative_error = std::abs(value - nearest) / nearest_power;
@@ -3560,11 +3562,11 @@ void apply_source_carrier_axis_centroid_median(
         }
         const auto real = symbols[symbol * kFloatsPerSymbol];
         const auto imag = symbols[symbol * kFloatsPerSymbol + 1U];
-        const auto real_level = nearest_qam64_level_index(real);
-        const auto imag_level = nearest_qam64_level_index(imag);
+        const auto real_level = nearest_qam_level_index(real);
+        const auto imag_level = nearest_qam_level_index(imag);
         const std::complex<float> nearest{
-            kQam64Levels[real_level],
-            kQam64Levels[imag_level]};
+            qam().levels[real_level],
+            qam().levels[imag_level]};
         const std::complex<float> value{real, imag};
         const auto nearest_power = std::max(std::abs(nearest), 1.0e-6F);
         const auto relative_error = std::abs(value - nearest) / nearest_power;
@@ -3689,10 +3691,10 @@ void apply_source_carrier_qam_centroid(
         }
         const auto real = symbols[symbol * kFloatsPerSymbol];
         const auto imag = symbols[symbol * kFloatsPerSymbol + 1U];
-        const auto real_level = nearest_qam64_level_index(real);
-        const auto imag_level = nearest_qam64_level_index(imag);
-        const auto point_index = qam64_point_index(real_level, imag_level);
-        const auto nearest = qam64_point_from_index(point_index);
+        const auto real_level = nearest_qam_level_index(real);
+        const auto imag_level = nearest_qam_level_index(imag);
+        const auto point_index = qam_point_index(real_level, imag_level);
+        const auto nearest = qam_point_from_index(point_index);
         const std::complex<float> value{real, imag};
         const auto nearest_power = std::max(std::abs(nearest), 1.0e-6F);
         const auto relative_error = std::abs(value - nearest) / nearest_power;
@@ -3779,13 +3781,13 @@ void apply_source_carrier_qam_centroid(
             }
             const auto real = symbols[symbol * kFloatsPerSymbol];
             const auto imag = symbols[symbol * kFloatsPerSymbol + 1U];
-            const auto real_level = nearest_qam64_level_index(real);
-            const auto imag_level = nearest_qam64_level_index(imag);
-            const auto point_index = qam64_point_index(real_level, imag_level);
+            const auto real_level = nearest_qam_level_index(real);
+            const auto imag_level = nearest_qam_level_index(imag);
+            const auto point_index = qam_point_index(real_level, imag_level);
             if (fit.valid_centroids[point_index] == 0U) {
                 continue;
             }
-            const auto nearest = qam64_point_from_index(point_index);
+            const auto nearest = qam_point_from_index(point_index);
             const auto centroid = fit.centroids[point_index];
             symbols[symbol * kFloatsPerSymbol] = real + nearest.real() - centroid.real();
             symbols[symbol * kFloatsPerSymbol + 1U] =
@@ -3888,14 +3890,14 @@ void apply_source_carrier_neighbor_leakage(
                 symbols[local_symbol * kFloatsPerSymbol],
                 symbols[local_symbol * kFloatsPerSymbol + 1U]};
             const std::complex<float> nearest{
-                nearest_qam64_level(value.real()),
-                nearest_qam64_level(value.imag())};
+                nearest_qam_level(value.real()),
+                nearest_qam_level(value.imag())};
             const std::complex<float> neighbor_value{
                 symbols[neighbor_symbol * kFloatsPerSymbol],
                 symbols[neighbor_symbol * kFloatsPerSymbol + 1U]};
             const std::complex<float> neighbor_nearest{
-                nearest_qam64_level(neighbor_value.real()),
-                nearest_qam64_level(neighbor_value.imag())};
+                nearest_qam_level(neighbor_value.real()),
+                nearest_qam_level(neighbor_value.imag())};
             const auto nearest_power = std::max(std::abs(nearest), 1.0e-6F);
             const auto neighbor_power = std::max(std::abs(neighbor_nearest), 1.0e-6F);
             const auto relative_error = std::abs(value - nearest) / nearest_power;
@@ -3968,8 +3970,8 @@ void apply_source_carrier_neighbor_leakage(
                 symbols[neighbor_symbol * kFloatsPerSymbol],
                 symbols[neighbor_symbol * kFloatsPerSymbol + 1U]};
             const std::complex<float> neighbor_nearest{
-                nearest_qam64_level(neighbor_value.real()),
-                nearest_qam64_level(neighbor_value.imag())};
+                nearest_qam_level(neighbor_value.real()),
+                nearest_qam_level(neighbor_value.imag())};
             const auto corrected = value - leakage[rule_index] * neighbor_nearest;
             symbols[local_symbol * kFloatsPerSymbol] = corrected.real();
             symbols[local_symbol * kFloatsPerSymbol + 1U] = corrected.imag();
@@ -4066,8 +4068,8 @@ void apply_source_carrier_neighbor_leakage_set(
                 symbols[neighbor_symbol * kFloatsPerSymbol],
                 symbols[neighbor_symbol * kFloatsPerSymbol + 1U]};
             const std::complex<float> neighbor_nearest{
-                nearest_qam64_level(neighbor_value.real()),
-                nearest_qam64_level(neighbor_value.imag())};
+                nearest_qam_level(neighbor_value.real()),
+                nearest_qam_level(neighbor_value.imag())};
             if (require_reliable) {
                 const auto neighbor_power = std::max(std::abs(neighbor_nearest), 1.0e-6F);
                 const auto neighbor_relative_error =
@@ -4105,8 +4107,8 @@ void apply_source_carrier_neighbor_leakage_set(
                 symbols[local_symbol * kFloatsPerSymbol],
                 symbols[local_symbol * kFloatsPerSymbol + 1U]};
             const std::complex<float> nearest{
-                nearest_qam64_level(value.real()),
-                nearest_qam64_level(value.imag())};
+                nearest_qam_level(value.real()),
+                nearest_qam_level(value.imag())};
             const auto nearest_power = std::max(std::abs(nearest), 1.0e-6F);
             const auto relative_error = std::abs(value - nearest) / nearest_power;
             if (relative_error > options.reliability_threshold
@@ -4239,7 +4241,7 @@ void apply_source_carrier_axis_quantile(
     }
 
     std::vector<AxisQuantileFit> fits(rules.size());
-    const auto min_symbols = std::max<std::size_t>(options.min_symbols, kQam64Levels.size());
+    const auto min_symbols = std::max<std::size_t>(options.min_symbols, qam().levels.size());
     for (std::size_t rule_index = 0; rule_index < rules.size(); ++rule_index) {
         const auto matched = real_values[rule_index].size();
         stats[rule_index].matched_symbols += matched;
@@ -4352,8 +4354,8 @@ void apply_source_carrier_symbol_gain(
                 symbols[symbol * kFloatsPerSymbol],
                 symbols[symbol * kFloatsPerSymbol + 1U]};
             const std::complex<float> nearest{
-                nearest_qam64_level(value.real()),
-                nearest_qam64_level(value.imag())};
+                nearest_qam_level(value.real()),
+                nearest_qam_level(value.imag())};
             const auto nearest_power = std::max(std::abs(nearest), 1.0e-6F);
             const auto relative_error = std::abs(value - nearest) / nearest_power;
             if (relative_error > options.reliability_threshold) {
@@ -4961,7 +4963,7 @@ void apply_source_frame_llr_scale(
         return;
     }
     const auto spec = dtmb::core::symbol_interleaver_spec(mode);
-    const auto symbol_count = llrs.size() / kLlrsPerSymbol;
+    const auto symbol_count = llrs.size() / llrs_per_symbol();
     for (std::size_t symbol = 0; symbol < symbol_count; ++symbol) {
         const auto source_symbol = source_symbol_for_output_symbol(
             first_output_symbol + symbol,
@@ -4976,8 +4978,8 @@ void apply_source_frame_llr_scale(
                 || source_frame > rule.last_frame) {
                 continue;
             }
-            for (std::size_t bit = 0; bit < kLlrsPerSymbol; ++bit) {
-                llrs[symbol * kLlrsPerSymbol + bit] *= rule.scale;
+            for (std::size_t bit = 0; bit < llrs_per_symbol(); ++bit) {
+                llrs[symbol * llrs_per_symbol() + bit] *= rule.scale;
             }
             ++stats[rule_index].scaled_symbols;
             break;
@@ -4996,7 +4998,7 @@ void apply_source_frame_ramp_llr_erasure(
     if (!options.enabled) {
         return;
     }
-    const auto symbol_count = llrs.size() / kLlrsPerSymbol;
+    const auto symbol_count = llrs.size() / llrs_per_symbol();
     for (std::size_t symbol = 0; symbol < symbol_count; ++symbol) {
         const auto source_symbol = source_symbol_for_output_symbol(
             first_output_symbol + symbol,
@@ -5012,8 +5014,8 @@ void apply_source_frame_ramp_llr_erasure(
         if (std::abs(ramp_metrics[source_frame]) < options.threshold) {
             continue;
         }
-        for (std::size_t bit = 0; bit < kLlrsPerSymbol; ++bit) {
-            llrs[symbol * kLlrsPerSymbol + bit] *= options.scale;
+        for (std::size_t bit = 0; bit < llrs_per_symbol(); ++bit) {
+            llrs[symbol * llrs_per_symbol() + bit] *= options.scale;
         }
         ++stats.scaled_symbols;
     }
@@ -5029,7 +5031,7 @@ void apply_source_carrier_llr_scale(
     if (rules.empty()) {
         return;
     }
-    const auto symbol_count = llrs.size() / kLlrsPerSymbol;
+    const auto symbol_count = llrs.size() / llrs_per_symbol();
     for (std::size_t symbol = 0; symbol < symbol_count; ++symbol) {
         const auto source_symbol = source_symbol_for_output_symbol(
             first_output_symbol + symbol,
@@ -5044,8 +5046,8 @@ void apply_source_carrier_llr_scale(
                 || source_frame > rule.last_frame) {
                 continue;
             }
-            for (std::size_t bit = 0; bit < kLlrsPerSymbol; ++bit) {
-                llrs[symbol * kLlrsPerSymbol + bit] *= rule.scale;
+            for (std::size_t bit = 0; bit < llrs_per_symbol(); ++bit) {
+                llrs[symbol * llrs_per_symbol() + bit] *= rule.scale;
             }
             ++stats[rule_index].scaled_symbols;
             break;
@@ -5092,8 +5094,8 @@ void apply_source_carrier_residual_llr_confidence(
                 symbols[symbol * kFloatsPerSymbol],
                 symbols[symbol * kFloatsPerSymbol + 1U]};
             const std::complex<float> nearest{
-                nearest_qam64_level(value.real()),
-                nearest_qam64_level(value.imag())};
+                nearest_qam_level(value.real()),
+                nearest_qam_level(value.imag())};
             const auto nearest_power = std::max(std::abs(nearest), 1.0e-6F);
             const auto residual_ratio = std::abs(value - nearest) / nearest_power;
             if (!std::isfinite(residual_ratio)
@@ -5104,7 +5106,7 @@ void apply_source_carrier_residual_llr_confidence(
                 rule.residual_knee / residual_ratio,
                 rule.min_scale,
                 1.0F);
-            auto symbol_llrs = llrs.subspan(symbol * kLlrsPerSymbol, kLlrsPerSymbol);
+            auto symbol_llrs = llrs.subspan(symbol * llrs_per_symbol(), llrs_per_symbol());
             for (auto& llr : symbol_llrs) {
                 llr *= scale;
             }
@@ -5132,8 +5134,8 @@ void apply_dd_llr_confidence(
             symbols[symbol * kFloatsPerSymbol],
             symbols[symbol * kFloatsPerSymbol + 1U]};
         const std::complex<float> nearest{
-            nearest_qam64_level(value.real()),
-            nearest_qam64_level(value.imag())};
+            nearest_qam_level(value.real()),
+            nearest_qam_level(value.imag())};
         const auto decision_abs = std::max(std::abs(nearest), 1.0e-6F);
         const auto residual_ratio = std::abs(value - nearest) / decision_abs;
         if (!std::isfinite(residual_ratio)
@@ -5144,7 +5146,7 @@ void apply_dd_llr_confidence(
             options.residual_knee / residual_ratio,
             options.min_scale,
             1.0F);
-        auto symbol_llrs = llrs.subspan(symbol * kLlrsPerSymbol, kLlrsPerSymbol);
+        auto symbol_llrs = llrs.subspan(symbol * llrs_per_symbol(), llrs_per_symbol());
         for (auto& llr : symbol_llrs) {
             llr *= scale;
         }
@@ -5200,7 +5202,10 @@ int main(int argc, char** argv) {
     try {
         for (int index = 1; index < argc; ++index) {
             const std::string arg = argv[index];
-            if (arg == "--mode") {
+            if (arg == "--qam") {
+                if (++index >= argc) throw std::invalid_argument("missing QAM mode");
+                qam_mode = dtmb::core::parse_qam_mode(argv[index]);
+            } else if (arg == "--mode") {
                 if (++index >= argc) {
                     usage(argv[0]);
                     return 2;
@@ -5671,6 +5676,21 @@ int main(int argc, char** argv) {
             }
         }
 
+        if (qam_mode != dtmb::core::QamMode::qam64) {
+            // These fits have fixed 64QAM calibration assumptions, including
+            // eight axis centroids and three codeword slots.
+            for (int index = 1; index < argc; ++index) {
+                const auto arg = std::string_view(argv[index]);
+                if ((arg.starts_with("--branch-") || arg.starts_with("--source-")
+                        || arg.starts_with("--dd-"))
+                    && arg != "--source-frame-confidence"
+                    && arg != "--source-frame-mse-weighting"
+                    && arg != "--source-frame-llr-scale"
+                    && arg != "--source-carrier-llr-scale") {
+                    throw std::invalid_argument(std::string(arg) + " is a 64QAM-only calibration option");
+                }
+            }
+        }
         if (!mode_set || positional.size() > 2 || chunk_symbols == 0) {
             usage(argv[0]);
             return 2;
@@ -6044,7 +6064,7 @@ int main(int argc, char** argv) {
                 ? source_displacement_window.first_symbol
                 : std::size_t{0};
         std::vector<float> deinterleaved_chunk(chunk_symbols * kFloatsPerSymbol);
-        std::vector<float> output_chunk(chunk_symbols * kLlrsPerSymbol);
+        std::vector<float> output_chunk(chunk_symbols * llrs_per_symbol());
         std::size_t written_output_symbols = 0;
         const auto input_chunk_bytes = static_cast<std::streamsize>(
             input_chunk.size() * sizeof(float));
@@ -6090,8 +6110,8 @@ int main(int argc, char** argv) {
                     throw std::runtime_error("frame confidence input ends inside a C3780 data frame");
                 }
                 for (std::size_t first = 0; first < symbols_read; first += frame_symbols) {
-                    const auto mse = dtmb::core::c3780_qam64_frame_mse_cf32(
-                        std::span<const float>(input_chunk.data() + first * 2, frame_symbols * 2));
+                    const auto mse = dtmb::core::c3780_qam_frame_mse_cf32(
+                        std::span<const float>(input_chunk.data() + first * 2, frame_symbols * 2), qam_mode);
                     ++mse_scored_frames;
                     const auto frame_weight = source_frame_inverse_mse_weighting
                         ? static_cast<float>(std::clamp(1.0 / std::max(mse, 1.0e-12), 0.05, 4.0))
@@ -6282,11 +6302,11 @@ int main(int argc, char** argv) {
                 }
                 auto useful_output = std::span<float>(
                     output_chunk.data(),
-                    useful_symbols * kLlrsPerSymbol);
-                dtmb::core::qam64_soft_demodulate_cf32(
+                    useful_symbols * llrs_per_symbol());
+                dtmb::core::qam_soft_demodulate_cf32(
                     useful_input,
                     useful_output,
-                    demap_options);
+                    qam_mode, demap_options);
                 if (use_symbol_weights) {
                     const auto* weights = csi_deinterleaved_chunk.data()
                         + discard_now * kFloatsPerSymbol;
@@ -6296,8 +6316,8 @@ int main(int argc, char** argv) {
                             throw std::runtime_error(
                                 "CSI weights must be finite and non-negative");
                         }
-                        for (std::size_t bit = 0; bit < kLlrsPerSymbol; ++bit) {
-                            useful_output[symbol * kLlrsPerSymbol + bit] *= weight;
+                        for (std::size_t bit = 0; bit < llrs_per_symbol(); ++bit) {
+                            useful_output[symbol * llrs_per_symbol() + bit] *= weight;
                         }
                         ++csi_weighted_symbols;
                         csi_weight_sum += weight;
@@ -6360,6 +6380,8 @@ int main(int argc, char** argv) {
             }
         }
 
+        std::cerr << "qam=" << dtmb::core::qam_mode_name(qam_mode) << '\n'
+                  << "llrs_per_symbol=" << llrs_per_symbol() << '\n';
         std::cerr << "input_symbols=" << input_symbols << '\n'
                   << "discarded_latency_symbols="
                   << (keep_latency ? 0 : deinterleaver.latency_symbols() - discard_remaining)

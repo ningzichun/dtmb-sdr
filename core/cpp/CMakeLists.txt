@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(dtmb_core VERSION 0.3.0 LANGUAGES C CXX)
+project(dtmb_core VERSION 0.4.0 LANGUAGES C CXX)
 
 option(DTMB_CORE_BUILD_TESTS "Build dtmb-core tests" ON)
 option(DTMB_CORE_ENABLE_CUDA_LDPC "Build the optional CUDA LDPC backend" OFF)
@@ -58,6 +58,13 @@ target_link_libraries(dtmb_core_c3780_extract PRIVATE dtmb::core)
 add_executable(dtmb_core_deinterleave_qam64 tools/deinterleave_qam64.cpp)
 target_link_libraries(dtmb_core_deinterleave_qam64 PRIVATE dtmb::core)
 
+# Both command names share the same streaming implementation.
+add_executable(dtmb_core_deinterleave_qam tools/deinterleave_qam64.cpp)
+target_link_libraries(dtmb_core_deinterleave_qam PRIVATE dtmb::core)
+
+add_executable(dtmb_core_qam_softdemap tools/qam64_softdemap.cpp)
+target_link_libraries(dtmb_core_qam_softdemap PRIVATE dtmb::core)
+
 add_executable(dtmb_core_pipe_buffer tools/pipe_buffer.cpp)
 target_compile_features(dtmb_core_pipe_buffer PRIVATE cxx_std_20)
 target_link_libraries(dtmb_core_pipe_buffer PRIVATE Threads::Threads)
@@ -88,6 +95,8 @@ install(TARGETS
   dtmb_core_ci8_resample
   dtmb_core_c3780_extract
   dtmb_core_deinterleave_qam64
+  dtmb_core_deinterleave_qam
+  dtmb_core_qam_softdemap
   dtmb_core_ldpc_bch_decode
   dtmb_core_pipe_buffer
   RUNTIME DESTINATION dtmb/bin
@@ -95,6 +104,13 @@ install(TARGETS
 
 if(DTMB_CORE_BUILD_TESTS)
   enable_testing()
+  add_executable(dtmb_pn_tests tests/test_pn.cpp)
+  target_link_libraries(dtmb_pn_tests PRIVATE dtmb::core)
+  add_test(NAME dtmb_pn_tests COMMAND dtmb_pn_tests)
+
+  add_executable(dtmb_qam_tests tests/test_qam.cpp)
+  target_link_libraries(dtmb_qam_tests PRIVATE dtmb::core)
+  add_test(NAME dtmb_qam_tests COMMAND dtmb_qam_tests)
   add_executable(dtmb_ldpc_h_gate_tests tests/test_ldpc_h_gate.cpp)
   target_link_libraries(dtmb_ldpc_h_gate_tests PRIVATE dtmb_ldpc_h_gate_support)
   target_compile_definitions(dtmb_ldpc_h_gate_tests PRIVATE

@@ -19,7 +19,7 @@ namespace dtmb::core {
 namespace {
 
 constexpr std::uint32_t kVersionMajor = 0;
-constexpr std::uint32_t kVersionMinor = 2;
+constexpr std::uint32_t kVersionMinor = 4;
 constexpr std::uint32_t kVersionPatch = 0;
 constexpr std::uint32_t kAbiVersionMajor = 0;
 constexpr std::uint32_t kAbiVersionMinor = 1;
@@ -127,25 +127,34 @@ struct PartialStats {
 }
 
 constexpr std::array<float, 8> kQam64Levels{-7.0F, -5.0F, -3.0F, -1.0F, 1.0F, 3.0F, 5.0F, 7.0F};
-constexpr std::array<std::array<std::uint8_t, 3>, 8> kQam64AxisBits{{
-    {{0, 0, 0}},
-    {{1, 0, 0}},
-    {{1, 1, 0}},
-    {{0, 1, 0}},
-    {{0, 1, 1}},
-    {{1, 1, 1}},
-    {{1, 0, 1}},
-    {{0, 0, 1}},
+constexpr std::array<float, 4> kQam16Levels{-6.0F, -2.0F, 2.0F, 6.0F};
+constexpr std::array<float, 6> kQam32Levels{-7.5F, -4.5F, -1.5F, 1.5F, 4.5F, 7.5F};
+// GB 20600-2006 Figure 4, indexed by b0 + 2*b1 + ... + 16*b4.
+// The four outer corners of the 6 by 6 grid are absent.
+constexpr std::array<QamPoint, 32> kQam32Points{{
+    {-1.5F, -1.5F}, {-7.5F, -4.5F}, {1.5F, -1.5F}, {7.5F, -4.5F},
+    {-4.5F, -1.5F}, {-7.5F, -1.5F}, {4.5F, -1.5F}, {7.5F, -1.5F},
+    {-1.5F, 1.5F}, {-7.5F, 4.5F}, {1.5F, 1.5F}, {7.5F, 4.5F},
+    {-4.5F, 1.5F}, {-7.5F, 1.5F}, {4.5F, 1.5F}, {7.5F, 1.5F},
+    {-1.5F, -4.5F}, {-1.5F, -7.5F}, {1.5F, -4.5F}, {1.5F, -7.5F},
+    {-4.5F, -4.5F}, {-4.5F, -7.5F}, {4.5F, -4.5F}, {4.5F, -7.5F},
+    {-1.5F, 4.5F}, {-1.5F, 7.5F}, {1.5F, 4.5F}, {1.5F, 7.5F},
+    {-4.5F, 4.5F}, {-4.5F, 7.5F}, {4.5F, 4.5F}, {4.5F, 7.5F},
 }};
+constexpr QamDefinition kQam16{QamMode::qam16, 4, 40.0F, kQam16Levels};
+constexpr QamDefinition kQam32{QamMode::qam32, 5, 45.0F, kQam32Levels, kQam32Points};
+constexpr QamDefinition kQam64{QamMode::qam64, 6, 42.0F, kQam64Levels};
 
-[[nodiscard]] float axis_llr(float value, std::size_t bit_index, float noise_variance) noexcept {
+[[nodiscard]] float axis_llr(
+    float value, std::size_t bit_index, float noise_variance,
+    const QamDefinition& qam) noexcept {
     auto min_zero = std::numeric_limits<float>::infinity();
     auto min_one = std::numeric_limits<float>::infinity();
 
-    for (std::size_t index = 0; index < kQam64Levels.size(); ++index) {
-        const auto delta = value - kQam64Levels[index];
+    for (std::size_t index = 0; index < qam.levels.size(); ++index) {
+        const auto delta = value - qam.levels[index];
         const auto distance = delta * delta;
-        if (kQam64AxisBits[index][bit_index] == 0) {
+        if (((qam.axis_label(index) >> bit_index) & 1U) == 0) {
             min_zero = std::min(min_zero, distance);
         } else {
             min_one = std::min(min_one, distance);
@@ -155,7 +164,7 @@ constexpr std::array<std::array<std::uint8_t, 3>, 8> kQam64AxisBits{{
     return (min_one - min_zero) / noise_variance;
 }
 
-[[nodiscard]] double log_sum_exp4(const std::array<double, 4>& values) noexcept {
+[[nodiscard]] double log_sum_exp(std::span<const double> values) noexcept {
     const auto max_value = *std::max_element(values.begin(), values.end());
     auto scaled_sum = 0.0;
     for (const auto value : values) {
@@ -167,49 +176,160 @@ constexpr std::array<std::array<std::uint8_t, 3>, 8> kQam64AxisBits{{
 [[nodiscard]] float axis_llr_exact(
     float value,
     std::size_t bit_index,
-    float noise_variance) noexcept {
+    float noise_variance, const QamDefinition& qam) noexcept {
     std::array<double, 4> zero_metrics{};
     std::array<double, 4> one_metrics{};
     std::size_t zero_count = 0;
     std::size_t one_count = 0;
 
-    for (std::size_t index = 0; index < kQam64Levels.size(); ++index) {
-        const auto delta = static_cast<double>(value) - static_cast<double>(kQam64Levels[index]);
+    for (std::size_t index = 0; index < qam.levels.size(); ++index) {
+        const auto delta = static_cast<double>(value) - static_cast<double>(qam.levels[index]);
         const auto metric = -(delta * delta) / static_cast<double>(noise_variance);
-        if (kQam64AxisBits[index][bit_index] == 0) {
+        if (((qam.axis_label(index) >> bit_index) & 1U) == 0) {
             zero_metrics[zero_count++] = metric;
         } else {
             one_metrics[one_count++] = metric;
         }
     }
 
-    return static_cast<float>(log_sum_exp4(zero_metrics) - log_sum_exp4(one_metrics));
+    return static_cast<float>(
+        log_sum_exp(std::span(zero_metrics).first(zero_count))
+        - log_sum_exp(std::span(one_metrics).first(one_count)));
 }
 
-void qam64_soft_demodulate_range(
+void qam32_llrs(float real, float imag, float noise_variance,
+                QamSoftDemapMethod method, float* output) noexcept {
+    if (method == QamSoftDemapMethod::log_sum_exp) {
+        std::array<double, 32> metrics{};
+        for (std::size_t label = 0; label < kQam32Points.size(); ++label) {
+            const auto di = static_cast<double>(real) - kQam32Points[label].real;
+            const auto dq = static_cast<double>(imag) - kQam32Points[label].imag;
+            metrics[label] = -(di * di + dq * dq) / noise_variance;
+        }
+        for (std::size_t bit = 0; bit < 5; ++bit) {
+            std::array<double, 16> zero{}, one{};
+            std::size_t n0 = 0, n1 = 0;
+            for (std::size_t label = 0; label < metrics.size(); ++label) {
+                if (((label >> bit) & 1U) == 0) zero[n0++] = metrics[label];
+                else one[n1++] = metrics[label];
+            }
+            output[bit] = static_cast<float>(log_sum_exp(zero) - log_sum_exp(one));
+        }
+        return;
+    }
+    std::array<float, 5> zero, one;
+    zero.fill(std::numeric_limits<float>::infinity());
+    one.fill(std::numeric_limits<float>::infinity());
+    for (std::size_t label = 0; label < kQam32Points.size(); ++label) {
+        const auto di = real - kQam32Points[label].real;
+        const auto dq = imag - kQam32Points[label].imag;
+        const auto distance = di * di + dq * dq;
+        for (std::size_t bit = 0; bit < 5; ++bit) {
+            auto& best = ((label >> bit) & 1U) == 0 ? zero[bit] : one[bit];
+            best = std::min(best, distance);
+        }
+    }
+    for (std::size_t bit = 0; bit < 5; ++bit) {
+        output[bit] = (one[bit] - zero[bit]) / noise_variance;
+    }
+}
+
+void qam_soft_demodulate_range(
     std::span<const float> interleaved_symbols,
     std::span<float> output_llr,
     float noise_variance,
     QamSoftDemapMethod method,
+    const QamDefinition& qam,
     std::size_t first_symbol,
     std::size_t last_symbol) {
     for (std::size_t symbol = first_symbol; symbol < last_symbol; ++symbol) {
         const auto real = interleaved_symbols[symbol * 2];
         const auto imag = interleaved_symbols[symbol * 2 + 1];
-        auto* out = output_llr.data() + symbol * 6;
-        for (std::size_t bit = 0; bit < 3; ++bit) {
+        auto* out = output_llr.data() + symbol * qam.bits_per_symbol;
+        if (qam.mode == QamMode::qam32) {
+            qam32_llrs(real, imag, noise_variance, method, out);
+            continue;
+        }
+        for (std::size_t bit = 0; bit < qam.axis_bits(); ++bit) {
             if (method == QamSoftDemapMethod::log_sum_exp) {
-                out[bit] = axis_llr_exact(real, bit, noise_variance);
-                out[3 + bit] = axis_llr_exact(imag, bit, noise_variance);
+                out[bit] = axis_llr_exact(real, bit, noise_variance, qam);
+                out[qam.axis_bits() + bit] = axis_llr_exact(imag, bit, noise_variance, qam);
             } else {
-                out[bit] = axis_llr(real, bit, noise_variance);
-                out[3 + bit] = axis_llr(imag, bit, noise_variance);
+                out[bit] = axis_llr(real, bit, noise_variance, qam);
+                out[qam.axis_bits() + bit] = axis_llr(imag, bit, noise_variance, qam);
             }
         }
     }
 }
 
 }  // namespace
+
+const QamDefinition& qam_definition(QamMode mode) {
+    switch (mode) {
+    case QamMode::qam16: return kQam16;
+    case QamMode::qam32: return kQam32;
+    case QamMode::qam64: return kQam64;
+    }
+    throw std::invalid_argument("QAM mode must be 16qam, 32qam or 64qam");
+}
+
+QamMode parse_qam_mode(std::string_view name) {
+    if (name == "16qam") return QamMode::qam16;
+    if (name == "32qam") return QamMode::qam32;
+    if (name == "64qam") return QamMode::qam64;
+    throw std::invalid_argument("QAM mode must be 16qam, 32qam or 64qam");
+}
+
+const char* qam_mode_name(QamMode mode) {
+    switch (qam_definition(mode).mode) {
+    case QamMode::qam16: return "16qam";
+    case QamMode::qam32: return "32qam";
+    case QamMode::qam64: return "64qam";
+    }
+    throw std::invalid_argument("invalid QAM mode");
+}
+
+std::size_t QamDefinition::nearest_level_index(float value) const noexcept {
+    // Lower level wins midpoint ties, including in the compatibility path.
+    if (mode == QamMode::qam32) {
+        for (std::size_t index = 0; index + 1 < levels.size(); ++index) {
+            if (value <= (levels[index] + levels[index + 1]) * 0.5F) return index;
+        }
+        return levels.size() - 1;
+    }
+    if (mode == QamMode::qam16) {
+        if (value <= -4.0F) return 0;
+        if (value <= 0.0F) return 1;
+        if (value <= 4.0F) return 2;
+        return 3;
+    }
+    if (value <= -6.0F) return 0;
+    if (value <= -4.0F) return 1;
+    if (value <= -2.0F) return 2;
+    if (value <= 0.0F) return 3;
+    if (value <= 2.0F) return 4;
+    if (value <= 4.0F) return 5;
+    if (value <= 6.0F) return 6;
+    return 7;
+}
+
+QamPoint QamDefinition::nearest_point(float real, float imag) const noexcept {
+    if (points_by_label.empty()) {
+        return {nearest_level(real), nearest_level(imag)};
+    }
+    auto best = points_by_label.front();
+    auto best_distance = std::numeric_limits<float>::infinity();
+    for (const auto point : points_by_label) {
+        const auto di = real - point.real;
+        const auto dq = imag - point.imag;
+        const auto distance = di * di + dq * dq;
+        if (distance < best_distance) {
+            best = point;
+            best_distance = distance;
+        }
+    }
+    return best;
+}
 
 std::size_t SymbolInterleaverSpec::max_branch_delay() const noexcept {
     return branch_count == 0 ? 0 : (branch_count - 1) * delay_step;
@@ -321,7 +441,7 @@ Version version() noexcept {
 }
 
 const char* build_info() noexcept {
-    return "dtmb-core-cpp 0.2.0";
+    return "dtmb-core-cpp 0.4.0";
 }
 
 Ci8PowerStats ci8_power_stats(
@@ -367,10 +487,12 @@ Ci8PowerStats ci8_power_stats(
     return finish_stats(merged, worker_count);
 }
 
-void qam64_soft_demodulate_cf32(
+void qam_soft_demodulate_cf32(
     std::span<const float> interleaved_symbols,
     std::span<float> output_llr,
+    QamMode mode,
     QamSoftDemapOptions options) {
+    const auto& qam = qam_definition(mode);
     if ((interleaved_symbols.size() % 2) != 0) {
         throw std::invalid_argument("CF32 input must contain interleaved real/imag pairs");
     }
@@ -379,7 +501,7 @@ void qam64_soft_demodulate_cf32(
     }
 
     const auto symbol_count = interleaved_symbols.size() / 2;
-    if (output_llr.size() < symbol_count * 6) {
+    if (symbol_count > output_llr.size() / qam.bits_per_symbol) {
         throw std::invalid_argument("output LLR span is too small");
     }
 
@@ -388,11 +510,12 @@ void qam64_soft_demodulate_cf32(
         return;
     }
     if (worker_count == 1) {
-        qam64_soft_demodulate_range(
+        qam_soft_demodulate_range(
             interleaved_symbols,
             output_llr,
             options.noise_variance,
             options.method,
+            qam,
             0,
             symbol_count);
         return;
@@ -404,11 +527,12 @@ void qam64_soft_demodulate_cf32(
         const auto first = (symbol_count * worker) / worker_count;
         const auto last = (symbol_count * (worker + 1)) / worker_count;
         workers.emplace_back([&, first, last] {
-            qam64_soft_demodulate_range(
+            qam_soft_demodulate_range(
                 interleaved_symbols,
                 output_llr,
                 options.noise_variance,
                 options.method,
+                qam,
                 first,
                 last);
         });
@@ -416,6 +540,13 @@ void qam64_soft_demodulate_cf32(
     for (auto& worker : workers) {
         worker.join();
     }
+}
+
+void qam64_soft_demodulate_cf32(
+    std::span<const float> interleaved_symbols,
+    std::span<float> output_llr,
+    QamSoftDemapOptions options) {
+    qam_soft_demodulate_cf32(interleaved_symbols, output_llr, QamMode::qam64, options);
 }
 
 }  // namespace dtmb::core

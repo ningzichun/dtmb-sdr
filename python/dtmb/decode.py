@@ -13,6 +13,14 @@ from typing import BinaryIO, Sequence
 
 SYMBOL_RATE = 7_560_000
 PROFILES = {
+    11: (1, "mode1"),
+    12: (1, "mode2"),
+    13: (2, "mode1"),
+    14: (2, "mode2"),
+    15: (3, "mode1"),
+    16: (3, "mode2"),
+    17: (3, "mode1"),
+    18: (3, "mode2"),
     19: (1, "mode1"),
     20: (1, "mode2"),
     21: (2, "mode1"),
@@ -45,8 +53,16 @@ def build_commands(args: argparse.Namespace) -> list[list[str]]:
     if args.input_rate <= 0:
         raise ValueError("--input-rate must be positive")
     if args.system_info_index not in PROFILES:
-        raise ValueError("--system-info-index must be 19..24")
+        raise ValueError("--system-info-index must be 11..16 (16QAM), 17..18 (32QAM) or 19..24 (64QAM)")
+    if args.pn_mode not in ("pn420", "pn595", "pn945"):
+        raise ValueError("--pn-mode must be pn420, pn595 or pn945")
+    if args.pn_mode == "pn595" and args.pn_schedule_tracking:
+        raise ValueError("PN595 uses fixed-sequence timing tracking, without cyclic PN schedule options")
     fec_rate, interleaver = PROFILES[args.system_info_index]
+    qam = "16qam" if args.system_info_index <= 16 else "32qam" if args.system_info_index <= 18 else "64qam"
+    codewords_per_group = {"16qam": 2, "32qam": 5, "64qam": 3}[qam]
+    if args.qam32_frame_phase != "auto" and qam != "32qam":
+        raise ValueError("--qam32-frame-phase requires a 32QAM profile")
     if not math.isfinite(args.resample_headroom_db) or not 0 <= args.resample_headroom_db <= 24:
         raise ValueError("--resample-headroom-db must be finite and in 0..24")
     if args.resample_headroom_db and args.input_rate == SYMBOL_RATE:
@@ -75,7 +91,7 @@ def build_commands(args: argparse.Namespace) -> list[list[str]]:
             "--auto-sync",
             "--sync-frames", "300",
             "--acquisition-frames", "16",
-            "--auto-phase-adjustment", "1" if args.input_rate == 20_000_000 else "0",
+            "--auto-phase-adjustment", "1" if args.input_rate == 20_000_000 and args.pn_mode == "pn945" and qam == "64qam" else "0",
             "--timing-search-radius", "2",
             "--timing-search-threshold", "0.45",
             "--timing-trajectory-interval-frames", "400",
@@ -91,13 +107,15 @@ def build_commands(args: argparse.Namespace) -> list[list[str]]:
             "8",
             "--pn-wideband-block-frames",
             "2",
-            "--pn-wideband-header-observation", "core-postfix",
+            "--pn-wideband-header-observation", "direct" if args.pn_mode == "pn595" else "core-postfix",
             "--pn-wideband-scale-estimator", "masked-frame-taps",
             "--pn-mmse",
             format(0.004 * resample_gain**2, ".9g"),
             "--remove-dc",
+            "--pn-mode", args.pn_mode,
+            "--qam", qam,
             "--normalization",
-            "qam64",
+            "qam64" if qam == "64qam" else "qam",
             "--system-info-index",
             str(args.system_info_index),
     ]
@@ -108,6 +126,7 @@ def build_commands(args: argparse.Namespace) -> list[list[str]]:
 
     demap = [
             str(_exe("dtmb_core_deinterleave_qam64", args.bin_dir)),
+            "--qam", qam,
             "--mode",
             interleaver,
             "--phase",
@@ -126,7 +145,7 @@ def build_commands(args: argparse.Namespace) -> list[list[str]]:
         "--alist",
         str((args.data_dir / f"dtmb_ldpc_rate{fec_rate}.alist").resolve()),
         "--codewords-per-frame",
-        "3",
+        str(codewords_per_group),
         "--workers",
         str(args.workers),
         "--ldpc-accel",
@@ -138,7 +157,10 @@ def build_commands(args: argparse.Namespace) -> list[list[str]]:
         "--retry-max-iterations", "50",
         "--attenuation", "0.65",
         "--clean-frames-only",
+        "--require-output",
     ]
+    if qam == "32qam":
+        fec.extend(["--qam", qam, "--qam32-frame-phase", args.qam32_frame_phase])
     if args.error_policy == "continue":
         fec.append("--insert-discontinuity-packets")
     else:
@@ -200,7 +222,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input", default="-", help="CI8 path or - for stdin")
     parser.add_argument("--input-rate", type=int, required=True)
     parser.add_argument("--output", default="-", help="MPEG-TS path or - for stdout")
-    parser.add_argument("--system-info-index", type=int, default=22)
+    parser.add_argument("--pn-mode", choices=("pn420", "pn595", "pn945"), default="pn945")
+    parser.add_argument("--system-info-index", type=int, choices=tuple(PROFILES), default=22,
+                        help="11..16: 16QAM; 17..18: 32QAM; 19..24: 64QAM (default 22)")
+    parser.add_argument("--qam32-frame-phase", choices=("auto", "0", "1"), default="auto",
+                        help="32QAM packing alignment: LDPC/BCH detection, or skip zero/one signal frame.")
     parser.add_argument("--acceleration", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--decode-batch-frames", type=int, default=256)
     parser.add_argument("--max-iterations", type=int, default=300)

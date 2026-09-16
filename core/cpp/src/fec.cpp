@@ -451,6 +451,16 @@ DtmbBchDecodeStats dtmb_bch_descramble_message_bits(
     std::span<std::uint8_t> output_bytes,
     bool correct,
     std::size_t scrambler_skip_bits) {
+    return dtmb_bch_descramble_message_bits(
+        ldpc_message_bits, output_bytes, correct, scrambler_skip_bits, 0);
+}
+
+DtmbBchDecodeStats dtmb_bch_descramble_message_bits(
+    std::span<const std::uint8_t> ldpc_message_bits,
+    std::span<std::uint8_t> output_bytes,
+    bool correct,
+    std::size_t scrambler_skip_bits,
+    std::size_t scrambler_reset_bits) {
     if (ldpc_message_bits.empty() || (ldpc_message_bits.size() % kBchCodeBits) != 0) {
         throw std::invalid_argument("LDPC message bits must contain whole BCH blocks");
     }
@@ -471,9 +481,11 @@ DtmbBchDecodeStats dtmb_bch_descramble_message_bits(
     stats.block_clean.assign(block_count, 1U);
     stats.block_corrected_errors.assign(block_count, 0U);
     auto scrambler = kScramblerInitialState;
+    if (scrambler_reset_bits != 0) scrambler_skip_bits %= scrambler_reset_bits;
     for (std::size_t bit = 0; bit < scrambler_skip_bits; ++bit) {
         (void)advance_scrambler(scrambler);
     }
+    auto scrambler_position = scrambler_skip_bits;
     std::size_t output_byte = 0;
     std::array<std::uint8_t, kBchCodeBits> codeword{};
     for (std::size_t block = 0; block < block_count; ++block) {
@@ -497,15 +509,67 @@ DtmbBchDecodeStats dtmb_bch_descramble_message_bits(
         for (std::size_t byte = 0; byte < kBchMessageBits / 8U; ++byte) {
             std::uint8_t decoded_byte = 0;
             for (std::size_t bit = 0; bit < 8U; ++bit) {
+                if (scrambler_reset_bits != 0 && scrambler_position == scrambler_reset_bits) {
+                    scrambler = kScramblerInitialState;
+                    scrambler_position = 0;
+                }
                 decoded_byte = static_cast<std::uint8_t>(
                     (decoded_byte << 1U)
                     | (decoded_codeword[byte * 8U + bit]
                        ^ advance_scrambler(scrambler)));
+                ++scrambler_position;
             }
             output_bytes[output_byte++] = decoded_byte;
         }
     }
     return stats;
+}
+
+Qam32FrameAlignment qam32_frame_alignment(
+    std::span<const float> transmitted_llr,
+    const LdpcSparseGraph& rate3_graph,
+    LdpcDecodeOptions options) {
+    constexpr std::size_t frame_bits = 3744 * 5;
+    constexpr std::size_t codeword_bits = 7488;
+    constexpr std::size_t punctured_bits = 5;
+    constexpr std::size_t parity_bits = 11 * 127;
+    constexpr std::size_t message_bits = 8 * kBchCodeBits;
+    if (transmitted_llr.size() < 2 * frame_bits) {
+        throw std::invalid_argument("32QAM frame alignment requires two complete signal frames");
+    }
+    if (rate3_graph.variable_count != codeword_bits + punctured_bits
+        || rate3_graph.check_count() != parity_bits) {
+        throw std::invalid_argument("32QAM frame alignment requires the DTMB rate-3 graph");
+    }
+    if (!std::all_of(transmitted_llr.begin(), transmitted_llr.end(),
+                     [](float value) { return std::isfinite(value); })) {
+        throw std::invalid_argument("32QAM frame alignment requires finite LLRs");
+    }
+    std::vector<float> llr(codeword_bits + punctured_bits, 0.0F);
+    std::vector<std::uint8_t> decoded(llr.size()), transport(8 * 94);
+    Qam32FrameAlignment result;
+    for (std::size_t phase = 0; phase < 2; ++phase) {
+        for (std::size_t word = 0; word < 2; ++word) {
+            const auto offset = phase * frame_bits + word * codeword_bits;
+            std::copy_n(transmitted_llr.data() + offset, codeword_bits,
+                        llr.data() + punctured_bits);
+            const auto ldpc = ldpc_decode_min_sum_sparse(llr, rate3_graph, decoded, options);
+            if (!ldpc.converged) continue;
+            const auto bch = dtmb_bch_descramble_message_bits(
+                std::span<const std::uint8_t>(decoded).subspan(parity_bits, message_bits),
+                transport);
+            result.clean_codewords[phase] += bch.unclean_blocks == 0 ? 1U : 0U;
+        }
+    }
+    const auto phase0 = result.clean_codewords[0] == 2;
+    const auto phase1 = result.clean_codewords[1] == 2;
+    if (phase0 == phase1) {
+        throw std::runtime_error(
+            "unable to lock 32QAM frame packing: two LDPC/BCH-clean codewords "
+            "are required at exactly one phase");
+    }
+    result.phase = phase1 ? 1 : 0;
+    return result;
 }
 
 }  // namespace dtmb::core

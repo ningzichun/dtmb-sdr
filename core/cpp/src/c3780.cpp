@@ -376,9 +376,10 @@ void fft_recursive(
 
 }  // namespace
 
-void qam64_normalize_cf32(
+void qam_normalize_cf32(
     std::span<const float> interleaved_symbols,
-    std::span<float> output_symbols) {
+    std::span<float> output_symbols, QamMode mode) {
+    const auto& qam = qam_definition(mode);
     if ((interleaved_symbols.size() % 2) != 0) {
         throw std::invalid_argument("CF32 input must contain interleaved real/imag pairs");
     }
@@ -404,7 +405,7 @@ void qam64_normalize_cf32(
         return;
     }
 
-    constexpr double average_power = 42.0;
+    const double average_power = qam.average_power;
     const auto scale = static_cast<float>(std::sqrt(observed_power / average_power));
     auto numerator = Complex{0.0F, 0.0F};
     double denominator = 0.0;
@@ -414,10 +415,8 @@ void qam64_normalize_cf32(
             interleaved_symbols[symbol * 2 + 1],
         };
         const auto corrected = value / std::max(scale, 1.0e-12F);
-        const auto nearest = Complex{
-            nearest_qam64_level(corrected.real()),
-            nearest_qam64_level(corrected.imag()),
-        };
+        const auto point = qam.nearest_point(corrected.real(), corrected.imag());
+        const auto nearest = Complex{point.real, point.imag};
         numerator += std::conj(nearest) * value;
         denominator += std::norm(nearest);
     }
@@ -443,9 +442,10 @@ void qam64_normalize_cf32(
     }
 }
 
-void qam64_normalize_amplitude_cf32(
+void qam_normalize_amplitude_cf32(
     std::span<const float> interleaved_symbols,
-    std::span<float> output_symbols) {
+    std::span<float> output_symbols, QamMode mode) {
+    const auto& qam = qam_definition(mode);
     if ((interleaved_symbols.size() % 2) != 0) {
         throw std::invalid_argument("CF32 input must contain interleaved real/imag pairs");
     }
@@ -471,7 +471,7 @@ void qam64_normalize_amplitude_cf32(
         return;
     }
 
-    constexpr double average_power = 42.0;
+    const double average_power = qam.average_power;
     const auto scale = static_cast<float>(std::sqrt(observed_power / average_power));
     const auto safe_scale = std::max(scale, 1.0e-12F);
     for (std::size_t symbol = 0; symbol < symbol_count; ++symbol) {
@@ -480,19 +480,36 @@ void qam64_normalize_amplitude_cf32(
     }
 }
 
-double c3780_qam64_frame_mse_cf32(std::span<const float> symbols) {
+double c3780_qam_frame_mse_cf32(std::span<const float> symbols, QamMode mode) {
+    const auto& qam = qam_definition(mode);
     if (symbols.size() != kC3780DataSymbols * 2) {
         throw std::invalid_argument("frame confidence requires 3744 CF32 data symbols");
     }
     double sum = 0.0;
-    for (const auto value : symbols) {
-        if (!std::isfinite(value)) {
+    for (std::size_t index = 0; index < symbols.size(); index += 2) {
+        const auto real = symbols[index], imag = symbols[index + 1];
+        if (!std::isfinite(real) || !std::isfinite(imag)) {
             throw std::invalid_argument("frame confidence requires finite symbols");
         }
-        const auto error = static_cast<double>(value) - nearest_qam64_level(value);
-        sum += error * error;
+        const auto point = qam.nearest_point(real, imag);
+        const auto di = static_cast<double>(real) - point.real;
+        const auto dq = static_cast<double>(imag) - point.imag;
+        sum += di * di;
+        sum += dq * dq;
     }
     return sum / static_cast<double>(kC3780DataSymbols);
+}
+
+void qam64_normalize_cf32(std::span<const float> input, std::span<float> output) {
+    qam_normalize_cf32(input, output, QamMode::qam64);
+}
+
+void qam64_normalize_amplitude_cf32(std::span<const float> input, std::span<float> output) {
+    qam_normalize_amplitude_cf32(input, output, QamMode::qam64);
+}
+
+double c3780_qam64_frame_mse_cf32(std::span<const float> symbols) {
+    return c3780_qam_frame_mse_cf32(symbols, QamMode::qam64);
 }
 
 C3780Qam64IntegerTimingResult c3780_qam64_integer_timing_correct_cf32(
@@ -702,6 +719,13 @@ void c3780_extract_data_symbols_cf32(
             interleaved_data_symbols.first(kC3780DataSymbols * 2),
             interleaved_data_symbols.first(kC3780DataSymbols * 2));
     }
+}
+
+void c3780_extract_data_symbols_cf32(
+    std::span<const float> body, std::span<float> data, QamMode mode) {
+    c3780_extract_data_symbols_cf32(body, data, false);
+    qam_normalize_cf32(data.first(kC3780DataSymbols * 2),
+                       data.first(kC3780DataSymbols * 2), mode);
 }
 
 }  // namespace dtmb::core

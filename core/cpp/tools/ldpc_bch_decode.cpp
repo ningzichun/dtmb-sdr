@@ -56,6 +56,7 @@ void usage(const char* program) {
     std::cerr
         << "usage: " << program
         << " --fec-rate 1|2|3 --alist PATH [--codewords-per-frame N]"
+        << " [--qam 16qam|32qam|64qam] [--qam32-frame-phase auto|0|1]"
         << " [--workers N] [--max-iterations N] [--retry-max-iterations N]"
         << " [--attenuation X] [--llr-clip X]"
         << " [--ldpc-accel cpu|cuda]"
@@ -90,7 +91,7 @@ void usage(const char* program) {
         << " [--decode-batch-frames N]"
         << " [--score-initial-syndrome]"
         << " [--early-syndrome-reject-ratio off|X]"
-        << " [--clean-frames-only] [--fail-on-unclean-frame] [--mark-discontinuities]"
+        << " [--require-output] [--clean-frames-only] [--fail-on-unclean-frame] [--mark-discontinuities]"
         << " [--emit-clean-codewords]"
         << " [--emit-bch-clean-codewords]"
         << " [--emit-bch-clean-packets]"
@@ -2570,6 +2571,9 @@ bool has_transmitted_llr_evidence(
 int main(int argc, char** argv) {
     std::size_t fec_rate = 0;
     std::size_t codewords_per_frame = 3;
+    bool codewords_per_frame_explicit = false;
+    std::optional<dtmb::core::QamMode> qam_mode;
+    std::string qam32_frame_phase = "auto";
     std::size_t requested_workers = 0;
     std::string alist_path;
     std::string input_path = "-";
@@ -2583,6 +2587,7 @@ int main(int argc, char** argv) {
     auto ldpc_accel = LdpcAccel::cpu;
     std::size_t decode_batch_frames = 16;
     bool clean_frames_only = false;
+    bool require_output = false;
     bool fail_on_unclean_frame = false;
     bool emit_clean_codewords = false;
     bool emit_bch_clean_codewords = false;
@@ -2654,6 +2659,13 @@ int main(int argc, char** argv) {
                     return 2;
                 }
                 codewords_per_frame = parse_size(argv[index], "codewords per frame");
+                codewords_per_frame_explicit = true;
+            } else if (arg == "--qam") {
+                if (++index >= argc) { usage(argv[0]); return 2; }
+                qam_mode = dtmb::core::parse_qam_mode(argv[index]);
+            } else if (arg == "--qam32-frame-phase") {
+                if (++index >= argc) { usage(argv[0]); return 2; }
+                qam32_frame_phase = argv[index];
             } else if (arg == "--workers") {
                 if (++index >= argc) {
                     usage(argv[0]);
@@ -2899,6 +2911,8 @@ int main(int argc, char** argv) {
                     value == "off" || value == "none"
                         ? -1.0F
                         : parse_float(value, "early syndrome reject ratio");
+            } else if (arg == "--require-output") {
+                require_output = true;
             } else if (arg == "--clean-frames-only") {
                 clean_frames_only = true;
             } else if (arg == "--fail-on-unclean-frame") {
@@ -3006,6 +3020,33 @@ int main(int argc, char** argv) {
                 return 0;
             } else {
                 positional.push_back(arg);
+            }
+        }
+        if (qam_mode.has_value()) {
+            const auto expected = dtmb::core::qam_definition(*qam_mode).codewords_per_fec_group();
+            if (codewords_per_frame_explicit && codewords_per_frame != expected) {
+                throw std::invalid_argument("--codewords-per-frame conflicts with --qam FEC grouping");
+            }
+            codewords_per_frame = expected;
+        }
+        const bool qam32 = qam_mode == dtmb::core::QamMode::qam32;
+        if (qam32 && fec_rate != 3) {
+            throw std::invalid_argument("32QAM requires DTMB FEC rate 3");
+        }
+        if (qam32_frame_phase != "auto" && qam32_frame_phase != "0" && qam32_frame_phase != "1") {
+            throw std::invalid_argument("32QAM frame phase must be auto, 0 or 1");
+        }
+        if (!qam32 && qam32_frame_phase != "auto") {
+            throw std::invalid_argument("--qam32-frame-phase requires --qam 32qam");
+        }
+        if (qam32) {
+            for (int index = 1; index < argc; ++index) {
+                const auto arg = std::string_view(argv[index]);
+                if (arg == "--retry-qam-plane" || arg.starts_with("--retry-branch-")
+                    || arg.starts_with("--retry-mode2-source-") || arg.starts_with("--select-mode2-source-")
+                    || arg.starts_with("--retry-final-failed-syndrome-solve-ts")) {
+                    throw std::invalid_argument(std::string(arg) + " does not support 32QAM packing");
+                }
             }
         }
         if (fec_rate == 0 || alist_path.empty() || codewords_per_frame == 0 || positional.size() > 2) {
@@ -3378,6 +3419,8 @@ int main(int argc, char** argv) {
         std::vector<float> transmitted_llr(frame_llr_count);
         const auto frame_transport_bytes =
             codewords_per_frame * profile.output_bytes_per_codeword();
+        const std::size_t signal_frames_per_fec_group = qam32 ? 2 : 1;
+        const auto scrambler_reset_bits = qam32 ? frame_transport_bytes * 8 / 2 : 0;
         const auto codeword_transport_bytes = profile.output_bytes_per_codeword();
         if ((codeword_transport_bytes % kTsPacketSize) != 0) {
             throw std::runtime_error(
@@ -3395,6 +3438,37 @@ int main(int argc, char** argv) {
             }
         }
         const auto frame_bytes = static_cast<std::streamsize>(frame_llr_count * sizeof(float));
+
+        // The two possible 32QAM packing phases share the same symbol-frame
+        // boundary. Acquire from a bounded prefix, then replay every retained
+        // LLR through the ordinary CPU/CUDA decoder without seeking.
+        std::vector<float> packing_prefix;
+        std::size_t packing_prefix_offset = 0;
+        std::size_t packing_discarded_signal_frames = 0;
+        if (qam32) {
+            packing_prefix.resize(frame_llr_count);
+            input.read(reinterpret_cast<char*>(packing_prefix.data()), frame_bytes);
+            if (input.gcount() != frame_bytes) {
+                throw std::runtime_error("LLR input ended before two complete 32QAM signal frames");
+            }
+            if (!std::all_of(packing_prefix.begin(), packing_prefix.end(),
+                             [](float value) { return std::isfinite(value); })) {
+                throw std::runtime_error("LLR input contains a nonfinite value");
+            }
+            if (qam32_frame_phase == "auto") {
+                const auto alignment = dtmb::core::qam32_frame_alignment(packing_prefix, graph, decode_options);
+                packing_discarded_signal_frames = alignment.phase;
+                std::cerr << "qam32_phase0_clean_codewords=" << alignment.clean_codewords[0] << '\n'
+                          << "qam32_phase1_clean_codewords=" << alignment.clean_codewords[1] << '\n';
+            } else {
+                packing_discarded_signal_frames = qam32_frame_phase == "1" ? 1 : 0;
+            }
+            packing_prefix_offset = packing_discarded_signal_frames * (frame_llr_count / 2);
+            std::cerr << "qam32_frame_phase=" << packing_discarded_signal_frames << '\n'
+                      << "qam32_frame_phase_selection=" << (qam32_frame_phase == "auto" ? "auto" : "explicit") << '\n'
+                      << "packing_discarded_signal_frames=" << packing_discarded_signal_frames << '\n'
+                      << "packing_discarded_llrs=" << packing_prefix_offset << '\n';
+        }
 
         std::size_t frame_count = 0;
         std::size_t codeword_count = 0;
@@ -4378,7 +4452,8 @@ int main(int argc, char** argv) {
                                 candidate_message,
                                 candidate_transport,
                                 true,
-                                codeword * codeword_transport_bytes * 8U);
+                                codeword * codeword_transport_bytes * 8U,
+                                scrambler_reset_bits);
                         if (bch.unclean_blocks != 0U) {
                             continue;
                         }
@@ -4547,7 +4622,8 @@ int main(int argc, char** argv) {
                                 candidate_message,
                                 candidate_transport,
                                 true,
-                                codeword * codeword_transport_bytes * 8U);
+                                codeword * codeword_transport_bytes * 8U,
+                                scrambler_reset_bits);
                         };
                         auto baseline_bch_clean = false;
                         if (decoded_frame.results[codeword].converged) {
@@ -4933,7 +5009,7 @@ int main(int argc, char** argv) {
                 auto& decoded_frame = decoded[frame];
                 decoded_frame.bch = dtmb::core::dtmb_bch_descramble_message_bits(
                     decoded_frame.message_bits,
-                    decoded_frame.transport_bytes);
+                    decoded_frame.transport_bytes, true, 0, scrambler_reset_bits);
                 const auto bch_blocks_per_codeword =
                     decoded_frame.bch.block_count / codewords_per_frame;
                 if (bch_blocks_per_codeword * codewords_per_frame
@@ -5107,7 +5183,8 @@ int main(int argc, char** argv) {
                             candidate_message,
                             candidate_transport,
                             true,
-                            codeword * codeword_transport_bytes * 8U);
+                            codeword * codeword_transport_bytes * 8U,
+                            scrambler_reset_bits);
                     };
                     const auto accept_solution = [&](
                         std::span<const std::uint8_t> bits) {
@@ -5713,8 +5790,16 @@ int main(int argc, char** argv) {
         };
 
         while (true) {
-            input.read(reinterpret_cast<char*>(transmitted_llr.data()), frame_bytes);
-            const auto bytes_read = input.gcount();
+            const auto prefix_count = packing_prefix.size() - packing_prefix_offset;
+            if (prefix_count != 0) {
+                std::copy_n(packing_prefix.data() + packing_prefix_offset, prefix_count, transmitted_llr.data());
+                packing_prefix_offset += prefix_count;
+            }
+            auto bytes_read = static_cast<std::streamsize>(prefix_count * sizeof(float));
+            if (bytes_read < frame_bytes) {
+                input.read(reinterpret_cast<char*>(transmitted_llr.data() + prefix_count), frame_bytes - bytes_read);
+                bytes_read += input.gcount();
+            }
             if (bytes_read == 0) {
                 if (input.bad()) {
                     throw std::runtime_error("failed to read LLR input stream");
@@ -5722,6 +5807,9 @@ int main(int argc, char** argv) {
                 break;
             }
             if (bytes_read != frame_bytes) {
+                // A trailing half-group must fail without losing earlier
+                // complete groups still waiting in a large decode batch.
+                if (qam32) flush_pending_frames();
                 throw std::runtime_error("LLR input ended before a complete DTMB FEC frame");
             }
             if (!std::all_of(
@@ -5887,6 +5975,10 @@ int main(int argc, char** argv) {
         flush_pending_frames();
 
         std::cerr << "frames=" << frame_count << '\n'
+                  << "signal_frames_per_fec_group=" << signal_frames_per_fec_group << '\n'
+                  << "codewords_per_fec_group=" << codewords_per_frame << '\n'
+                  << "signal_frames=" << frame_count * signal_frames_per_fec_group << '\n'
+                  << "scrambler_reset_bits=" << scrambler_reset_bits << '\n'
                   << "frame_index_offset=" << frame_index_offset << '\n'
                   << "codewords=" << codeword_count << '\n'
                   << "worker_count=" << worker_count << '\n'
@@ -5939,6 +6031,7 @@ int main(int argc, char** argv) {
                   << "bch_corrected_errors=" << bch_corrected_errors << '\n'
                   << "bch_unclean_blocks=" << bch_unclean_blocks << '\n'
                   << "clean_frames=" << clean_frame_count << '\n'
+                  << "clean_signal_frames=" << clean_frame_count * signal_frames_per_fec_group << '\n'
                   << "emitted_frames=" << emitted_frame_count << '\n'
                   << "partial_emitted_frames=" << partial_emitted_frame_count << '\n'
                   << "omitted_frames=" << omitted_frame_count << '\n'
@@ -6081,6 +6174,9 @@ int main(int argc, char** argv) {
                   << "soft_decoded_frames=" << soft_decoded_frames << '\n'
                   << "output_packets=" << output_packet_count << '\n'
                   << "output_bytes=" << output_byte_count << '\n';
+        if (require_output && output_byte_count == 0) {
+            throw std::runtime_error("no transport bytes recovered (empty output is not a successful decode)");
+        }
         return 0;
     } catch (const std::exception& exc) {
         std::cerr << "dtmb_core_ldpc_bch_decode: " << exc.what() << '\n';

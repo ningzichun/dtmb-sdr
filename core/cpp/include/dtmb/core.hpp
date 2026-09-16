@@ -1,8 +1,11 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <stdexcept>
+#include <string_view>
 #include <vector>
 
 namespace dtmb::core {
@@ -28,6 +31,96 @@ struct Ci8PowerStatsOptions {
     std::size_t requested_workers = 0;
     std::size_t min_parallel_samples = 1U << 20U;
 };
+
+enum class QamMode { qam16 = 16, qam32 = 32, qam64 = 64 };
+
+enum class PnMode { pn420 = 420, pn595 = 595, pn945 = 945 };
+
+struct PnDefinition {
+    PnMode mode;
+    std::size_t header_symbols;
+    // For PN595 this is the complete fixed reference, not a cyclic core.
+    std::size_t core_symbols;
+    std::size_t prefix_symbols;
+    std::size_t suffix_symbols;
+    std::size_t frames_per_superframe;
+    float header_to_body_power_ratio;
+    std::string_view seed;
+    std::array<std::size_t, 4> recurrence_taps;
+    std::size_t recurrence_tap_count;
+
+    [[nodiscard]] constexpr bool cyclic_extension() const noexcept { return prefix_symbols != 0; }
+    [[nodiscard]] constexpr std::size_t frame_symbols() const noexcept { return header_symbols + 3780; }
+    [[nodiscard]] constexpr std::size_t phase_count() const noexcept {
+        return cyclic_extension() ? core_symbols : 1;
+    }
+    [[nodiscard]] constexpr std::size_t default_channel_span() const noexcept {
+        return cyclic_extension() ? prefix_symbols : (header_symbols + 1) / 4;
+    }
+};
+
+// GB 20600-2006 sections 4.6.2.1--3. Recurrences use the appendix bit order.
+inline constexpr PnDefinition kPn420Definition{
+    PnMode::pn420, 420, 255, 82, 83, 225, 2.0F, "10110000", {0, 2, 3, 7}, 4};
+inline constexpr PnDefinition kPn595Definition{
+    PnMode::pn595, 595, 595, 0, 0, 216, 1.0F, "0000000001", {0, 7, 0, 0}, 2};
+inline constexpr PnDefinition kPn945Definition{
+    PnMode::pn945, 945, 511, 217, 217, 200, 2.0F, "111110111", {0, 1, 2, 7}, 4};
+
+[[nodiscard]] constexpr const PnDefinition& pn_definition(PnMode mode) {
+    switch (mode) {
+    case PnMode::pn420: return kPn420Definition;
+    case PnMode::pn595: return kPn595Definition;
+    case PnMode::pn945: return kPn945Definition;
+    }
+    throw std::invalid_argument("PN mode must be pn420, pn595 or pn945");
+}
+
+[[nodiscard]] PnMode parse_pn_mode(std::string_view name);
+[[nodiscard]] const char* pn_mode_name(PnMode mode);
+// Unscaled phase-zero reference chips, 0 -> +1 and 1 -> -1.
+[[nodiscard]] std::span<const std::int8_t> pn_reference_chips(PnMode mode);
+void pn_header_symbols_cf32(PnMode mode, std::span<float> output, std::size_t phase = 0);
+
+struct QamPoint {
+    float real;
+    float imag;
+};
+
+struct QamDefinition {
+    QamMode mode;
+    std::size_t bits_per_symbol;
+    float average_power;
+    std::span<const float> levels;
+    // Cross constellations are indexed by the transmitted b0-first label.
+    std::span<const QamPoint> points_by_label = {};
+
+    [[nodiscard]] std::size_t axis_bits() const {
+        if (bits_per_symbol % 2 != 0) {
+            throw std::invalid_argument("cross QAM does not have independent bit axes");
+        }
+        return bits_per_symbol / 2;
+    }
+    [[nodiscard]] std::size_t signal_frames_per_fec_group() const noexcept {
+        return bits_per_symbol % 2 == 0 ? 1 : 2;
+    }
+    [[nodiscard]] std::size_t codewords_per_fec_group() const noexcept {
+        return bits_per_symbol * signal_frames_per_fec_group() / 2;
+    }
+    // GB 20600 reflected Gray label, transmitted least-significant bit first.
+    [[nodiscard]] static std::size_t axis_label(std::size_t level) noexcept {
+        return level ^ (level >> 1U);
+    }
+    [[nodiscard]] std::size_t nearest_level_index(float value) const noexcept;
+    [[nodiscard]] float nearest_level(float value) const noexcept {
+        return levels[nearest_level_index(value)];
+    }
+    [[nodiscard]] QamPoint nearest_point(float real, float imag) const noexcept;
+};
+
+[[nodiscard]] const QamDefinition& qam_definition(QamMode mode);
+[[nodiscard]] QamMode parse_qam_mode(std::string_view name);
+[[nodiscard]] const char* qam_mode_name(QamMode mode);
 
 enum class QamSoftDemapMethod {
     max_log,
@@ -181,8 +274,8 @@ struct Pn945ResidualCfoResult {
 inline constexpr std::size_t kC3780FrameBodySymbols = 3780;
 inline constexpr std::size_t kC3780SystemInfoSymbols = 36;
 inline constexpr std::size_t kC3780DataSymbols = 3744;
-inline constexpr std::size_t kPn945HeaderSymbols = 945;
-inline constexpr std::size_t kPn945FrameSymbols = 4725;
+inline constexpr std::size_t kPn945HeaderSymbols = kPn945Definition.header_symbols;
+inline constexpr std::size_t kPn945FrameSymbols = kPn945Definition.frame_symbols();
 inline constexpr std::size_t kDtmbSymbolRateSps = 7'560'000;
 
 struct LdpcSparseGraph {
@@ -365,11 +458,53 @@ private:
     std::span<std::uint8_t> output_bytes,
     bool correct = true,
     std::size_t scrambler_skip_bits = 0);
+// Periodic resets are measured in transport bits. 32QAM resets every 20 BCH
+// payload blocks (15040 bits), including within codeword 2 of a five-word group.
+[[nodiscard]] DtmbBchDecodeStats dtmb_bch_descramble_message_bits(
+    std::span<const std::uint8_t> ldpc_message_bits,
+    std::span<std::uint8_t> output_bytes,
+    bool correct,
+    std::size_t scrambler_skip_bits,
+    std::size_t scrambler_reset_bits);
+
+struct Qam32FrameAlignment {
+    std::size_t phase = 0;
+    std::array<std::size_t, 2> clean_codewords{};
+};
+
+// A two-signal-frame prefix contains two complete codewords at either possible
+// packing phase. Lock only when one phase passes LDPC and BCH on both words.
+// This is acquisition only: every emitted FEC group still passes its own gates.
+[[nodiscard]] Qam32FrameAlignment qam32_frame_alignment(
+    std::span<const float> transmitted_llr,
+    const LdpcSparseGraph& rate3_graph,
+    LdpcDecodeOptions options = {});
 
 [[nodiscard]] Ci8PowerStats ci8_power_stats(
     std::span<const std::int8_t> interleaved_iq,
     Ci8PowerStatsOptions options = {});
 
+// Per-symbol output is b0-first; a positive LLR means bit zero.
+void qam_soft_demodulate_cf32(
+    std::span<const float> interleaved_symbols,
+    std::span<float> output_llr,
+    QamMode mode,
+    QamSoftDemapOptions options = {});
+
+void qam_normalize_cf32(
+    std::span<const float> interleaved_symbols,
+    std::span<float> output_symbols,
+    QamMode mode);
+
+void qam_normalize_amplitude_cf32(
+    std::span<const float> interleaved_symbols,
+    std::span<float> output_symbols,
+    QamMode mode);
+
+[[nodiscard]] double c3780_qam_frame_mse_cf32(
+    std::span<const float> interleaved_data_symbols, QamMode mode);
+
+// Compatibility entry points preserve the existing 64QAM API and ABI.
 void qam64_soft_demodulate_cf32(
     std::span<const float> interleaved_symbols,
     std::span<float> output_llr,
@@ -412,6 +547,11 @@ void c3780_extract_data_symbols_cf32(
     std::span<float> interleaved_data_symbols,
     bool normalize_qam64 = true);
 
+void c3780_extract_data_symbols_cf32(
+    std::span<const float> interleaved_time_body,
+    std::span<float> interleaved_data_symbols,
+    QamMode mode);
+
 [[nodiscard]] Pn945AcquisitionResult acquire_pn945_cf32(
     std::span<const float> interleaved_symbols,
     Pn945AcquisitionOptions options = {});
@@ -450,5 +590,49 @@ void c3780_extract_data_symbols_cf32(
     const Pn945WidebandChannelModel& model,
     std::size_t model_frame_index,
     Pn945EqualizeOptions options = {});
+
+// Generic names share the established option/result layouts. The PN945 entry
+// points above remain available for source and binary compatibility.
+using PnAcquisitionOptions = Pn945AcquisitionOptions;
+using PnAcquisitionResult = Pn945AcquisitionResult;
+using PnResidualCfoOptions = Pn945ResidualCfoOptions;
+using PnResidualCfoResult = Pn945ResidualCfoResult;
+using PnScheduleAlignment = Pn945ScheduleAlignment;
+using PnEqualizeOptions = Pn945EqualizeOptions;
+using PnEqualizeResult = Pn945EqualizeResult;
+using PnWidebandScaleEstimator = Pn945WidebandScaleEstimator;
+using PnHeaderObservation = Pn945HeaderObservation;
+using PnWidebandModelOptions = Pn945WidebandModelOptions;
+using PnWidebandChannelModel = Pn945WidebandChannelModel;
+
+[[nodiscard]] PnAcquisitionResult acquire_pn_cf32(
+    PnMode mode, std::span<const float> symbols, PnAcquisitionOptions options = {});
+// Cyclic-extension similarity or fixed-sequence direct correlation, by mode.
+[[nodiscard]] float pn_header_metric_ci8(PnMode mode, std::span<const std::int8_t> header);
+// PN595 uses direct correlation of its fixed reference; it has only phase zero.
+[[nodiscard]] std::size_t pn_detect_phase_cf32(PnMode mode, std::span<const float> header);
+[[nodiscard]] float pn_known_phase_metric_ci8(
+    PnMode mode, std::span<const std::int8_t> header, std::size_t phase = 0);
+[[nodiscard]] std::size_t pn_phase_for_frame(PnMode mode, std::size_t superframe_index);
+// Only cyclic modes carry a PN phase schedule; PN595 cannot identify a superframe origin.
+[[nodiscard]] PnScheduleAlignment fit_pn_phase_schedule(
+    PnMode mode, std::span<const std::size_t> observed_phases);
+[[nodiscard]] PnResidualCfoResult estimate_pn_residual_cfo_cf32(
+    PnMode mode, std::span<const float> symbols, std::size_t phase_offset,
+    PnResidualCfoOptions options = {});
+[[nodiscard]] PnEqualizeResult pn_equalize_c3780_frame_cf32(
+    PnMode mode, std::span<const float> header, std::span<const float> body,
+    std::span<const float> next_header, std::span<float> spectrum,
+    PnEqualizeOptions options = {});
+[[nodiscard]] PnWidebandChannelModel build_pn_wideband_channel_model_cf32(
+    PnMode mode, std::span<const float> headers, PnWidebandModelOptions options = {});
+[[nodiscard]] PnEqualizeResult pn_equalize_c3780_frame_wideband_cf32(
+    PnMode mode, std::span<const float> header, std::span<const float> body,
+    std::span<const float> next_header, std::span<float> spectrum,
+    const PnWidebandChannelModel& model, PnEqualizeOptions options = {});
+[[nodiscard]] PnEqualizeResult pn_equalize_c3780_frame_wideband_cached_cf32(
+    PnMode mode, std::span<const float> body, std::span<const float> next_header,
+    std::span<float> spectrum, const PnWidebandChannelModel& model,
+    std::size_t model_frame_index, PnEqualizeOptions options = {});
 
 }  // namespace dtmb::core
