@@ -1,6 +1,6 @@
-cmake_minimum_required(VERSION 3.20)
+﻿cmake_minimum_required(VERSION 3.20)
 
-project(dtmb_core VERSION 0.4.0 LANGUAGES C CXX)
+project(dtmb_core VERSION 0.4.1 LANGUAGES C CXX)
 
 option(DTMB_CORE_BUILD_TESTS "Build dtmb-core tests" ON)
 option(DTMB_CORE_ENABLE_CUDA_LDPC "Build the optional CUDA LDPC backend" OFF)
@@ -18,10 +18,12 @@ endif()
 add_library(dtmb_core
   src/c3780.cpp
   src/core.cpp
+  src/nr.cpp
   src/fec.cpp
   src/frame_sync.cpp
   src/pn_channel.cpp
   src/resampler.cpp
+  src/iq.cpp
   src/transport.cpp
 )
 add_library(dtmb::core ALIAS dtmb_core)
@@ -104,6 +106,9 @@ install(TARGETS
 
 if(DTMB_CORE_BUILD_TESTS)
   enable_testing()
+  add_executable(dtmb_nr_tests tests/test_nr.cpp)
+  target_link_libraries(dtmb_nr_tests PRIVATE dtmb::core)
+  add_test(NAME dtmb_nr_tests COMMAND dtmb_nr_tests "${CMAKE_CURRENT_SOURCE_DIR}/tests/nr_appendix_c.txt")
   add_executable(dtmb_pn_tests tests/test_pn.cpp)
   target_link_libraries(dtmb_pn_tests PRIVATE dtmb::core)
   add_test(NAME dtmb_pn_tests COMMAND dtmb_pn_tests)

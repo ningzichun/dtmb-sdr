@@ -1,6 +1,7 @@
 #include "dtmb/core.hpp"
 
 #include "binary_stdio.hpp"
+#include "nr_stream.hpp"
 
 #include <algorithm>
 #include <array>
@@ -444,7 +445,7 @@ struct DdLlrConfidenceStats {
 
 void usage(const char* program) {
     std::cerr
-        << "usage: " << program << " [--qam 16qam|32qam|64qam]"
+        << "usage: " << program << " [--qam 4qam-nr|4qam|16qam|32qam|64qam]"
         << " --mode mode1|mode2 [--phase N] [--keep-latency]"
         << " [--workers N] [--min-parallel-symbols N] [--chunk-symbols N]"
         << " [--branch-gain-branches CSV]"
@@ -5695,6 +5696,20 @@ int main(int argc, char** argv) {
             usage(argv[0]);
             return 2;
         }
+        if (qam_mode == dtmb::core::QamMode::qam4_nr) {
+            // Symbol-domain calibration and output selectors cannot be applied
+            // after NR decoding: each soft bit combines eight source symbols.
+            constexpr std::array<std::string_view, 12> supported{
+                "--qam", "--mode", "--phase", "--keep-latency", "--workers",
+                "--min-parallel-symbols", "--chunk-symbols", "--noise-variance",
+                "--soft-demod-method", "--csi-weights", "--source-frame-confidence",
+                "--source-frame-mse-weighting"};
+            for (int index = 1; index < argc; ++index) {
+                const auto arg = std::string_view(argv[index]);
+                if (arg.starts_with("--") && std::find(supported.begin(), supported.end(), arg) == supported.end())
+                    throw std::invalid_argument(std::string(arg) + " is not supported for 4QAM-NR bit interleaving");
+            }
+        }
         if (source_frame_mse_weighting && source_frame_inverse_mse_weighting) {
             throw std::invalid_argument("binary and inverse-MSE source confidence are mutually exclusive");
         }
@@ -5979,6 +5994,11 @@ int main(int argc, char** argv) {
                 throw std::runtime_error(
                     "failed to open CSI weights input: " + csi_weights_path);
             }
+        }
+        if (qam_mode == dtmb::core::QamMode::qam4_nr) {
+            return dtmb::tools::run_nr_demapper(input, output, demap_options, chunk_symbols,
+                mode, phase, keep_latency, csi_weights_input.is_open() ? &csi_weights_input : nullptr,
+                source_frame_mse_weighting, source_frame_inverse_mse_weighting);
         }
         std::unique_ptr<std::ofstream> symbols_output_file;
         std::ostream* symbols_output = nullptr;

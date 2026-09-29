@@ -1,6 +1,7 @@
 #include "dtmb/core.hpp"
 
 #include "binary_stdio.hpp"
+#include "nr_stream.hpp"
 
 #include <cstddef>
 #include <cstdlib>
@@ -19,7 +20,7 @@ constexpr std::size_t kFloatsPerSymbol = 2;
 
 void usage(const char* program) {
     std::cerr
-        << "usage: " << program << " [--qam 16qam|32qam|64qam]"
+        << "usage: " << program << " [--qam 4qam-nr|4qam|16qam|32qam|64qam]"
         << " [--workers N] [--min-parallel-symbols N] [--chunk-symbols N]"
         << " [--noise-variance X] [--soft-demod-method max-log|log-sum-exp]"
         << " [input.cf32|-] [output.llr.f32|-]\n";
@@ -157,6 +158,9 @@ int main(int argc, char** argv) {
         std::unique_ptr<std::ofstream> output_file;
         auto& input = input_stream(input_path, input_file);
         auto& output = output_stream(output_path, output_file);
+
+        if (qam_mode == dtmb::core::QamMode::qam4_nr)
+            return dtmb::tools::run_nr_demapper(input, output, options, chunk_symbols);
 
         std::vector<float> input_chunk(chunk_symbols * kFloatsPerSymbol);
         std::vector<float> output_chunk(chunk_symbols * dtmb::core::qam_definition(qam_mode).bits_per_symbol);

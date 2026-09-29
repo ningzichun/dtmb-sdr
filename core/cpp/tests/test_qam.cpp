@@ -81,6 +81,22 @@ void check_32qam() {
 
 int main() {
     check_32qam();
+    const auto& qam4 = qam_definition(parse_qam_mode("4qam"));
+    assert(qam4.bits_per_symbol == 2 && qam4.average_power == 40.5F);
+    assert(qam4.signal_frames_per_fec_group() == 1 && qam4.codewords_per_fec_group() == 1);
+    constexpr std::array<float, 8> four_points{-4.5F, -4.5F, 4.5F, -4.5F,
+                                                 -4.5F, 4.5F, 4.5F, 4.5F};
+    for (auto method : {QamSoftDemapMethod::max_log, QamSoftDemapMethod::log_sum_exp}) {
+        QamSoftDemapOptions options;
+        options.method = method;
+        std::array<float, 8> llr{};
+        qam_soft_demodulate_cf32(four_points, llr, QamMode::qam4, options);
+        for (std::size_t n = 0; n < 4; ++n) {
+            assert((llr[n * 2] < 0) == (four_points[n * 2] > 0));
+            assert((llr[n * 2 + 1] < 0) == (four_points[n * 2 + 1] > 0));
+        }
+        assert(qam4.nearest_level(0.0F) == -4.5F);
+    }
     const auto& qam = qam_definition(QamMode::qam16);
     assert(qam.bits_per_symbol == 4 && qam.average_power == 40.0F);
     // Independent ascending-level Gray labels, with b0 transmitted first.
@@ -121,7 +137,7 @@ int main() {
     assert(midpoint_llr[0] == -32 && midpoint_llr[1] == 0);
     assert(midpoint_llr[2] == -32 && midpoint_llr[3] == 0);
 
-    for (auto mode : {QamMode::qam16, QamMode::qam32, QamMode::qam64}) {
+    for (auto mode : {QamMode::qam4, QamMode::qam16, QamMode::qam32, QamMode::qam64}) {
         const auto& definition = qam_definition(mode);
         std::vector<float> points;
         if (!definition.points_by_label.empty()) {

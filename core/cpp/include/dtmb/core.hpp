@@ -32,7 +32,7 @@ struct Ci8PowerStatsOptions {
     std::size_t min_parallel_samples = 1U << 20U;
 };
 
-enum class QamMode { qam16 = 16, qam32 = 32, qam64 = 64 };
+enum class QamMode { qam4_nr = 0, qam4 = 4, qam16 = 16, qam32 = 32, qam64 = 64 };
 
 enum class PnMode { pn420 = 420, pn595 = 595, pn945 = 945 };
 
@@ -102,10 +102,14 @@ struct QamDefinition {
         return bits_per_symbol / 2;
     }
     [[nodiscard]] std::size_t signal_frames_per_fec_group() const noexcept {
-        return bits_per_symbol % 2 == 0 ? 1 : 2;
+        return mode == QamMode::qam4_nr || bits_per_symbol % 2 != 0 ? 2 : 1;
+    }
+    // NR carries one LDPC-coded bit per symbol after its rate-1/2 inner code.
+    [[nodiscard]] std::size_t coded_bits_per_symbol() const noexcept {
+        return mode == QamMode::qam4_nr ? 1 : bits_per_symbol;
     }
     [[nodiscard]] std::size_t codewords_per_fec_group() const noexcept {
-        return bits_per_symbol * signal_frames_per_fec_group() / 2;
+        return coded_bits_per_symbol() * signal_frames_per_fec_group() / 2;
     }
     // GB 20600 reflected Gray label, transmitted least-significant bit first.
     [[nodiscard]] static std::size_t axis_label(std::size_t level) noexcept {
@@ -467,10 +471,11 @@ private:
     std::size_t scrambler_skip_bits,
     std::size_t scrambler_reset_bits);
 
-struct Qam32FrameAlignment {
+struct FramePackingAlignment {
     std::size_t phase = 0;
     std::array<std::size_t, 2> clean_codewords{};
 };
+using Qam32FrameAlignment = FramePackingAlignment;
 
 // A two-signal-frame prefix contains two complete codewords at either possible
 // packing phase. Lock only when one phase passes LDPC and BCH on both words.
@@ -480,11 +485,18 @@ struct Qam32FrameAlignment {
     const LdpcSparseGraph& rate3_graph,
     LdpcDecodeOptions options = {});
 
+// NR needs five signal frames to test two complete words at either phase.
+[[nodiscard]] FramePackingAlignment nr_frame_alignment(
+    std::span<const float> transmitted_llr,
+    const LdpcSparseGraph& rate3_graph,
+    LdpcDecodeOptions options = {});
+
 [[nodiscard]] Ci8PowerStats ci8_power_stats(
     std::span<const std::int8_t> interleaved_iq,
     Ci8PowerStatsOptions options = {});
 
 // Per-symbol output is b0-first; a positive LLR means bit zero.
+// NR callers demap with qam4, then call nr_soft_decode on complete blocks.
 void qam_soft_demodulate_cf32(
     std::span<const float> interleaved_symbols,
     std::span<float> output_llr,
@@ -608,6 +620,8 @@ using PnWidebandChannelModel = Pn945WidebandChannelModel;
 [[nodiscard]] PnAcquisitionResult acquire_pn_cf32(
     PnMode mode, std::span<const float> symbols, PnAcquisitionOptions options = {});
 // Cyclic-extension similarity or fixed-sequence direct correlation, by mode.
+[[nodiscard]] float pn_header_metric_cf32(PnMode mode, std::span<const float> header);
+[[nodiscard]] float pn_known_phase_metric_cf32(PnMode mode, std::span<const float> header, std::size_t phase);
 [[nodiscard]] float pn_header_metric_ci8(PnMode mode, std::span<const std::int8_t> header);
 // PN595 uses direct correlation of its fixed reference; it has only phase zero.
 [[nodiscard]] std::size_t pn_detect_phase_cf32(PnMode mode, std::span<const float> header);

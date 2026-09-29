@@ -1,4 +1,5 @@
-#include "dtmb/core.hpp"
+﻿#include "dtmb/core.hpp"
+#include "dtmb/worker.hpp"
 
 #include "dtmb/core_c.h"
 
@@ -20,7 +21,7 @@ namespace {
 
 constexpr std::uint32_t kVersionMajor = 0;
 constexpr std::uint32_t kVersionMinor = 4;
-constexpr std::uint32_t kVersionPatch = 0;
+constexpr std::uint32_t kVersionPatch = 1;
 constexpr std::uint32_t kAbiVersionMajor = 0;
 constexpr std::uint32_t kAbiVersionMinor = 1;
 
@@ -45,7 +46,7 @@ struct PartialStats {
 
     auto available_workers = options.requested_workers;
     if (available_workers == 0) {
-        available_workers = std::thread::hardware_concurrency();
+        available_workers = dtmb::core::WorkerThread::hardware_concurrency();
     }
     if (available_workers == 0) {
         available_workers = 1;
@@ -68,7 +69,7 @@ struct PartialStats {
 
     auto available_workers = options.requested_workers;
     if (available_workers == 0) {
-        available_workers = std::thread::hardware_concurrency();
+        available_workers = dtmb::core::WorkerThread::hardware_concurrency();
     }
     if (available_workers == 0) {
         available_workers = 1;
@@ -127,6 +128,7 @@ struct PartialStats {
 }
 
 constexpr std::array<float, 8> kQam64Levels{-7.0F, -5.0F, -3.0F, -1.0F, 1.0F, 3.0F, 5.0F, 7.0F};
+constexpr std::array<float, 2> kQam4Levels{-4.5F, 4.5F};
 constexpr std::array<float, 4> kQam16Levels{-6.0F, -2.0F, 2.0F, 6.0F};
 constexpr std::array<float, 6> kQam32Levels{-7.5F, -4.5F, -1.5F, 1.5F, 4.5F, 7.5F};
 // GB 20600-2006 Figure 4, indexed by b0 + 2*b1 + ... + 16*b4.
@@ -141,6 +143,8 @@ constexpr std::array<QamPoint, 32> kQam32Points{{
     {-1.5F, 4.5F}, {-1.5F, 7.5F}, {1.5F, 4.5F}, {1.5F, 7.5F},
     {-4.5F, 4.5F}, {-4.5F, 7.5F}, {4.5F, 4.5F}, {4.5F, 7.5F},
 }};
+constexpr QamDefinition kQam4{QamMode::qam4, 2, 40.5F, kQam4Levels};
+constexpr QamDefinition kQam4Nr{QamMode::qam4_nr, 2, 40.5F, kQam4Levels};
 constexpr QamDefinition kQam16{QamMode::qam16, 4, 40.0F, kQam16Levels};
 constexpr QamDefinition kQam32{QamMode::qam32, 5, 45.0F, kQam32Levels, kQam32Points};
 constexpr QamDefinition kQam64{QamMode::qam64, 6, 42.0F, kQam64Levels};
@@ -266,22 +270,28 @@ void qam_soft_demodulate_range(
 
 const QamDefinition& qam_definition(QamMode mode) {
     switch (mode) {
+    case QamMode::qam4_nr: return kQam4Nr;
+    case QamMode::qam4: return kQam4;
     case QamMode::qam16: return kQam16;
     case QamMode::qam32: return kQam32;
     case QamMode::qam64: return kQam64;
     }
-    throw std::invalid_argument("QAM mode must be 16qam, 32qam or 64qam");
+    throw std::invalid_argument("QAM mode must be 4qam-nr, 4qam, 16qam, 32qam or 64qam");
 }
 
 QamMode parse_qam_mode(std::string_view name) {
+    if (name == "4qam-nr") return QamMode::qam4_nr;
+    if (name == "4qam" || name == "qpsk") return QamMode::qam4;
     if (name == "16qam") return QamMode::qam16;
     if (name == "32qam") return QamMode::qam32;
     if (name == "64qam") return QamMode::qam64;
-    throw std::invalid_argument("QAM mode must be 16qam, 32qam or 64qam");
+    throw std::invalid_argument("QAM mode must be 4qam-nr, 4qam, 16qam, 32qam or 64qam");
 }
 
 const char* qam_mode_name(QamMode mode) {
     switch (qam_definition(mode).mode) {
+    case QamMode::qam4_nr: return "4qam-nr";
+    case QamMode::qam4: return "4qam";
     case QamMode::qam16: return "16qam";
     case QamMode::qam32: return "32qam";
     case QamMode::qam64: return "64qam";
@@ -297,6 +307,7 @@ std::size_t QamDefinition::nearest_level_index(float value) const noexcept {
         }
         return levels.size() - 1;
     }
+    if (mode == QamMode::qam4 || mode == QamMode::qam4_nr) return value <= 0 ? 0 : 1;
     if (mode == QamMode::qam16) {
         if (value <= -4.0F) return 0;
         if (value <= 0.0F) return 1;
@@ -441,7 +452,7 @@ Version version() noexcept {
 }
 
 const char* build_info() noexcept {
-    return "dtmb-core-cpp 0.4.0";
+    return "dtmb-core-cpp 0.4.1";
 }
 
 Ci8PowerStats ci8_power_stats(
@@ -461,7 +472,7 @@ Ci8PowerStats ci8_power_stats(
     }
 
     std::vector<PartialStats> partials(worker_count);
-    std::vector<std::thread> workers;
+    std::vector<dtmb::core::WorkerThread> workers;
     workers.reserve(worker_count);
 
     for (std::size_t worker = 0; worker < worker_count; ++worker) {
@@ -492,6 +503,8 @@ void qam_soft_demodulate_cf32(
     std::span<float> output_llr,
     QamMode mode,
     QamSoftDemapOptions options) {
+    if (mode == QamMode::qam4_nr)
+        throw std::invalid_argument("NR requires 4QAM demapping followed by nr_soft_decode");
     const auto& qam = qam_definition(mode);
     if ((interleaved_symbols.size() % 2) != 0) {
         throw std::invalid_argument("CF32 input must contain interleaved real/imag pairs");
@@ -521,7 +534,7 @@ void qam_soft_demodulate_cf32(
         return;
     }
 
-    std::vector<std::thread> workers;
+    std::vector<dtmb::core::WorkerThread> workers;
     workers.reserve(worker_count);
     for (std::size_t worker = 0; worker < worker_count; ++worker) {
         const auto first = (symbol_count * worker) / worker_count;

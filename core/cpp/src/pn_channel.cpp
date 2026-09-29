@@ -1,4 +1,5 @@
 #include "dtmb/core.hpp"
+#include "dtmb/worker.hpp"
 
 #include <algorithm>
 #include <array>
@@ -339,7 +340,7 @@ struct PnHeaderCoreAccumulator {
     }
     auto worker_count = requested_workers;
     if (worker_count == 0) {
-        worker_count = std::thread::hardware_concurrency();
+        worker_count = dtmb::core::WorkerThread::hardware_concurrency();
     }
     if (worker_count == 0) {
         worker_count = 1;
@@ -1082,8 +1083,9 @@ static std::size_t pn_phase_for_frame(std::size_t index) noexcept {
     return index == 0 ? 0 : ((index % 2) != 0 ? (index + 1) / 2 : kPnCoreSymbols - index / 2);
 }
 
+template<typename Sample>
 static float pn_known_phase_metric_ci8(
-    std::span<const std::int8_t> header, std::size_t phase) {
+    std::span<const Sample> header, std::size_t phase) {
     if (header.size() != kPnHeaderSymbols * 2 || phase >= kPnPhaseCount) {
         throw std::invalid_argument("known-phase PN metric needs a complete header and a valid selected-mode phase");
     }
@@ -1201,7 +1203,7 @@ static PnResidualCfoResult estimate_pn_residual_cfo_cf32(
     const auto worker_count = choose_residual_cfo_worker_count(
         frame_count,
         options.requested_workers);
-    std::vector<std::thread> workers;
+    std::vector<dtmb::core::WorkerThread> workers;
     workers.reserve(worker_count);
     for (std::size_t worker = 0; worker < worker_count; ++worker) {
         workers.emplace_back([&, worker] {
@@ -1889,6 +1891,10 @@ decltype(auto) dispatch_pn(PnMode mode, Function&& function) {
 
 std::size_t pn_detect_phase_cf32(PnMode mode, std::span<const float> header) {
     return dispatch_pn(mode, [&](auto impl) { return impl.pn_detect_phase_cf32(header); });
+}
+
+float pn_known_phase_metric_cf32(PnMode mode, std::span<const float> header, std::size_t phase) {
+    return dispatch_pn(mode, [&](auto impl) { return impl.pn_known_phase_metric_ci8(header, phase); });
 }
 
 float pn_known_phase_metric_ci8(PnMode mode, std::span<const std::int8_t> header, std::size_t phase) {

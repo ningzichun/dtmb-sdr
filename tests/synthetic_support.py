@@ -24,7 +24,7 @@ QAM32_FIGURE4 = (
 def transport_frames(rate: int, qam: int, count: int = 4) -> list[bytes]:
     if qam == 32:
         assert rate == 3 and count % 2 == 0
-    packets_per_frame = 10 if qam == 32 else (2 if qam == 16 else 3) * (rate + 1)
+    packets_per_frame = 10 if qam == 32 else (int(qam).bit_length() - 1) // 2 * (rate + 1)
     rng = np.random.default_rng(823 + rate)
     packets = [bytes((0x47, 0x01, 0x00, 0x10 | (n % 16)))
                + rng.bytes(184) for n in range(packets_per_frame * count)]
@@ -100,8 +100,8 @@ def modulate(bits: np.ndarray, qam: int) -> np.ndarray:
         for label, real, imag in QAM32_FIGURE4:
             points[sum(int(bit) << n for n, bit in enumerate(label))] = real + 1j * imag
         return points[np.sum(bits.reshape(-1, 5) * (1 << np.arange(5)), axis=1)]
-    axis_bits = 2 if qam == 16 else 3
-    levels = np.array([-6, -2, 2, 6] if qam == 16 else [-7, -5, -3, -1, 1, 3, 5, 7])
+    axis_bits = 1 if qam == 4 else 2 if qam == 16 else 3
+    levels = np.array([-4.5, 4.5] if qam == 4 else [-6, -2, 2, 6] if qam == 16 else [-7, -5, -3, -1, 1, 3, 5, 7])
     labels = np.arange(len(levels)) ^ (np.arange(len(levels)) >> 1)
     lookup = np.empty_like(levels)
     lookup[labels] = levels
@@ -134,7 +134,7 @@ def symbol_stream(rate: int, qam: int, mode: str, phase: int = 0, count: int = 4
     payload = modulate(bits, qam)
     latency = 52 * 51 * (240 if mode == "mode1" else 720)
     rng = np.random.default_rng(78)
-    tail = modulate(rng.integers(0, 2, latency * {16: 4, 32: 5, 64: 6}[qam], dtype=np.uint8), qam)
+    tail = modulate(rng.integers(0, 2, latency * {4: 2, 16: 4, 32: 5, 64: 6}[qam], dtype=np.uint8), qam)
     return interleave(np.concatenate((payload, tail)), mode, phase), bits, b"".join(frames)
 
 
@@ -181,6 +181,10 @@ def ci8_frames(symbols: np.ndarray, profile: int, qam: int, *, pn_mode: str = "p
                scheduled: bool = False, leading: int = 0, cfo: float = 0.0,
                noise: float = 0.0, channel: np.ndarray | None = None) -> bytes:
     info_vectors = {
+        3: "01111000110010000010111011010101",
+        5: "01110111110001110010000111011010",
+        7: "00100010100100100111010010001111",
+        9: "01001011111110110001110111100110",
         11: "00010001101000010100011110111100",
         13: "01111000001101110010111000101010",
         15: "00101101100111010111101110000000",
@@ -203,7 +207,7 @@ def ci8_frames(symbols: np.ndarray, profile: int, qam: int, *, pn_mode: str = "p
     physical = np.empty_like(logical)
     physical[:, mapping] = logical
     bodies = np.fft.ifft(physical, axis=1)
-    body_power = ({16: 40, 32: 45, 64: 42}[qam] * 3744 + 2 * 36) / 3780**2
+    body_power = ({4: 40.5, 16: 40, 32: 45, 64: 42}[qam] * 3744 + 2 * 36) / 3780**2
     headers = np.stack([pn_header(pn_mode, pn_phase(pn_mode, frame) if scheduled else 0)
                         for frame in range(len(bodies))])
     headers *= np.sqrt(body_power * PN[pn_mode][5] / 2)

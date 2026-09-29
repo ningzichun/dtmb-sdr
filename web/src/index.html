@@ -1,0 +1,52 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Inspect SDR IQ captures and decode DTMB locally in your browser. WebGL spectrum, waterfall, and the open-source dtmb-sdr receiver.">
+  <title>DTMB Lab · Browser receiver</title><link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 36 36'%3E%3Cpath fill='none' stroke='%2361e7bc' stroke-width='3' d='M3 19h5l3-11 6 22 6-25 4 14h6'/%3E%3C/svg%3E"><link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<header class="topbar"><a class="brand" href="./"><svg viewBox="0 0 36 36" aria-hidden="true"><path d="M3 19h5l3-11 6 22 6-25 4 14h6"/></svg><strong>DTMB<span>LAB</span></strong></a><span class="subtitle">BROWSER RECEIVER</span><nav><span class="privacy"><i></i> Files stay on your device</span><a href="https://github.com/ningzichun/dtmb-sdr" target="_blank" rel="noreferrer">Source ↗</a></nav></header>
+<main>
+  <section class="intro"><div><p class="eyebrow">SIGNAL WORKBENCH</p><h1>See the signal. Recover the stream.</h1><p>Inspect your IQ capture, check reception, and decode with the dtmb-sdr core.</p></div><span class="pill">WebAssembly + WebGL</span></section>
+  <div class="workbench">
+    <aside class="panel controls">
+      <div class="panel-title"><h2>Capture source</h2><span class="step">01</span></div>
+      <label class="dropzone" id="dropzone" for="file"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V3m-5 5 5-5 5 5M4 15v6h16v-6"/></svg><strong id="file-name">Open an IQ capture</strong><span id="file-info">Drop a raw file here, or browse</span><input id="file" type="file" aria-label="Open IQ capture"></label>
+      <p class="hint">Raw interleaved I, Q. ZIP archives are unpacked locally.</p>
+      <div class="samples">
+        <div class="samples-head"><span>Community samples</span><a href="https://github.com/ningzichun/dtmb-sdr/wiki/Samples" target="_blank" rel="noreferrer">wiki /</a></div>
+        <ul id="samples-list"><li class="muted" id="samples-status">Loading list...</li></ul>
+        <div class="samples-url"><input id="url" type="url" inputmode="url" spellcheck="false" placeholder="https://… .ci8/.zip link" aria-label="Load IQ capture or ZIP from URL"><button id="url-load" class="button secondary small" type="button">Load ↗</button></div>
+      </div>
+      <label>Sample format<select id="format"><option value="ci8">CI8 / CS8 · signed 8-bit</option><option value="cu8">CU8 · unsigned 8-bit</option><option value="ci16">CI16 / SC16 · signed 16-bit LE</option><option value="cf32">CF32 · float 32-bit LE</option></select></label>
+      <label>Sample rate <span>samples / second</span><input id="rate" type="number" min="1" max="4294967295" step="1" value="20000000" required></label>
+      <label>Center frequency <span>MHz · display only</span><input id="center" type="number" min="0" step="0.001" value="538"></label>
+      <div class="two-col"><label>Start <span>seconds</span><input id="start" type="number" min="0" step="0.1" value="0"></label><label>Duration <span>seconds</span><input id="duration" type="number" min="0" step="0.1" value="2"></label></div>
+      <p class="hint">Duration 0 selects the rest of the file. Use a short interval for a first decode.</p>
+      <button id="inspect" class="button primary" disabled>Inspect capture <span>↗</span></button>
+      <div class="rule"></div>
+      <div class="panel-title"><h2>DTMB receiver</h2><span class="step">02</span></div>
+      <label>Frame header<select id="pn"><option value="pn945">PN945</option><option value="pn595">PN595</option><option value="pn420">PN420</option></select></label>
+      <label>Transmission profile<select id="profile"></select></label>
+      <label class="checkbox"><input id="tracking" type="checkbox"> Track cyclic PN schedule <span title="Optional; applies to PN420/PN945. Enable only when appropriate for your capture.">ⓘ</span></label>
+      <button id="decode" class="button secondary" disabled>Decode to MPEG-TS <span>→</span></button><button id="cancel" class="button danger" hidden>Stop decoding</button>
+      <p class="hint">Choose the transmitted profile.</p>
+    </aside>
+    <div class="workspace">
+      <section class="panel display"><div class="panel-title"><div class="title-line"><span class="live-dot"></span><h2>Spectrum & waterfall</h2><span id="plot-state" class="muted">Waiting for capture</span></div><span class="unit">dBFS / bin · MHz</span></div>
+        <canvas id="spectrum" aria-label="IQ power spectrum"></canvas>
+        <div class="waterfall-label"><span>WATERFALL</span><span id="waterfall-scope">128 sampled windows across the selected interval</span></div>
+        <canvas id="waterfall" aria-label="WebGL waterfall of sampled IQ windows"></canvas>
+        <div class="plot-footer"><span><i class="legend"></i> Hann window · 2,048-point FFT</span><label>Floor <input id="floor" type="range" min="-140" max="-45" value="-100" aria-label="Spectrum floor"><output id="floor-value">−100 dB</output></label></div>
+      </section>
+      <section class="metrics" aria-label="Capture measurements"><article class="panel metric"><span>RECORDED LEVEL</span><strong id="rms">— <small>dBFS</small></strong><p>RMS per component</p></article><article class="panel metric"><span>CLIPPING</span><strong id="clipping">— <small>%</small></strong><p>Sampled I / Q components</p></article><article class="panel metric"><span>DC OFFSET</span><strong id="dc">—</strong><p>Normalized I / Q mean</p></article><article class="panel metric"><span>CAPTURE LENGTH</span><strong id="length">— <small>s</small></strong><p id="sample-count">From file size and input rate</p></article></section>
+      <section class="panel health"><div class="panel-title"><h2>Capture check</h2><span id="health-badge" class="badge">NOT INSPECTED</span></div><div id="findings"><p class="empty">Your spectrum is the first check. A successful DTMB decode is the next.</p><p class="hint">Format, sample rate, clipping, and I/Q balance are checked over sampled windows. Only receiver lock and clean FEC output can establish that a capture contains decodable DTMB.</p></div></section>
+      <section class="panel receiver"><div class="panel-title"><h2>Receiver output</h2><span id="receiver-badge" class="badge">IDLE</span></div><div class="stages"><span>01 <b>Condition</b></span><span>02 <b>Synchronize</b></span><span>03 <b>Demap</b></span><span>04 <b>Recover TS</b></span></div><progress id="progress" value="0" max="1" aria-label="Capture input progress"></progress><div class="status-row"><p id="status" role="status" aria-live="polite">Open a file to begin.</p><a id="download" class="button small" hidden>Download .ts ↓</a></div><p id="transport" class="hint"></p><button id="preview" class="button secondary small" hidden>Preview video ?</button><video id="video" controls playsinline hidden></video><p id="preview-status" class="hint"></p><details><summary>Receiver log</summary><pre id="log">No receiver run yet.</pre></details></section>
+      <section class="panel report"><div><h2>Sharing a capture problem?</h2><p>Attach the diagnostic report, your RF settings, and a short original IQ recording.</p></div><div class="report-actions"><button id="report" class="button secondary small" disabled>Save report ↓</button><a id="issue" class="text-link" href="https://github.com/ningzichun/dtmb-sdr/issues/new?template=capture.yml" target="_blank" rel="noreferrer">Prepare an issue ↗</a></div></section>
+    </div>
+  </div>
+</main>
+<footer><span>DTMB Lab <span class="muted">/</span> Open-source receiver, running locally.</span><span id="build">Portable C++ core · MIT</span></footer>
+<script type="module" src="./app.js"></script>
+</body></html>

@@ -1,4 +1,5 @@
 #include "dtmb/core.hpp"
+#include "dtmb/worker.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -233,7 +234,7 @@ void RationalResamplerCf32::emit_available(
 
     auto worker_count = requested_workers_;
     if (worker_count == 0) {
-        worker_count = std::thread::hardware_concurrency();
+        worker_count = dtmb::core::WorkerThread::hardware_concurrency();
     }
     if (output_count < min_parallel_output_samples_) {
         worker_count = 1;
@@ -247,7 +248,7 @@ void RationalResamplerCf32::emit_available(
             destination_sample_offset,
             interleaved_output);
     } else {
-        std::vector<std::thread> workers;
+        std::vector<dtmb::core::WorkerThread> workers;
         workers.reserve(worker_count);
         for (std::size_t worker = 0; worker < worker_count; ++worker) {
             const auto first = produced_output_samples_ + output_count * worker / worker_count;

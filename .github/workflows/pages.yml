@@ -1,0 +1,49 @@
+name: Browser receiver and GitHub Pages
+on:
+  push:
+    branches: [main]
+    paths: ['core/**', 'python/dtmb/data/**', 'web/**', '.github/workflows/pages.yml']
+  pull_request:
+    paths: ['core/**', 'python/dtmb/data/**', 'web/**', '.github/workflows/pages.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: '4.0.15'
+      - run: python -m pip install numpy
+      - run: npm ci --prefix web
+      - run: python web/build.py
+      - run: npm test --prefix web
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist/web
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@v4
+        id: deployment

@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "dtmb-sdr"
-version = "0.4.0"
+version = "0.4.1"
 description = "Vendor-neutral CI8 stream to MPEG-TS DTMB receiver"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -53,7 +53,6 @@ wheel.py-api = "py3"
 sdist.include = [
   "core/cpp/**",
   "python/dtmb/**",
-  "tests/**",
   "README.md",
   "LICENSE",
   "THIRD_PARTY.md",

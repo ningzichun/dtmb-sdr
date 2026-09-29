@@ -1,4 +1,5 @@
 #include "dtmb/core.hpp"
+#include "dtmb/worker.hpp"
 
 #include <algorithm>
 #include <array>
@@ -149,7 +150,7 @@ template<typename Sample>
     }
     auto worker_count = requested_workers;
     if (worker_count == 0) {
-        worker_count = std::thread::hardware_concurrency();
+        worker_count = dtmb::core::WorkerThread::hardware_concurrency();
     }
     if (worker_count == 0) {
         worker_count = 1;
@@ -221,7 +222,7 @@ PnAcquisitionResult acquire_pn_cf32(
         sample_count - pn.header_symbols + 1);
     const auto worker_count = choose_worker_count(phase_count, options.requested_workers);
     std::vector<PhaseScore> scores(phase_count);
-    std::vector<std::thread> workers;
+    std::vector<dtmb::core::WorkerThread> workers;
     workers.reserve(worker_count);
     for (std::size_t worker = 0; worker < worker_count; ++worker) {
         workers.emplace_back([&, worker] {
@@ -254,6 +255,12 @@ PnAcquisitionResult acquire_pn_cf32(
         coarse_cfo_hz,
         coarse_cfo_valid,
     };
+}
+
+float pn_header_metric_cf32(PnMode mode, std::span<const float> header) {
+    const auto& pn = pn_definition(mode);
+    if (header.size() != pn.header_symbols * 2) throw std::invalid_argument("PN metric needs a complete header");
+    return header_metric(header, 0, pn);
 }
 
 float pn_header_metric_ci8(PnMode mode, std::span<const std::int8_t> header) {

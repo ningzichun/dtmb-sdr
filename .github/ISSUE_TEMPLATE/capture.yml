@@ -1,0 +1,45 @@
+name: Capture or decoding problem
+description: Report an IQ capture that did not decode as expected
+title: "Capture: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Inspect your capture in [DTMB Lab](https://ningzichun.github.io/dtmb-sdr/) first.
+        Check the spectrum, actual export format and sample rate, and run a short decode.
+        Files stay on your device. Save the diagnostic report and attach it below.
+
+        A healthy DTMB multiplex in an 8 MHz channel occupies about 7.56 MHz and looks like
+        this: a broad digital signal covering most of the channel, not narrow spectral peaks.
+        The exact shape varies with SDR filtering, multipath and gain.
+        ![example DTMB spectrum](https://raw.githubusercontent.com/ningzichun/dtmb-sdr/main/docs/images/example-dtmb-spectrum.png)
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostic report and receiver log
+      description: Attach dtmb-diagnostic.json, or explain why the browser app could not run.
+    validations:
+      required: true
+  - type: input
+    id: source
+    attributes:
+      label: SDR and capture software
+      description: For example the SDR family or capture software used, and the capture command or flowgraph if convenient.
+      placeholder: "e.g. capture tool / command (optional detail)"
+    validations:
+      required: true
+  - type: textarea
+    id: parameters
+    attributes:
+      label: Capture and transmission settings
+      description: Actual format, byte order, sample rate, center frequency, RF bandwidth, gain, PN mode and modulation/FEC/interleaver if known. Include dropped-sample counts.
+    validations:
+      required: true
+  - type: textarea
+    id: recording
+    attributes:
+      label: Original recording and observed behavior
+      description: Link a short original IQ recording, include its byte size and SHA-256, and describe expected and actual results. Avoid converting to CI8 before sharing CI16 captures.
+    validations:
+      required: true
+

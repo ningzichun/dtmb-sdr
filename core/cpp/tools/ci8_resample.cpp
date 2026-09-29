@@ -1,4 +1,5 @@
 #include "dtmb/core.hpp"
+#include "dtmb/iq.hpp"
 
 #include "binary_stdio.hpp"
 
@@ -9,6 +10,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <limits>
 #include <numeric>
 #include <span>
 #include <stdexcept>
@@ -21,6 +23,7 @@ void usage(const char* program) {
     std::cerr
         << "usage: " << program
         << " [--input-rate N] [--output-rate N]"
+        << " [--input-format ci8|cs8|cu8|ci16|sc16|cf32] [--output-format ci8|cf32]"
         << " [--srrc-span N] [--roll-off X] [--output-scale X]"
         << " [--workers N] [--min-parallel-output-samples N]"
         << " [--chunk-samples N] [input.ci8|-] [output.ci8|-]\n";
@@ -116,6 +119,9 @@ int main(int argc, char** argv) {
     std::size_t min_parallel_output_samples = 16'384;
     float roll_off = 0.05F;
     float output_scale = 1.0F / std::sqrt(45.0F);
+    bool scale_explicit = false;
+    auto input_format = dtmb::core::IqFormat::ci8;
+    std::string output_format = "ci8";
     std::string input_path = "-";
     std::string output_path = "-";
     std::vector<std::string> positional;
@@ -123,7 +129,15 @@ int main(int argc, char** argv) {
     try {
         for (int index = 1; index < argc; ++index) {
             const std::string arg = argv[index];
-            if (arg == "--input-rate") {
+            if (arg == "--input-format") {
+                if (++index >= argc) throw std::invalid_argument("missing input format");
+                input_format = dtmb::core::parse_iq_format(argv[index]);
+            } else if (arg == "--output-format") {
+                if (++index >= argc) throw std::invalid_argument("missing output format");
+                output_format = argv[index];
+                if (output_format != "ci8" && output_format != "cf32")
+                    throw std::invalid_argument("output format must be ci8 or cf32");
+            } else if (arg == "--input-rate") {
                 if (++index >= argc) {
                     usage(argv[0]);
                     return 2;
@@ -153,6 +167,7 @@ int main(int argc, char** argv) {
                     return 2;
                 }
                 output_scale = parse_float(argv[index], "output scale");
+                scale_explicit = true;
             } else if (arg == "--chunk-samples") {
                 if (++index >= argc) {
                     usage(argv[0]);
@@ -181,7 +196,9 @@ int main(int argc, char** argv) {
             }
         }
         if (positional.size() > 2 || !(roll_off > 0.0F && roll_off <= 1.0F)
-            || output_scale <= 0.0F) {
+            || !std::isfinite(output_scale) || output_scale <= 0.0F
+            || input_rate > std::numeric_limits<std::uint32_t>::max()
+            || output_rate > std::numeric_limits<std::uint32_t>::max()) {
             usage(argv[0]);
             return 2;
         }
@@ -195,6 +212,47 @@ int main(int argc, char** argv) {
         const auto common = std::gcd(input_rate, output_rate);
         const auto up = output_rate / common;
         const auto down = input_rate / common;
+        if (input_format != dtmb::core::IqFormat::ci8 || output_format == "cf32"
+            || std::max(up, down) > 4096) {
+            dtmb::tools::configure_binary_stdio(input_path == "-", output_path == "-");
+            std::unique_ptr<std::ifstream> input_file;
+            std::unique_ptr<std::ofstream> output_file;
+            auto& input = input_stream(input_path, input_file);
+            auto& output = output_stream(output_path, output_file);
+            dtmb::core::IqResampler converter(static_cast<std::uint32_t>(input_rate),
+                static_cast<std::uint32_t>(output_rate), srrc_span, roll_off);
+            std::vector<float> values(chunk_samples * 2), converted;
+            std::size_t clips = 0, samples = 0, produced = 0;
+            const float gain = scale_explicit ? output_scale : 1.0F;
+            auto write = [&] {
+                produced += converted.size() / 2;
+                if (output_format == "cf32") {
+                    for (auto& v : converted) v *= gain / 128.0F;
+                    output.write(reinterpret_cast<const char*>(converted.data()),
+                        static_cast<std::streamsize>(converted.size() * sizeof(float)));
+                    if (!output) throw std::runtime_error("failed to write CF32 output");
+                } else write_ci8(output, converted, gain, clips);
+            };
+            while (auto count = dtmb::core::read_iq(input, input_format, values)) {
+                samples += count / 2;
+                converted.clear();
+                if (input_rate == output_rate) converted.assign(values.begin(), values.begin() + count);
+                else converter.process(std::span(values).first(count), converted);
+                write();
+            }
+            converted.clear();
+            if (input_rate != output_rate) converter.finish(converted);
+            write();
+            output.flush();
+            std::cerr << "input_rate_sps=" << input_rate << '\n'
+                      << "output_rate_sps=" << output_rate << '\n'
+                      << "input_samples=" << samples << '\n'
+                      << "output_samples=" << produced << '\n'
+                      << "output_format=" << output_format << '\n'
+                      << "output_clip_values=" << clips << '\n'
+                      << "trailing_input_bytes=0\n";
+            return 0;
+        }
         const auto taps = dtmb::core::square_root_raised_cosine_taps(
             srrc_span,
             std::max(up, down),

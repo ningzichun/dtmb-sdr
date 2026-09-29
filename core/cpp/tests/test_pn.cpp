@@ -168,8 +168,8 @@ void check_equalizer(PnMode mode, std::size_t window_offset) {
 
 int main() {
     const auto release = version();
-    assert(release.major == 0 && release.minor == 4 && release.patch == 0);
-    assert(std::string_view(build_info()) == "dtmb-core-cpp 0.4.0");
+    assert(release.major == 0 && release.minor == 4 && release.patch == 1);
+    assert(std::string_view(build_info()) == "dtmb-core-cpp 0.4.1");
     // PN420/PN945: GB 20600 appendices D/E phase-zero vectors.
     check_vector(PnMode::pn420,
         "B0A5E9FEA1CF0D9A3DC7407C4A22D5C8C938109BCCEFCB2B69063"

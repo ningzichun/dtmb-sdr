@@ -1,0 +1,25 @@
+name: Native receiver tests
+on:
+  push:
+    branches: [main]
+    paths: ['core/**', 'python/**', 'tests/**', '.github/workflows/native.yml']
+  pull_request:
+    paths: ['core/**', 'python/**', 'tests/**', '.github/workflows/native.yml']
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install numpy pytest
+      - run: cmake -S core/cpp -B build -DDTMB_CORE_BUILD_TESTS=ON -DDTMB_CORE_ENABLE_FFTW=OFF -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build --config Release --parallel 4
+      - run: ctest --test-dir build -C Release --output-on-failure
+      - run: python -m pytest -q tests/test_decode.py tests/test_iq_formats.py tests/test_sip.py tests/test_ts.py tests/test_receive_nr.py
+        env:
+          PYTHONPATH: python
+          DTMB_TEST_BIN_DIR: build

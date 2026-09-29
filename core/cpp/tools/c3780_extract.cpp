@@ -1,4 +1,6 @@
 #include "dtmb/core.hpp"
+#include "dtmb/worker.hpp"
+#include "dtmb/iq.hpp"
 
 #include "binary_stdio.hpp"
 
@@ -188,9 +190,9 @@ struct FrameWork {
           csi_weights(dtmb::core::kC3780DataSymbols),
           integer_timing_correction_enabled(integer_timing_correction) {}
 
-    std::vector<std::int8_t> header_ci8;
-    std::vector<std::int8_t> post_body_header_ci8;
-    std::vector<std::int8_t> body_ci8;
+    std::vector<float> header_ci8;
+    std::vector<float> post_body_header_ci8;
+    std::vector<float> body_ci8;
     std::vector<float> header_cf32;
     std::vector<float> post_body_header_cf32;
     std::vector<float> body_cf32;
@@ -574,7 +576,7 @@ void usage(const char* program) {
         << " [--source-carrier-channel-diagnostics-out PATH]"
         << " [--pn-mmse off|auto|X]"
         << " [--remove-dc]"
-        << " [--pn-mode pn420|pn595|pn945] [--qam 16qam|32qam|64qam] [--normalization system-info|qam|qam-amplitude|none]"
+        << " [--input-format ci8|cu8|ci16|cf32] [--pn-mode pn420|pn595|pn945] [--qam 4qam-nr|4qam|16qam|32qam|64qam] [--normalization system-info|qam|qam-amplitude|none]"
         << " [--qam64-integer-timing-correction]"
         << " [--pn-schedule-sync]"
         << " [--pn-schedule-tracking]"
@@ -739,20 +741,18 @@ std::ostream& output_stream(
     return *file_holder;
 }
 
-std::size_t read_bytes(std::istream& input, std::span<std::int8_t> buffer) {
-    input.read(
-        reinterpret_cast<char*>(buffer.data()),
-        static_cast<std::streamsize>(buffer.size()));
-    return static_cast<std::size_t>(input.gcount());
+dtmb::core::IqFormat input_format = dtmb::core::IqFormat::ci8;
+std::size_t read_bytes(std::istream& input, std::span<float> buffer) {
+    return dtmb::core::read_iq(input, input_format, buffer);
 }
 
 class ReplayInput {
 public:
-    explicit ReplayInput(std::istream& input, std::vector<std::int8_t> prefix = {})
+    explicit ReplayInput(std::istream& input, std::vector<float> prefix = {})
         : input_(input),
           prefix_(std::move(prefix)) {}
 
-    std::size_t read(std::span<std::int8_t> buffer) {
+    std::size_t read(std::span<float> buffer) {
         std::size_t copied = 0;
         if (prefix_position_ < prefix_.size()) {
             copied = std::min(buffer.size(), prefix_.size() - prefix_position_);
@@ -767,7 +767,7 @@ public:
 
 private:
     std::istream& input_;
-    std::vector<std::int8_t> prefix_;
+    std::vector<float> prefix_;
     std::size_t prefix_position_ = 0;
 };
 
@@ -1566,7 +1566,7 @@ private:
         }
         auto required_bytes = (sample_end - buffer_start_sample_) * 2;
         while (!input_ended_ && buffer_.size() < required_bytes) {
-            std::vector<std::int8_t> chunk(
+            std::vector<float> chunk(
                 std::max<std::size_t>(required_bytes - buffer_.size(), 1U << 16U));
             const auto count = input_.read(chunk);
             if (count == 0) {
@@ -1581,13 +1581,13 @@ private:
     [[nodiscard]] float metric_at(std::size_t candidate_start) const {
         const auto relative_start = candidate_start - buffer_start_sample_;
         if (pn_schedule_origin_.has_value()) {
-            return dtmb::core::pn_known_phase_metric_ci8(pn_mode,
-                std::span<const std::int8_t>(buffer_).subspan(
+            return dtmb::core::pn_known_phase_metric_cf32(pn_mode,
+                std::span<const float>(buffer_).subspan(
                     relative_start * 2, pn().header_symbols * 2),
                 dtmb::core::pn_phase_for_frame(pn_mode, *pn_schedule_origin_ + schedule_frame_index_));
         }
-        return dtmb::core::pn_header_metric_ci8(pn_mode,
-            std::span<const std::int8_t>(buffer_).subspan(relative_start * 2, pn().header_symbols * 2));
+        return dtmb::core::pn_header_metric_cf32(pn_mode,
+            std::span<const float>(buffer_).subspan(relative_start * 2, pn().header_symbols * 2));
     }
 
     [[nodiscard]] bool schedule_candidate_confirmed(std::size_t candidate_start) const {
@@ -1606,8 +1606,8 @@ private:
             }
             const auto phase = dtmb::core::pn_phase_for_frame(pn_mode,
                 *pn_schedule_origin_ + schedule_frame_index_ - back);
-            if (dtmb::core::pn_known_phase_metric_ci8(pn_mode,
-                    std::span<const std::int8_t>(buffer_).subspan(
+            if (dtmb::core::pn_known_phase_metric_cf32(pn_mode,
+                    std::span<const float>(buffer_).subspan(
                         relative * 2, pn().header_symbols * 2), phase)
                 < hit_threshold_) {
                 return false;
@@ -1702,7 +1702,7 @@ private:
     static constexpr std::size_t kScheduleConfirmationHeaders = 4;
     std::size_t pn_schedule_low_headers_ = 0;
     std::size_t pn_schedule_reanchor_confirmed_ = 0;
-    std::vector<std::int8_t> buffer_;
+    std::vector<float> buffer_;
     std::size_t buffer_start_sample_ = 0;
     std::size_t next_expected_sample_ = 0;
     std::size_t trajectory_origin_sample_ = 0;
@@ -1739,11 +1739,11 @@ private:
 };
 
 std::size_t discard_bytes(ReplayInput& input, std::size_t byte_count) {
-    std::vector<std::int8_t> buffer(std::min<std::size_t>(byte_count, 1U << 16U));
+    std::vector<float> buffer(std::min<std::size_t>(byte_count, 1U << 16U));
     std::size_t discarded = 0;
     while (discarded < byte_count) {
         const auto wanted = std::min(buffer.size(), byte_count - discarded);
-        const auto count = input.read(std::span<std::int8_t>(buffer.data(), wanted));
+        const auto count = input.read(std::span<float>(buffer.data(), wanted));
         discarded += count;
         if (count != wanted) {
             break;
@@ -2230,7 +2230,7 @@ void update_frame_normalization_stats(
 }
 
 void convert_ci8_to_cf32(
-    std::span<const std::int8_t> input,
+    std::span<const float> input,
     std::span<float> output,
     std::size_t sample_start,
     float frequency_shift_hz,
@@ -2265,7 +2265,7 @@ void process_frame(
 }
 
 void convert_ci8_to_cf32(
-    std::span<const std::int8_t> input,
+    std::span<const float> input,
     std::span<float> output,
     std::size_t sample_start,
     float frequency_shift_hz,
@@ -3081,10 +3081,10 @@ std::string_view normalization_name(Normalization normalization) noexcept {
         return "system-info";
     case Normalization::qam:
         if (qam_mode == dtmb::core::QamMode::qam32) return "qam32";
-        return qam_mode == dtmb::core::QamMode::qam64 ? "qam64" : "qam16";
+        return qam_mode == dtmb::core::QamMode::qam64 ? "qam64" : "qam";
     case Normalization::qam_amplitude:
         if (qam_mode == dtmb::core::QamMode::qam32) return "qam32-amplitude";
-        return qam_mode == dtmb::core::QamMode::qam64 ? "qam64-amplitude" : "qam16-amplitude";
+        return qam_mode == dtmb::core::QamMode::qam64 ? "qam64-amplitude" : "qam-amplitude";
     case Normalization::none:
         return "none";
     }
@@ -3929,6 +3929,12 @@ int main(int argc, char** argv) {
                 pn_mmse = parse_pn_mmse(argv[index]);
             } else if (arg == "--remove-dc") {
                 remove_dc = true;
+            } else if (arg == "--input-format") {
+                if (++index >= argc) throw std::invalid_argument("missing input format");
+                input_format = dtmb::core::parse_iq_format(argv[index]);
+            } else if (arg == "--input-format") {
+                if (++index >= argc) throw std::invalid_argument("missing input format");
+                input_format = dtmb::core::parse_iq_format(argv[index]);
             } else if (arg == "--pn-mode") {
                 if (++index >= argc) { usage(argv[0]); return 2; }
                 pn_mode = dtmb::core::parse_pn_mode(argv[index]);
@@ -4036,15 +4042,19 @@ int main(int argc, char** argv) {
         }
         if (!system_info_explicit && qam_explicit && qam_mode != dtmb::core::QamMode::qam64) {
             // Preserve the default rate-3/mode1 choice with the requested alphabet.
-            system_info_index = qam_mode == dtmb::core::QamMode::qam16 ? 15 : 17;
+            system_info_index = qam_mode == dtmb::core::QamMode::qam4_nr ? 3
+                : qam_mode == dtmb::core::QamMode::qam4 ? 9 : qam_mode == dtmb::core::QamMode::qam16 ? 15 : 17;
         }
         profile_probe = system_info_auto;
         if (!system_info_auto) {
+            const bool profile_nr = system_info_index == 3 || system_info_index == 4;
+            const bool profile4 = system_info_index >= 5 && system_info_index <= 10;
             const bool profile16 = system_info_index >= 11 && system_info_index <= 16;
             const bool profile32 = system_info_index == 17 || system_info_index == 18;
             const bool profile64 = system_info_index >= 19 && system_info_index <= 24;
-            if (profile16 || profile32 || profile64) {
-                const auto profile_qam = profile16 ? dtmb::core::QamMode::qam16
+            if (profile_nr || profile4 || profile16 || profile32 || profile64) {
+                const auto profile_qam = profile_nr ? dtmb::core::QamMode::qam4_nr
+                    : profile4 ? dtmb::core::QamMode::qam4 : profile16 ? dtmb::core::QamMode::qam16
                     : profile32 ? dtmb::core::QamMode::qam32 : dtmb::core::QamMode::qam64;
                 if (qam_explicit && qam_mode != profile_qam) {
                     throw std::invalid_argument("--qam conflicts with --system-info-index");
@@ -4359,7 +4369,7 @@ int main(int argc, char** argv) {
 
         auto worker_count = requested_workers;
         if (worker_count == 0) {
-            worker_count = std::thread::hardware_concurrency();
+            worker_count = dtmb::core::WorkerThread::hardware_concurrency();
         }
         worker_count = std::max<std::size_t>(worker_count, 1);
         if (batch_frames == 0) {
@@ -4377,7 +4387,7 @@ int main(int argc, char** argv) {
         worker_count = std::min(worker_count, batch_frames);
 
         const auto manual_frequency_shift_hz = frequency_shift_hz;
-        std::vector<std::int8_t> startup_ci8;
+        std::vector<float> startup_ci8;
         std::size_t startup_buffered_samples = 0;
         auto acquisition = dtmb::core::PnAcquisitionResult{};
         auto residual_cfo = dtmb::core::PnResidualCfoResult{};
@@ -4770,7 +4780,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 const auto active_workers = std::min(worker_count, jobs.size());
-                std::vector<std::thread> workers;
+                std::vector<dtmb::core::WorkerThread> workers;
                 std::vector<std::exception_ptr> worker_errors(active_workers);
                 std::vector<dtmb::core::PnEqualizeResult> results(output_count);
                 const auto header_values = pn().header_symbols * 2U;
@@ -4951,7 +4961,7 @@ int main(int argc, char** argv) {
                 }
 
                 const auto active_workers = std::min(worker_count, loaded_frames);
-                std::vector<std::thread> workers;
+                std::vector<dtmb::core::WorkerThread> workers;
                 std::vector<std::exception_ptr> worker_errors(active_workers);
                 workers.reserve(active_workers);
                 for (std::size_t worker = 0; worker < active_workers; ++worker) {

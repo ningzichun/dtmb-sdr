@@ -1,20 +1,30 @@
 # dtmb-sdr
 
-A minimal, vendor-neutral DTMB receiver. It accepts interleaved signed 8-bit
-complex samples (CI8) from a file or standard input and emits MPEG transport
+A vendor-neutral DTMB receiver with a browser application. It accepts interleaved
+CU8, CI8/CS8, CI16/SC16 or CF32 samples from a file or standard input and emits MPEG transport
 stream packets to a file or standard output.
+
+**[Open DTMB Lab in your browser](https://ningzichun.github.io/dtmb-sdr/)** to
+inspect a capture with a spectrum and WebGL waterfall, decode it locally,
+preview supported video codecs, and export a diagnostic report before opening
+an issue. The browser uses the same C++ receiver compiled to WebAssembly.
+See [browser build and format documentation](web/README.md).
+
+The new formats, normal 4QAM and browser app are available from the current
+source and Pages deployment. The existing PyPI 0.4.0 release predates these
+additions; use a source build for the updated native CLI.
 
 ```text
 CI8 file/stdin
   -> sample-rate conversion
   -> PN420/PN595/PN945 synchronization and C=3780 equalization
-  -> 16QAM/32QAM/64QAM deinterleaving and soft demapping
+  -> 4QAM/16QAM/32QAM/64QAM deinterleaving and soft demapping
   -> LDPC, BCH, and descrambling
   -> MPEG-TS file/stdout
 ```
 
-Hardware acquisition is intentionally outside this repository. Any application
-that can produce CI8 bytes at a known sample rate can feed the receiver.
+Hardware acquisition is outside this repository. Applications producing raw
+interleaved IQ bytes at a known sample rate can feed the receiver.
 
 ## Build
 
@@ -53,6 +63,12 @@ a supported NVIDIA toolkit.
 
 ## Decode a CI8 file
 
+Use `--input-format cu8|ci8|cs8|ci16|sc16|cf32` for the actual export format.
+CI16/SC16 and CF32 use little-endian components and preserve precision through
+the native frontend. The default remains CI8 for compatibility.
+Rates such as 10, 11.52, 12.5 and 15.12 MS/s are accepted; there is no 16 MS/s
+minimum. Rate conversion does not restore bandwidth missing from a capture.
+
 ```bash
 dtmb-decode \
   --input capture.ci8 \
@@ -75,6 +91,36 @@ with an explicit system-information profile:
 | 0.8 (rate 3) | mode1 | 15 | 17 | 23 |
 | 0.8 (rate 3) | mode2 | 16 | 18 | 24 |
 
+Normal 4QAM profiles 5/6, 7/8 and 9/10 select FEC 0.4, 0.6 and 0.8 respectively
+(odd = mode1, even = mode2), using one LDPC codeword per signal frame. All six
+profiles have exact synthetic transport tests with PN420, PN595 and PN945.
+Profiles 5/6, 7/8 and 9/10 cover the normal 4QAM mapping.
+
+The native CLI also supports **4QAM-NR profiles 3/4** (mode1/mode2), both with
+FEC rate 3, nominally 0.8. NR means Nordstrom-Robinson: an 8-to-16-bit code
+before ordinary 4QAM mapping. The receiver performs joint soft NR decoding
+before bit deinterleaving. One LDPC codeword spans two signal frames, with
+descrambler resets every 3,008 payload bits (376 transport bytes per frame).
+Use `--system-info-index 3` or `4`; native stages accept `--qam 4qam-nr`.
+
+`--nr-frame-phase auto` requires two LDPC/BCH-clean words at exactly one phase
+in a five-signal-frame prefix, then replays the retained input. A one-frame
+startup discard is reported. `0` selects a known boundary; `1` skips one frame.
+FEC frame counters and batch sizes count pairs of signal frames. The bit-interleaver
+latency is 170/510 signal frames. CSI and source confidence weight observations
+before NR decoding.
+
+NR is covered by all 256 normative Appendix C entries, independent likelihood
+calculations and exact synthetic CI8-to-TS tests for both profiles and every PN
+mode. NR OTA reception, CUDA parity and playable-media validation remain pending.
+
+For a PN595/4QAM rate-3 mode2 SC16 capture:
+
+```bash
+dtmb-decode --input capture.sc16 --input-format sc16 --input-rate 15120000 \
+  --pn-mode pn595 --system-info-index 10 --output recovered.ts
+```
+
 Each 16QAM, 32QAM, and 64QAM symbol carries 4, 5, or 6 soft bits. The native
 frontend and demappers accept `--qam 16qam|32qam|64qam`, and
 `--normalization qam` uses the selected alphabet. The existing 64QAM API and
@@ -82,16 +128,14 @@ frontend and demappers accept `--qam 16qam|32qam|64qam`, and
 executable is `dtmb_core_deinterleave_qam`.
 
 Synthetic regressions cover all six 16QAM profiles, continuous interleaving,
-noisy natural LDPC/BCH recovery and exact transport bytes. They do not establish
-over-the-air validation.
+noisy natural LDPC/BCH recovery and exact transport bytes. Over-the-air validation is a separate step.
 
 32QAM profiles 17/18 group two signal frames into five rate-3 LDPC codewords.
 
 `--qam32-frame-phase auto` detects packing alignment from two naturally
 LDPC/BCH-clean codewords at exactly one of two possible phases in a bounded
 prefix. The prefix is replayed and any one-frame startup discard is reported.
-Use `0` for a known group boundary or `1` to skip the first signal frame. An
-ambiguous prefix or incomplete terminal group is an error. FEC frame counters
+Use `0` for a known group boundary or `1` to skip the first signal frame. FEC frame counters
 and `--decode-batch-frames` count two-signal-frame groups for 32QAM; diagnostics
 also report signal-frame counts and the grouping factor. All five codewords
 must pass the clean gates before the group is emitted. Synthetic tests cover
@@ -99,7 +143,7 @@ both packing phases, both interleavers, noise and exact CI8-to-TS recovery.
 
 Select the known frame header explicitly with `--pn-mode pn420|pn595|pn945`.
 The default remains `pn945`; PN mode is independent of the system-information
-profile. Automatic PN-mode selection is not implemented.
+profile. Select the PN mode explicitly; automatic detection is a possible future addition.
 
 | Mode | Header symbols | Frame symbols | Frames per superframe | Header/body power |
 | --- | ---: | ---: | ---: | ---: |
@@ -213,8 +257,7 @@ capture, frontend, demapping and FEC can progress concurrently. Use
 not universal RF defaults and do not replace transport or codec validation.
 
 PN schedule options apply to PN420 and PN945. PN595 has a fixed header and uses
-direct correlation for timing tracking; cyclic schedule and cyclic header
-averaging options are rejected. In the native frontend, `--pn-estimator wideband`
+direct correlation for timing tracking. In the native frontend, `--pn-estimator wideband`
 selects the appropriate cyclic or direct channel estimator for the chosen mode.
 For PN595, use `--pn-wideband-header-observation direct` (or `core`). Its default
 linear fit spans 149 signed delays; `--pn-wideband-max-span-symbols` controls
@@ -236,7 +279,8 @@ ffprobe -v error -show_programs -show_streams recovered.ts
 Included:
 
 - portable C++20 receive stages;
-- CI8 file and stdin integration;
+- CU8, CI8/CS8, CI16/SC16 and CF32 file/stdin integration;
+- a static browser receiver, spectrum/waterfall and diagnostic reports;
 - MPEG-TS file and stdout output;
 - required LDPC matrices;
 - core and pipeline-construction tests.
@@ -245,7 +289,7 @@ Not included:
 
 - SDR drivers or hardware-control code;
 - capture recipes, device identifiers, frequencies, gains, or locations;
-- signal-generation, scanning, UI, visualization, sweep, or research tooling;
+- hardware scanning, sweeps, and research tooling;
 - real broadcast captures or derived analysis artifacts.
 
 ## License

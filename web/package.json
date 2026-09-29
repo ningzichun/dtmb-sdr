@@ -1,0 +1,12 @@
+﻿{
+  "name": "dtmb-browser-receiver",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "fflate": "^0.8.3",
+    "mpegts.js": "1.8.0"
+  }
+}

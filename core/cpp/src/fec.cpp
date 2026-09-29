@@ -1,4 +1,5 @@
 #include "dtmb/core.hpp"
+#include "dtmb/worker.hpp"
 
 #include <algorithm>
 #include <array>
@@ -54,7 +55,7 @@ std::size_t candidate_worker_count(std::size_t requested, std::size_t codewords)
     }
     auto workers = requested;
     if (workers == 0) {
-        workers = std::thread::hardware_concurrency();
+        workers = dtmb::core::WorkerThread::hardware_concurrency();
     }
     if (workers == 0) {
         workers = 1;
@@ -234,7 +235,7 @@ LdpcHardCandidateScore ldpc_score_hard_bit_candidate(
     if (score.worker_count == 1) {
         score_range(0, score.codewords);
     } else {
-        std::vector<std::thread> threads;
+        std::vector<dtmb::core::WorkerThread> threads;
         threads.reserve(score.worker_count);
         for (std::size_t worker = 0; worker < score.worker_count; ++worker) {
             const auto first = (score.codewords * worker) / score.worker_count;
@@ -525,29 +526,32 @@ DtmbBchDecodeStats dtmb_bch_descramble_message_bits(
     return stats;
 }
 
-Qam32FrameAlignment qam32_frame_alignment(
+namespace {
+FramePackingAlignment rate3_frame_alignment(
     std::span<const float> transmitted_llr,
     const LdpcSparseGraph& rate3_graph,
-    LdpcDecodeOptions options) {
-    constexpr std::size_t frame_bits = 3744 * 5;
+    LdpcDecodeOptions options,
+    std::size_t frame_bits) {
     constexpr std::size_t codeword_bits = 7488;
     constexpr std::size_t punctured_bits = 5;
     constexpr std::size_t parity_bits = 11 * 127;
     constexpr std::size_t message_bits = 8 * kBchCodeBits;
-    if (transmitted_llr.size() < 2 * frame_bits) {
-        throw std::invalid_argument("32QAM frame alignment requires two complete signal frames");
+    // Preserve 32QAM's whole two-frame prefix contract; NR needs five frames.
+    const auto required_bits = std::max(2 * frame_bits, frame_bits + 2 * codeword_bits);
+    if (transmitted_llr.size() < required_bits) {
+        throw std::invalid_argument("frame alignment requires two complete codewords at either phase");
     }
     if (rate3_graph.variable_count != codeword_bits + punctured_bits
         || rate3_graph.check_count() != parity_bits) {
-        throw std::invalid_argument("32QAM frame alignment requires the DTMB rate-3 graph");
+        throw std::invalid_argument("frame alignment requires the DTMB rate-3 graph");
     }
     if (!std::all_of(transmitted_llr.begin(), transmitted_llr.end(),
                      [](float value) { return std::isfinite(value); })) {
-        throw std::invalid_argument("32QAM frame alignment requires finite LLRs");
+        throw std::invalid_argument("frame alignment requires finite LLRs");
     }
     std::vector<float> llr(codeword_bits + punctured_bits, 0.0F);
     std::vector<std::uint8_t> decoded(llr.size()), transport(8 * 94);
-    Qam32FrameAlignment result;
+    FramePackingAlignment result;
     for (std::size_t phase = 0; phase < 2; ++phase) {
         for (std::size_t word = 0; word < 2; ++word) {
             const auto offset = phase * frame_bits + word * codeword_bits;
@@ -565,11 +569,22 @@ Qam32FrameAlignment qam32_frame_alignment(
     const auto phase1 = result.clean_codewords[1] == 2;
     if (phase0 == phase1) {
         throw std::runtime_error(
-            "unable to lock 32QAM frame packing: two LDPC/BCH-clean codewords "
+            "unable to lock frame packing: two LDPC/BCH-clean codewords "
             "are required at exactly one phase");
     }
     result.phase = phase1 ? 1 : 0;
     return result;
+}
+}  // namespace
+
+Qam32FrameAlignment qam32_frame_alignment(
+    std::span<const float> llr, const LdpcSparseGraph& graph, LdpcDecodeOptions options) {
+    return rate3_frame_alignment(llr, graph, options, 3744 * 5);
+}
+
+FramePackingAlignment nr_frame_alignment(
+    std::span<const float> llr, const LdpcSparseGraph& graph, LdpcDecodeOptions options) {
+    return rate3_frame_alignment(llr, graph, options, 3744);
 }
 
 }  // namespace dtmb::core
