@@ -1,101 +1,195 @@
 # DTMB Lab browser receiver
 
-Open **https://ningzichun.github.io/dtmb-sdr/**. Choose a local raw IQ file, its
-actual sample format and sample rate, inspect the spectrum and waterfall, then
-select the PN mode and transmission profile. Decode a short interval first.
-The resulting MPEG-TS can be downloaded or previewed when its codecs are
-supported by the browser. H.264/AAC support depends on the browser; AVS and
-other broadcast codecs play through a suitable external player.
+DTMB Lab lets you inspect a raw I/Q recording, identify DTMB transmission
+settings and recover an MPEG transport stream in your browser.
 
-No recording is uploaded. The application is a static site: all receiver
-stages execute in WebAssembly workers on the user's device. Saving a report
-and opening an issue are explicit user actions.
+**[Open DTMB Lab](https://ningzichun.github.io/dtmb-sdr/)**
 
-## Shared receiver
+Your recording stays on your device. The static application runs the shared
+C++ receiver in WebAssembly workers and saves results locally.
 
-`web/CMakeLists.txt` compiles the existing `core/cpp` resampler, C3780 frontend,
-symbol deinterleaver/demapper and LDPC/BCH tools. `web_stdio.hpp` adapts their
-binary stdin/stdout streams to asynchronous browser messages. Each stage has
-a dedicated worker; demand/ack messages bound each connection to one buffer.
-No server, SharedArrayBuffer, cross-origin isolation, Python runtime, WebGPU,
-or browser-specific copy of the receiver algorithms is required.
+## Get started
 
-WebGL renders the waterfall. The diagnostic FFT and power spectrum are separate
-from the receiver. A good-looking spectrum is a first check; the receiver makes the final call.
-Reports include sample windows, level, DC, clipping, a SHA-256 of the first
-1 MiB (explicitly **not** a whole-file hash), selected settings, core build
-identity, native receiver logs and the observed transport checks.
+1. Open a local I/Q file or ZIP archive, or choose a sample from the catalog.
+2. Select the recording's **Sample format**. Confirm the encoding used by the
+   recording application rather than relying on the filename.
+3. Enter the **Sample rate** in samples per second, such as `12500000` for
+   12.5 MS/s. If the rate is unknown, leave the field empty and click **Guess**.
+4. Choose a start time and a short duration for the first attempt. A duration
+   of `0` selects the rest of the file.
+5. Leave **PN mode** and **Transmission profile** on **Auto**, then click
+   **Inspect capture**. The spectrum and waterfall appear first, followed by
+   a scan of PN420, PN595 and PN945. Clear **Scan PN modes after inspection**
+   if you only want the spectrum and capture checks.
+6. Review the detected settings, then click **Decode to MPEG-TS**. Inspect
+   **Transport stream info**, download the `.ts` file or save a report.
 
-## Formats and rates
+Use **Stop receiver** to cancel an active scan or decode. You can select a
+specific PN mode or profile at any time to override Auto.
 
-All formats are interleaved **I then Q**, with no WAV or other container header.
+## Input settings
 
-| Format | Component | Bytes per complex sample |
+All formats contain interleaved **I then Q** samples, with no container header.
+
+| Format | I/Q component encoding | Bytes per complex sample |
 | --- | --- | ---: |
-| CU8 | unsigned 8-bit, zero at 128 | 2 |
-| CI8 / CS8 | signed two's-complement 8-bit | 2 |
-| CI16 / SC16 / CS16 | signed 16-bit, little endian | 4 |
-| CF32 | IEEE float32, little endian, nominal full scale ±1 | 8 |
+| CU8 | Unsigned 8-bit, centered at 128 | 2 |
+| CI8 / CS8 | Signed 8-bit | 2 |
+| CI16 / SC16 / CS16 | Signed 16-bit, little-endian | 4 |
+| CF32 | IEEE 754 float32, little-endian, nominal range ±1 | 8 |
 
-Native `--input-format` accepts the same names. CI16 is converted to float
-without losing its low bits and remains float through the frontend. The browser
-uses float conditioning for every format. Native legacy CI8 pipelines retain
-their existing resampler/scaling contract; `--output-format cf32` on the native
-conditioner selects the same float path as the browser.
+The sample-rate field starts empty. Use the known recording rate whenever
+available. **Guess** checks these common rates (MS/s) against all three PN modes:
 
-The bounded polyphase SRRC converter accepts positive integer sample rates,
-including 10, 11.52, 12.5, 15.12, 16 and 20 MS/s, and relatively prime rates.
-Its phase table does not grow with the greatest-common-divisor ratio. Rates
-are limited to unsigned 32-bit values; extreme ratios exceeding the 8192-tap
-half-width are rejected with an explicit error. At 7.56 MS/s it passes already
-conditioned symbol-rate input through. No rate converter restores missing RF
-bandwidth: arbitrary-rate acceptance does not mean every rate captures an
-entire DTMB channel.
+7.56, 7.68, 8, 8.192, 9.6, 10, 10.24, 11.52, 12, 12.288, 12.5, 15.12,
+15.36, 16, 16.384, 19.2, 20, 24, 25, 30.72, 32, 40, 50 and 61.44.
 
-The browser exposes 4QAM-NR profiles 3–4, normal 4QAM profiles 5–10,
-16QAM 11–16, 32QAM 17–18 and 64QAM 19–24, with PN420, PN595 or PN945.
-PN mode/profile selection is explicit in the browser.
+Repeated header matches with an unambiguous result
+supply an editable rate and start inspection. Ambiguous, incomplete or unmatched
+scans leave the field empty.
 
-## Build and test
+A guessed rate is a candidate from this list, not recording metadata or an
+exact clock measurement. It does not establish system-information lock or
+successful decoding. Rate conversion also cannot restore bandwidth missing
+from the recording.
 
-Install/activate Emscripten **4.0.15**, CMake, Python and Node.js 22+:
+**Center frequency** changes the plot labels only; it does not tune a receiver.
+
+## Understand the results
+
+RF energy in the spectrum and recognized DTMB frame structure are different
+observations. The receiver reports four stages separately:
+
+| Stage | What the result establishes |
+| --- | --- |
+| PN acquisition | Repeated PN headers match a DTMB frame structure. |
+| System-information lock | The receiver identifies the profile, modulation, FEC rate, interleaver and frame body. |
+| FEC recovery | LDPC/BCH checks pass for the recovered data groups. |
+| TS validation | The recovered bytes pass packet alignment, transport-error flag and PCR syntax checks. |
+
+For example, **PN595 acquired; system information not locked** means that the
+receiver recognized the header but has not confirmed the transmission profile.
+It is neither a complete decode nor a failed PN acquisition.
+
+### PN and profile selection
+
+PN **Auto** resolves a mode from a complete three-mode scan: either the only
+acquired mode, or the only mode with system-information lock when several modes
+acquire. Ambiguous results leave Auto unresolved. Profile **Auto** waits for
+system-information lock.
+
+The panel shows the current Auto choices alongside the observations. Selecting
+a mode or profile manually changes the receiver configuration; it does not
+turn that choice into a detection result. Modes that have not been tested
+remain **Not tested**.
+
+Click a PN entry to view its measurements:
+
+- Acquisition state and header hits, such as `16/16`.
+- Correlation metric and threshold, such as `0.543 / 0.350`. This is **not SNR**.
+- Estimated frequency offset, with acquisition timing in the expandable details.
+- Header and frame dimensions, frame period and superframe size.
+- Input format, sample rate and the analyzed time window.
+
+**Test configured PN** checks one configured mode; **Scan PN modes** checks
+all three. If no PN is acquired, check the input format, sample rate, PN mode
+or signal quality. That result alone does not show that the signal is too weak.
+
+The browser selects the frame body automatically and displays
+**C=1 · single-carrier** or **C=3780 · multicarrier** after system-information
+lock. C=1 reception covers PN595 with normal 4QAM profiles 5–10. See the
+[profile table](../README.md#pn-mode-profile-and-frame-body) for all profiles.
+
+### Progress and probe limits
+
+The progress bar measures **input read**, not decode success. It is shown only
+while work is active and is replaced by a final status when the operation
+finishes, fails, times out or is cancelled. An early stop retains the actual
+input-read percentage rather than showing 100%.
+
+Probes are bounded so you can inspect results before committing to a full decode:
+
+| Action | Input per probe | Time limit |
+| --- | --- | --- |
+| Guess sample rate | Up to 0.04 seconds or 16 MiB, whichever is smaller | 3 seconds per probe; 45 seconds overall |
+| Test or scan PN modes | Up to 0.2 seconds or 16 MiB, whichever is smaller | 30 seconds per mode |
+
+PN probes examine the beginning of the selected interval, using up to 16
+headers for acquisition and 32 frames for system-information checks. Scanning
+adds receiver work beyond spectrum inspection; its cost depends on the device
+and input settings. The plots stay visible as results arrive.
+
+## Transport stream and reports
+
+**Transport stream info** reads CRC-valid PAT/PMT tables and shows programs,
+PMT/PCR PIDs, declared tracks, stream types, languages and observed packet
+counts. Missing or damaged tables leave the corresponding information
+unavailable. These are received stream declarations; use an external player
+with suitable codec support to play the downloaded TS.
+
+Only groups that pass the native LDPC/BCH checks are emitted. Failed groups
+are skipped with discontinuity indications. A recovered TS can still fail
+packet checks; the file and its program information remain available.
+For continuity checks, use `dtmb-ts-analyze` from the
+[command-line package](../README.md). Audio/video integrity requires actual
+codec decoding.
+
+**Save report** records input settings, analyzed windows, level/DC/clipping
+measurements, PN observations, receiver logs, core build identity and transport
+checks. Its SHA-256 identifies the first 1 MiB of the input, or the whole input
+if smaller; it is a prefix hash for larger files.
+
+## Working with large recordings
+
+Inspection samples up to 128 windows across the selected interval. The spectrum
+and capture checks describe those windows rather than every sample in the file.
+
+Decoding reads the recording in bounded chunks and runs on CPU workers.
+Performance depends on your device and the recording. Start with a short
+interval, then increase it after reviewing the results. TS downloads are capped
+at 256 MiB; select a shorter interval if the cap is reached. Each WebAssembly
+worker has a 1 GiB memory limit.
+
+If the app reports an incompatible receiver build, refresh the page. For a
+local installation, rebuild and serve the complete output directory. Script
+versions and WebAssembly hashes are checked to keep receiver assets consistent.
+
+## Build and run locally
+
+Install and activate Emscripten **4.0.15**, and install CMake 3.20+, Python
+3.10+ and Node.js 22+. From the repository root:
 
 ```sh
 npm ci --prefix web
 python web/build.py
-# Or: python web/build.py --emsdk /path/to/emsdk
 python -m http.server 8765 --bind 127.0.0.1 --directory dist/web
 ```
 
-Open http://127.0.0.1:8765. Serve over localhost or HTTPS, rather than file URLs.
+Open **http://127.0.0.1:8765/**. Serve the app over localhost or HTTPS so the
+workers can load normally.
+
+If Emscripten is not active in your shell, point the build script at the SDK:
 
 ```sh
-python -m pip install numpy
-python web/tests/make_fixture.py
-npm test --prefix web
-npx --prefix web playwright install chromium
-npm --prefix web run test:browser
+python web/build.py --emsdk /path/to/emsdk
 ```
 
-Browser tests inspect a real WebGL canvas, run the complete WASM pipeline,
-compare recovered transport bytes against an independent synthetic transmitter,
-and exercise report downloads, cancellation, malformed float input and mobile
-layout. Native format/rate/4QAM tests live in `tests/test_iq_formats.py`.
+Run the JavaScript unit tests with:
 
-GitHub Actions builds, tests and publishes `dist/web` using the Pages workflow.
-Enable Pages with **GitHub Actions** as its source. All asset paths are relative
-so project sites such as `/dtmb-sdr/` work. The private project's app delegates
-to this same build instead of maintaining a second web receiver.
+```sh
+npm test --prefix web
+```
 
-## Limits and interpretation
+The browser build compiles the receiver stages from `core/cpp`, using one
+worker per stage and bounded byte streams between them. The waterfall is
+rendered with WebGL. The [native build instructions](../README.md#build-from-source)
+cover the shared receiver tests.
 
-Inspection samples up to 128 windows across the selected interval; it covers these sampled windows rather than the entire recording. The file extension is a hint, not proof of the byte format.
-Browser decoding runs one CPU worker per stage and is not claimed to sustain
-live RF rates. Cancel terminates the workers immediately. Captures stream from
-disk in bounded reads; downloadable TS is capped at 256 MiB, with an explicit
-request to select a shorter interval if reached. Each WASM stage has a 1 GiB
-memory ceiling. The app has no SDR hardware driver or tuning interface.
+## Deploy to GitHub Pages
 
-Only naturally clean LDPC/BCH groups are emitted. Unclean groups are omitted
-with native discontinuity indications. The browser checks TS packet alignment
-and transport error flags; receiver logs preserve FEC failures. For continuity and codec-correctness claims, use `dtmb-ts-analyze` and actual codec decoding. The supplied issue recordings are pending OTA validation of the new modes.
+Enable **GitHub Actions** as the Pages source in the repository settings.
+The [Pages workflow](../.github/workflows/pages.yml) builds and tests the app,
+then publishes `dist/web`. Pull requests build and test without deploying.
+
+Asset paths are relative, so the same output works at the site root or under
+a project path such as `/dtmb-sdr/`.

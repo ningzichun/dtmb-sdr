@@ -1,4 +1,5 @@
 #include "dtmb/core.hpp"
+#include "dtmb/c1.hpp"
 #include "dtmb/worker.hpp"
 #include "dtmb/iq.hpp"
 
@@ -40,6 +41,7 @@ std::size_t residual_slot_count() {
     return qam_mode == dtmb::core::QamMode::qam32 ? 1 : qam().codewords_per_fec_group();
 }
 bool profile_probe = false;
+bool c1_frame_body = false;
 
 enum class Normalization {
     system_info,
@@ -557,6 +559,7 @@ void usage(const char* program) {
         << " [--timing-diagnostics PATH]"
         << " [--no-residual-cfo]"
         << " [--frequency-shift-hz X]"
+        << " [--frame-body-mode auto|c1|c3780]"
         << " [--workers N] [--batch-frames N]"
         << " [--equalizer flat|pn] [--pn-estimator compact|wideband]"
         << " [--pn-channel-taps N] [--pn-wideband-block-frames N]"
@@ -856,7 +859,7 @@ public:
             ? std::optional<std::size_t>(dtmb::core::pn_phase_for_frame(pn_mode,
                 *pn_schedule_origin_ + schedule_frame_index_)) : std::nullopt;
         frame.post_body_header_valid = false;
-        if (pn_current_header_tracking_ && frame.known_pn_phase.has_value()) {
+        if (c1_frame_body || (pn_current_header_tracking_ && frame.known_pn_phase.has_value())) {
             const auto body_end = frame.sample_start + pn().frame_symbols();
             const auto context_end = body_end + pn().header_symbols;
             ensure_until(context_end);
@@ -884,7 +887,7 @@ public:
     }
 
     bool read_one(FrameWork& frame, std::size_t& trailing_ci8_bytes) {
-        if (search_radius_ == 0) {
+        if (search_radius_ == 0 && !c1_frame_body) {
             return read_untracked(frame, trailing_ci8_bytes);
         }
         if (trajectory_interval_frames_ != 0) {
@@ -1967,6 +1970,7 @@ SourceCarrierChannelRule parse_source_carrier_channel_rule(const std::string& te
 }
 
 std::vector<float> system_info_reference(std::size_t index) {
+    if (c1_frame_body) return dtmb::core::c1_system_info_reference_cf32(index);
     if (index < 1 || index > 64) {
         throw std::invalid_argument("system information index must be 1..64");
     }
@@ -3523,6 +3527,8 @@ int main(int argc, char** argv) {
     bool qam_explicit = false;
     bool system_info_explicit = false;
     bool pn_span_explicit = false;
+    std::string frame_body_setting = "c3780";
+    dtmb::core::C1AcquisitionResult c1_acquisition;
     std::string normalization_argument;
     std::size_t phase_offset = 0;
     std::size_t max_frames = 0;
@@ -3998,6 +4004,12 @@ int main(int argc, char** argv) {
                     system_info_index = parse_size(argv[index], "system information index");
                     system_info_auto = false;
                 }
+            } else if (arg == "--frame-body-mode") {
+                if (++index >= argc) throw std::invalid_argument("--frame-body-mode needs auto, c1 or c3780");
+                frame_body_setting = argv[index];
+                if (frame_body_setting != "auto" && frame_body_setting != "c1" && frame_body_setting != "c3780") {
+                    throw std::invalid_argument("--frame-body-mode must be auto, c1 or c3780");
+                }
             } else if (arg == "--system-info-auto-observation-frames") {
                 if (++index >= argc) {
                     usage(argv[0]);
@@ -4046,6 +4058,12 @@ int main(int argc, char** argv) {
                 : qam_mode == dtmb::core::QamMode::qam4 ? 9 : qam_mode == dtmb::core::QamMode::qam16 ? 15 : 17;
         }
         profile_probe = system_info_auto;
+        if (frame_body_setting == "c1" && pn_mode != dtmb::core::PnMode::pn595) {
+            throw std::invalid_argument("C=1 processing requires PN595");
+        }
+        if (frame_body_setting != "c3780" && !auto_sync) {
+            throw std::invalid_argument("C=1/body Auto requires --auto-sync");
+        }
         if (!system_info_auto) {
             const bool profile_nr = system_info_index == 3 || system_info_index == 4;
             const bool profile4 = system_info_index >= 5 && system_info_index <= 10;
@@ -4413,6 +4431,19 @@ int main(int argc, char** argv) {
                     sync_hit_threshold,
                     requested_workers,
                 });
+            std::cerr << "pn_mode=" << dtmb::core::pn_mode_name(pn_mode) << '\n'
+                      << "sync_hit_threshold=" << sync_hit_threshold << '\n'
+                      << "startup_buffered_samples=" << startup_buffered_samples << '\n'
+                      << "acquisition_mean_metric=" << acquisition.mean_metric << '\n'
+                      << "acquisition_max_metric=" << acquisition.max_metric << '\n'
+                      << "acquisition_hit_count=" << acquisition.hit_count << '\n'
+                      << "acquisition_observed_frames=" << acquisition.observed_frames << '\n'
+                      << "acquisition_phase_offset=" << acquisition.phase_offset << '\n'
+                      << "pn_header_symbols=" << pn().header_symbols << '\n'
+                      << "pn_frame_symbols=" << pn().frame_symbols() << '\n'
+                      << "coarse_cfo_hz=" << acquisition.coarse_cfo_hz << '\n'
+                      << "coarse_cfo_valid="
+                      << (acquisition.coarse_cfo_valid ? "true" : "false") << '\n';
             if (acquisition.hit_count < 2) {
                 throw std::runtime_error(
                     "auto-sync did not find a repeated selected-mode PN train above the hit threshold");
@@ -4474,6 +4505,42 @@ int main(int argc, char** argv) {
             frequency_shift_hz += automatic_frequency_shift_hz;
         }
 
+        if (frame_body_setting != "c3780" && pn_mode == dtmb::core::PnMode::pn595) {
+            std::vector<float> startup_cf32(startup_ci8.size());
+            convert_ci8_to_cf32(startup_ci8, startup_cf32, 0, 0.0F);
+            c1_acquisition = dtmb::core::acquire_c1_pn595_cf32(
+                startup_cf32, phase_offset, frequency_shift_hz,
+                std::max(std::size_t{32}, system_info_auto_observation_frames),
+                system_info_auto_min_metric, system_info_auto_min_margin);
+            std::cerr << "c1_candidate_observations=" << c1_acquisition.observations << '\n'
+                      << "c1_candidate_metric=" << c1_acquisition.metric << '\n'
+                      << "c1_candidate_margin=" << c1_acquisition.margin << '\n'
+                      << "c1_candidate_data_fourfold_metric=" << c1_acquisition.data_fourfold_metric << '\n'
+                      << "c1_candidate_locked=" << (c1_acquisition.locked ? "true" : "false") << '\n';
+            c1_frame_body = c1_acquisition.locked;
+            if (frame_body_setting == "c1" && !c1_frame_body) {
+                throw std::runtime_error("C=1 acquisition did not confirm PN595/4QAM SI and time-domain data");
+            }
+            if (c1_frame_body) {
+                worker_count = 1;
+                batch_frames = 1;
+                equalizer = Equalizer::pn;
+                if (profile_probe) qam_mode = dtmb::core::QamMode::qam4;
+                if ((!profile_probe && qam_mode != dtmb::core::QamMode::qam4)
+                    || pn_csi_demap || qam64_integer_timing_correction || data_dd_options.enabled) {
+                    throw std::invalid_argument("C=1 processing requires normal 4QAM without C3780-specific calibration");
+                }
+                automatic_frequency_shift_hz += c1_acquisition.frequency_shift_hz - frequency_shift_hz;
+                frequency_shift_hz = c1_acquisition.frequency_shift_hz;
+            }
+        }
+        std::cerr << "frame_body_mode=" << (c1_frame_body ? "c1" : "c3780") << '\n'
+                  << "frame_body_mode_selection=" << frame_body_setting << '\n'
+                  << "c1_cfo_alias=" << c1_acquisition.cfo_alias << '\n'
+                  << "c1_si_offset_symbols=" << c1_acquisition.body_offset << '\n'
+                  << "c1_pn_fit_error=" << c1_acquisition.pn_fit_error << '\n';
+        if (c1_frame_body) std::cerr << "c1_channel_taps=149\nc1_fft_symbols=8192\nc1_mmse_relative=0.01\n";
+
         ReplayInput replay_input(input, std::move(startup_ci8));
         const auto phase_bytes = phase_offset * 2;
         const auto discarded_phase_bytes = discard_bytes(replay_input, phase_bytes);
@@ -4526,7 +4593,7 @@ int main(int argc, char** argv) {
             &timing_diagnostics,
             pn_schedule_tracking ? pn_schedule_output_origin : std::nullopt,
             pn_current_header_tracking);
-        auto reference_index = system_info_index;
+        auto reference_index = c1_frame_body ? c1_acquisition.system_info_index : system_info_index;
         auto reference = system_info_reference(reference_index);
         auto system_info_selector = SystemInfoAutoSelector{
             system_info_auto_observation_frames,
@@ -4558,7 +4625,50 @@ int main(int argc, char** argv) {
         std::complex<float> wideband_last_dc_offset{};
         auto wideband_model_stats = WidebandModelStats{};
         std::size_t next_sample_start = phase_offset;
-        if (discarded_phase_bytes == phase_bytes
+        if (c1_frame_body && discarded_phase_bytes == phase_bytes) {
+            FrameWork frame;
+            std::vector<float> input_frame(dtmb::core::kC1Pn595ContextSymbols * 2);
+            std::vector<float> equalized(input_frame.size()), normalized_data(3744 * 2);
+            while ((max_frames == 0 || frame_count < max_frames)
+                   && frame_reader.read(frame, trailing_ci8_bytes)) {
+                ++input_frame_count;
+                if (!frame.post_body_header_valid) break;
+                convert_ci8_to_cf32(frame.header_ci8,
+                    std::span<float>(input_frame).first(595 * 2), frame.sample_start, frequency_shift_hz);
+                convert_ci8_to_cf32(frame.body_ci8,
+                    std::span<float>(input_frame).subspan(595 * 2, 3780 * 2),
+                    frame.sample_start + 595, frequency_shift_hz);
+                convert_ci8_to_cf32(frame.post_body_header_ci8,
+                    std::span<float>(input_frame).subspan(4375 * 2, 595 * 2),
+                    frame.sample_start + 4375, frequency_shift_hz);
+                dtmb::core::c1_equalize_pn595_cf32(input_frame, equalized);
+                const auto body_start = static_cast<std::size_t>(595 + c1_acquisition.body_offset);
+                std::copy_n(equalized.begin() + static_cast<std::ptrdiff_t>(body_start * 2),
+                            3780 * 2, frame.logical_cf32.begin());
+                observe_system_information(frame);
+                if (normalization == Normalization::none) {
+                    std::copy_n(frame.logical_cf32.begin() + 72, normalized_data.size(), frame.data_cf32.begin());
+                } else {
+                    const auto gain = estimate_system_info_gain(frame.logical_cf32, reference);
+                    if (!gain.valid) throw std::runtime_error("C=1 SI gain is unavailable");
+                    for (std::size_t symbol = 0; symbol < 3744; ++symbol) {
+                        const auto position = (symbol + 36) * 2;
+                        const auto value = std::complex<float>{frame.logical_cf32[position],
+                            frame.logical_cf32[position + 1]} / gain.gain;
+                        normalized_data[symbol * 2] = value.real();
+                        normalized_data[symbol * 2 + 1] = value.imag();
+                    }
+                    if (normalization == Normalization::system_info) {
+                        std::copy(normalized_data.begin(), normalized_data.end(), frame.data_cf32.begin());
+                    } else {
+                        dtmb::core::qam_normalize_amplitude_cf32(normalized_data, frame.data_cf32,
+                                                               dtmb::core::QamMode::qam4);
+                    }
+                }
+                write_all(output, frame.data_cf32);
+                ++frame_count;
+            }
+        } else if (discarded_phase_bytes == phase_bytes
             && equalizer == Equalizer::pn
             && pn_estimator == PnEstimator::compact) {
             FrameWork current(qam64_integer_timing_correction);
@@ -5023,7 +5133,7 @@ int main(int argc, char** argv) {
         std::cerr << "qam=" << dtmb::core::qam_mode_name(qam_mode) << '\n';
         std::cerr << "front_end=" << (auto_sync ? "auto" : "pinned") << "_" << dtmb::core::pn_mode_name(pn_mode) << "_"
                   << (equalizer == Equalizer::pn ? "pn_equalized" : "flat")
-                  << "_c3780\n"
+                  << (c1_frame_body ? "_c1\n" : "_c3780\n")
                   << "auto_sync=" << (auto_sync ? "true" : "false") << '\n'
                   << "pn_mode=" << dtmb::core::pn_mode_name(pn_mode) << '\n'
                   << "pn_header_symbols=" << pn().header_symbols << '\n'

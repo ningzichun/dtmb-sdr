@@ -1,5 +1,12 @@
 ﻿cmake_minimum_required(VERSION 3.20)
 
+if(CMAKE_HOST_APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+  set(CMAKE_OSX_DEPLOYMENT_TARGET "10.15" CACHE STRING "Minimum macOS version for the native receiver")
+endif()
+if(CMAKE_HOST_APPLE AND CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS "10.15")
+  message(FATAL_ERROR "The native receiver requires macOS 10.15 or later; set MACOSX_DEPLOYMENT_TARGET accordingly")
+endif()
+
 project(dtmb_core VERSION 0.4.1 LANGUAGES C CXX)
 
 option(DTMB_CORE_BUILD_TESTS "Build dtmb-core tests" ON)
@@ -8,14 +15,9 @@ option(DTMB_CORE_ENABLE_FFTW "Use FFTW3f when available" ON)
 
 find_package(Threads REQUIRED)
 
-if(DTMB_CORE_ENABLE_CUDA_LDPC)
-  enable_language(CUDA)
-  find_package(CUDAToolkit REQUIRED)
-  set(CMAKE_CUDA_STANDARD 20)
-  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-endif()
 
 add_library(dtmb_core
+  src/c1.cpp
   src/c3780.cpp
   src/core.cpp
   src/nr.cpp
@@ -76,16 +78,7 @@ target_compile_features(dtmb_ldpc_h_gate_support PUBLIC cxx_std_20)
 target_include_directories(dtmb_ldpc_h_gate_support PUBLIC tools)
 target_link_libraries(dtmb_ldpc_h_gate_support PUBLIC dtmb::core)
 
-if(DTMB_CORE_ENABLE_CUDA_LDPC)
-  add_library(dtmb_ldpc_cuda_backend STATIC tools/ldpc_cuda_backend.cu)
-  target_compile_definitions(dtmb_ldpc_cuda_backend PUBLIC DTMB_CORE_HAVE_CUDA_LDPC=1)
-  target_link_libraries(dtmb_ldpc_cuda_backend PUBLIC dtmb::core CUDA::cudart)
-else()
-  add_library(dtmb_ldpc_cuda_backend STATIC tools/ldpc_cuda_backend.cpp)
-  target_link_libraries(dtmb_ldpc_cuda_backend PUBLIC dtmb::core)
-endif()
-target_compile_features(dtmb_ldpc_cuda_backend PUBLIC cxx_std_20)
-target_include_directories(dtmb_ldpc_cuda_backend PUBLIC tools)
+include(cmake/CudaBackend.cmake)
 
 add_executable(dtmb_core_ldpc_bch_decode tools/ldpc_bch_decode.cpp)
 target_link_libraries(dtmb_core_ldpc_bch_decode PRIVATE
@@ -106,6 +99,9 @@ install(TARGETS
 
 if(DTMB_CORE_BUILD_TESTS)
   enable_testing()
+  add_executable(dtmb_c1_tests tests/test_c1.cpp)
+  target_link_libraries(dtmb_c1_tests PRIVATE dtmb::core)
+  add_test(NAME dtmb_c1_tests COMMAND dtmb_c1_tests)
   add_executable(dtmb_nr_tests tests/test_nr.cpp)
   target_link_libraries(dtmb_nr_tests PRIVATE dtmb::core)
   add_test(NAME dtmb_nr_tests COMMAND dtmb_nr_tests "${CMAKE_CURRENT_SOURCE_DIR}/tests/nr_appendix_c.txt")

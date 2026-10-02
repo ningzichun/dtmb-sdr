@@ -25,6 +25,7 @@ struct BatchDecodeResult {
 };
 
 [[nodiscard]] bool backend_compiled() noexcept;
+void require_backend();
 
 [[nodiscard]] BatchDecodeResult decode_min_sum_batch(
     std::span<const float> llr,

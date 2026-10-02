@@ -1,11 +1,18 @@
 # Third-Party References
 
-## Browser playback
+## Local ZIP extraction
 
-The static web build bundles [mpegts.js 1.8.0](https://github.com/xqq/mpegts.js)
-under Apache-2.0 for optional local MPEG-TS preview. Its license is distributed
-as `vendor/mpegts-LICENSE.txt`. Dependencies are pinned in `web/package-lock.json`.
-It handles media playback, independently of the DTMB receiver.
+The static web build bundles [fflate](https://github.com/101arrowz/fflate) under
+MIT for local ZIP extraction. Its license is distributed as
+`vendor/fflate-LICENSE.txt`. Dependencies are pinned in `web/package-lock.json`.
+
+## CUDA runtime
+
+The optional `cuda` extra depends on NVIDIA's separately distributed
+`nvidia-cuda-runtime-cu12` package and its NVIDIA license. Its runtime libraries
+are not bundled in the DTMB wheel. CUDA-enabled builds use NVIDIA's CUDA 12
+Toolkit; the DTMB LDPC implementation is project source compiled into an
+optional shared backend.
 
 ## Standard
 

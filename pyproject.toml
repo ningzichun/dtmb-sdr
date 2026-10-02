@@ -40,6 +40,9 @@ Source = "https://github.com/ningzichun/dtmb-sdr"
 
 [project.optional-dependencies]
 dev = ["build>=1", "pytest>=8", "numpy>=1.24"]
+cuda = [
+  "nvidia-cuda-runtime-cu12>=12.9.79,<13; (sys_platform == 'linux' or sys_platform == 'win32') and (platform_machine == 'x86_64' or platform_machine == 'AMD64')",
+]
 
 [project.scripts]
 dtmb-decode = "dtmb.decode:main"
@@ -51,17 +54,38 @@ cmake.build-type = "Release"
 wheel.packages = ["python/dtmb"]
 wheel.py-api = "py3"
 sdist.include = [
-  "core/cpp/**",
-  "python/dtmb/**",
+  "core/cpp/CMakeLists.txt",
+  "core/cpp/cmake/*.cmake",
+  "core/cpp/include/**/*.h",
+  "core/cpp/include/**/*.hpp",
+  "core/cpp/src/*.cpp",
+  "core/cpp/tools/*.cpp",
+  "core/cpp/tools/*.cu",
+  "core/cpp/tools/*.h",
+  "core/cpp/tools/*.hpp",
+  "core/cpp/tests/*.cpp",
+  "core/cpp/tests/*.txt",
+  "python/dtmb/*.py",
+  "python/dtmb/data/*.alist",
   "README.md",
   "LICENSE",
   "THIRD_PARTY.md",
+]
+sdist.exclude = [
+  "**/__pycache__/**",
+  "**/*.py[cod]",
+  "**/*.egg-info/**",
+  "**/build/**",
+  "**/dist/**",
+  "web/node_modules/**",
+  ".pytest_cache/**",
 ]
 
 [tool.scikit-build.cmake.define]
 DTMB_CORE_BUILD_TESTS = "OFF"
 DTMB_CORE_ENABLE_CUDA_LDPC = "OFF"
 DTMB_CORE_ENABLE_FFTW = "OFF"
+CMAKE_MSVC_RUNTIME_LIBRARY = "MultiThreaded"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

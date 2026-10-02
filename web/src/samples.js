@@ -50,9 +50,12 @@ export function applyEntry(entry, fields) {
     else fields.pn.value = pn;
   }
   if ((entry.profile || '').trim()) {
-    const number = Number(entry.profile);
-    if (!Number.isInteger(number) || number < 5 || number > 24) errors.push(`Bad profile "${entry.profile}".`);
-    else fields.profile.value = number;
+    if (entry.profile.trim().toLowerCase() === 'auto') fields.profile.value = 'auto';
+    else {
+      const number = Number(entry.profile);
+      if (!Number.isInteger(number) || number < 3 || number > 24) errors.push(`Bad profile "${entry.profile}".`);
+      else fields.profile.value = number;
+    }
   }
   const tracking = (entry.tracking || '').trim().toLowerCase();
   if (['true', 'false'].includes(tracking)) fields.tracking.checked = tracking === 'true';

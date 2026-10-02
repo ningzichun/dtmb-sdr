@@ -1,3 +1,5 @@
+import { boundedProbeOptions } from './pn-detection.js';
+
 export function profile(index) {
   if (!Number.isInteger(index) || index < 3 || index > 24) throw Error('Choose a supported profile (3–24).');
   const qam = index < 5 ? '4qam-nr' : index < 11 ? '4qam' : index < 17 ? '16qam' : index < 19 ? '32qam' : '64qam';
@@ -16,24 +18,49 @@ export function commands(options) {
     { stage: 'deinterleave_qam64', args: [...qam, '--mode', p.mode, '--phase', '0', '--workers', '1', '--chunk-symbols', '65536', '-', '-'] },
     { stage: 'ldpc_bch_decode', alist: p.rate, args: ['--fec-rate', `${p.rate}`, '--alist', '/code.alist', ...qam, '--codewords-per-frame', `${p.words}`, ...(p.qam === '4qam-nr' ? ['--nr-frame-phase', 'auto'] : []), '--workers', '1', '--decode-batch-frames', '8', '--max-iterations', '100', '--retry-max-iterations', '50', '--attenuation', '0.65', '--clean-frames-only', '--require-output', '--insert-discontinuity-packets', '-', '-'] },
   ];
+  stages[1].args.splice(stages[1].args.length - 2, 0, '--frame-body-mode', options.rateGuess ? 'c3780' : options.bodyMode ?? 'auto');
   return stages;
 }
 
+export function probeCommands(options) {
+  const stages = commands(options).slice(0, 2);
+  const args = stages[1].args;
+  args[args.indexOf('--system-info-index') + 1] = 'auto';
+  if (options.rateGuess) args[args.indexOf('--sync-frames') + 1] = '32';
+  args.splice(args.length - 2, 0, '--max-frames', options.rateGuess ? '1' : '32');
+  return stages;
+}
+
+export function probe(file, options, handlers = {}) {
+  const selected = boundedProbeOptions(file, options);
+  return { ...run(file, selected, handlers, probeCommands(selected), true), options: selected };
+}
+
 export function decode(file, options, handlers = {}) {
+  return run(file, options, handlers, commands(options));
+}
+
+function run(file, options, handlers, specs, discardOutput = false) {
   let position = options.startByte || 0;
   const end = options.endByte ?? file.size;
   let settled = false, total = 0;
   const chunks = [], workers = [], channels = [], logs = {};
-  let rejectRun;
+  const inputProgress = { readBytes: 0, totalBytes: end - position, fraction: 0 };
+  let finishRun;
   const promise = new Promise((resolve, reject) => {
-    rejectRun = reject;
-    const specs = commands(options);
+    let timer;
     const finish = (error) => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
       workers.forEach(w => w.terminate());
       error ? reject(error) : resolve({ blob: new Blob(chunks, { type: 'video/mp2t' }), bytes: total, logs });
     };
+    finishRun = finish;
+    if (discardOutput) {
+      const timeout = options.probeTimeoutMs ?? 30000;
+      timer = setTimeout(() => finish(Error(`PN probe reached its ${timeout / 1000}-second time limit. Results may be incomplete.`)), timeout);
+    }
     const reply = (worker, id, bytes) => worker.postMessage({ type: 'reply', id, bytes: bytes?.buffer }, bytes ? [bytes.buffer] : []);
     const pump = i => {
       const channel = channels[i];
@@ -42,6 +69,7 @@ export function decode(file, options, handlers = {}) {
         const { id, capacity } = channel.read;
         const size = Math.min(capacity, channel.data.length - channel.offset);
         const bytes = channel.data.slice(channel.offset, channel.offset + size);
+        handlers.activity?.(specs[i + 1].stage);
         channel.offset += size;
         reply(workers[i + 1], id, bytes);
         channel.read = null;
@@ -64,15 +92,19 @@ export function decode(file, options, handlers = {}) {
             if (i === 0) {
               const limit = Math.min(end, position + data.capacity);
               const bytes = new Uint8Array(await file.slice(position, limit).arrayBuffer());
+              if (settled) return;
               position = limit;
+              inputProgress.readBytes += bytes.length;
+              inputProgress.fraction = inputProgress.readBytes / inputProgress.totalBytes;
               reply(worker, data.id, bytes);
-              handlers.progress?.((position - (options.startByte || 0)) / (end - (options.startByte || 0)));
+              handlers.progress?.(inputProgress.fraction);
             } else { channels[i - 1].read = data; pump(i - 1); }
           } else if (data.type === 'write') {
             if (i === specs.length - 1) {
               total += data.bytes.byteLength;
               if (total > 256 * 1024 * 1024) throw Error('Output reached 256 MiB. Select a shorter capture interval.');
-              chunks.push(data.bytes); reply(worker, data.id);
+              if (!discardOutput) chunks.push(data.bytes);
+              reply(worker, data.id);
               handlers.output?.(total);
             } else {
               channels[i].data = new Uint8Array(data.bytes);
@@ -82,12 +114,24 @@ export function decode(file, options, handlers = {}) {
             const lines = logs[specs[i].stage];
             if (lines.length < 2000) lines.push(data.line);
             handlers.log?.(specs[i].stage, data.line);
-          } else if (data.type === 'error') finish(Error(`${specs[i].stage}: ${data.message}`));
+          } else if (data.type === 'error') {
+            const error = Error(`${specs[i].stage}: ${data.message}`);
+            if (data.name) error.name = data.name;
+            finish(error);
+          }
           else if (data.type === 'done') {
-            if (data.code !== 0) return finish(Error(`${specs[i].stage} exited ${data.code}. See receiver log.`));
+            if (data.code !== 0) {
+              if (data.code === 2 && logs[specs[i].stage].some(line => line.startsWith('usage: '))) {
+                const error = Error('Receiver build is incompatible with the app. Refresh the page or rebuild the web app; this is not a sample-rate or signal-quality failure.');
+                error.name = 'ReceiverBuildError';
+                return finish(error);
+              }
+              const nativeError = logs[specs[i].stage].findLast(line => line.startsWith(`dtmb_core_${specs[i].stage}: `));
+              return finish(Error(nativeError || `${specs[i].stage} exited ${data.code}. See receiver log.`));
+            }
             channels[i].eof = true; handlers.stage?.(i);
             if (i < specs.length - 1) pump(i);
-            else if (!total) finish(Error('No clean transport recovered. Check the spectrum, format, rate and profile.'));
+            else if (!total && !discardOutput) finish(Error('No clean transport recovered. Check the input format, sample rate, PN mode and transmission profile.'));
             else finish();
           }
         } catch (error) { finish(error); }
@@ -96,8 +140,6 @@ export function decode(file, options, handlers = {}) {
     workers.forEach((worker, i) => worker.postMessage({ type: 'run', ...specs[i] }));
   });
   return { promise, cancel() {
-    if (settled) return;
-    settled = true; workers.forEach(w => w.terminate());
-    rejectRun(new DOMException('Decode cancelled.', 'AbortError'));
-  }, logs };
+    finishRun(new DOMException('Receiver operation cancelled.', 'AbortError'));
+  }, logs, inputProgress };
 }

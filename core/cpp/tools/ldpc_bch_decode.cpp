@@ -55,7 +55,8 @@ struct DtmbLdpcProfile {
 
 void usage(const char* program) {
     std::cerr
-        << "usage: " << program
+        << "usage: " << program << " --cuda-check\n"
+        << "       " << program
         << " --fec-rate 1|2|3 --alist PATH [--codewords-per-frame N]"
         << " [--qam 4qam-nr|4qam|16qam|32qam|64qam] [--qam32-frame-phase auto|0|1]"
         << " [--nr-frame-phase auto|0|1]"
@@ -2571,6 +2572,16 @@ bool has_transmitted_llr_evidence(
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--cuda-check") {
+        try {
+            dtmb::tools::ldpc_cuda::require_backend();
+            std::cerr << "cuda_backend=cuda12\n";
+            return 0;
+        } catch (const std::exception& error) {
+            std::cerr << "dtmb_core_ldpc_bch_decode: " << error.what() << '\n';
+            return 1;
+        }
+    }
     std::size_t fec_rate = 0;
     std::size_t codewords_per_frame = 3;
     bool codewords_per_frame_explicit = false;
@@ -3360,10 +3371,8 @@ int main(int argc, char** argv) {
             usage(argv[0]);
             return 2;
         }
-        if (ldpc_accel == LdpcAccel::cuda && !dtmb::tools::ldpc_cuda::backend_compiled()) {
-            throw std::runtime_error(
-                "--ldpc-accel cuda requested, but this binary was built without "
-                "DTMB_CORE_ENABLE_CUDA_LDPC=ON");
+        if (ldpc_accel == LdpcAccel::cuda) {
+            dtmb::tools::ldpc_cuda::require_backend();
         }
         if (cuda_retry_clips) {
             if (ldpc_accel != LdpcAccel::cuda) {

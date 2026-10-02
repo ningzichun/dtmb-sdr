@@ -42,7 +42,7 @@ export class Waterfall {
 
 export class Spectrum {
   constructor(canvas, overlay) { this.canvas = canvas; this.overlay = overlay; this.bins = null; }
-  draw(bins = this.bins, rate = this.rate || 15120000, center = this.center || 0, floor = -100, ceiling = -15) {
+  draw(bins = this.bins, rate = this.rate || 0, center = this.center || 0, floor = -100, ceiling = -15) {
     this.bins = bins; this.rate = rate; this.center = center;
     const canvas = this.canvas, ratio = window.devicePixelRatio || 1;
     canvas.width = Math.round(canvas.clientWidth * ratio); canvas.height = Math.round(canvas.clientHeight * ratio);
@@ -56,7 +56,7 @@ export class Spectrum {
     for (let n = 0; n <= 8; n++) {
       const x = n / 8 * width; c.strokeStyle = '#19283a'; c.beginPath(); c.moveTo(x, 0); c.lineTo(x, height - 24); c.stroke();
       c.fillStyle = '#778a9f'; c.textAlign = n === 0 ? 'left' : n === 8 ? 'right' : 'center';
-      c.fillText(((center + (n / 8 - .5) * rate) / 1e6).toFixed(2), x, height - 7);
+      c.fillText(Number.isFinite(rate) && rate > 0 ? ((center + (n / 8 - .5) * rate) / 1e6).toFixed(2) : '—', x, height - 7);
     }
     c.textAlign = 'left';
     if (!bins) { c.fillStyle = '#53677f'; c.font = '13px system-ui'; c.fillText('Open a capture to inspect its spectrum', width / 2 - 130, height / 2); return; }

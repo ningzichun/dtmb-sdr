@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -28,12 +29,9 @@ def main():
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
     shutil.copytree(ROOT/'web/src', out, dirs_exist_ok=True)
-    player = ROOT/'web/node_modules/mpegts.js'
-    if not (player/'dist/mpegts.js').is_file():
-        raise SystemExit('Run npm ci --prefix web before building the browser app')
     (out/'vendor').mkdir(exist_ok=True)
-    shutil.copy2(player/'dist/mpegts.js', out/'vendor/mpegts.js')
-    shutil.copy2(player/'LICENSE', out/'vendor/mpegts-LICENSE.txt')
+    for retired in ('player.js', 'vendor/mpegts.js', 'vendor/mpegts-LICENSE.txt'):
+        (out / retired).unlink(missing_ok=True)
     fflate = ROOT/'web/node_modules/fflate'
     if not (fflate/'esm/browser.js').is_file():
         raise SystemExit('Run npm ci --prefix web before building the browser app')
@@ -45,7 +43,6 @@ def main():
             shutil.copy2(build/f'{name}.{ext}', out/'wasm')
     shutil.copytree(ROOT/'python/dtmb/data', out/'data', dirs_exist_ok=True)
     sha = subprocess.check_output(['git','rev-parse','HEAD'], cwd=ROOT, text=True).strip()
-    import re
     cmake = (ROOT/'core/cpp/CMakeLists.txt').read_text(encoding='utf-8')
     core_version = re.search(r'project\(dtmb_core VERSION (\S+)', cmake).group(1)
     dirty = bool(subprocess.check_output(['git','status','--porcelain','--untracked-files=no'], cwd=ROOT, text=True).strip())
@@ -54,7 +51,22 @@ def main():
         if path.suffix in {'.cpp','.hpp','.h'}:
             source_hash.update(path.relative_to(ROOT).as_posix().encode())
             source_hash.update(path.read_bytes())
+    web_hash = hashlib.sha256(Path(__file__).read_bytes())
+    for path in sorted((ROOT/'web/src').rglob('*')):
+        if path.is_file():
+            web_hash.update(path.relative_to(ROOT/'web/src').as_posix().encode())
+            web_hash.update(path.read_bytes())
+    web_revision = web_hash.hexdigest()
+    script_path = re.compile(r"(['\"])(\./[^'\"\n?]+\.js)\1")
+    for path in sorted(out.glob('*.js')) + [out/'index.html']:
+        content = script_path.sub(lambda match: f'{match[1]}{match[2]}?v={web_revision}{match[1]}',
+                                  path.read_text(encoding='utf-8'))
+        if path.name == 'index.html':
+            content = content.replace('href="./style.css"', f'href="./style.css?v={web_revision}"')
+        path.write_text(content, encoding='utf-8')
     (out/'build.json').write_text(json.dumps({'commit':sha,'dirty':dirty,'core':'dtmb-sdr','coreVersion':core_version,'coreSourceSha256':source_hash.hexdigest(),
+        'webSourceSha256':web_revision,
+        'loaders':{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in (out/'wasm').glob('*.mjs')},
         'wasm':{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in (out/'wasm').glob('*.wasm')}}), encoding='utf-8')
     (out/'.nojekyll').touch()
     print(f'Web app built: {out}')

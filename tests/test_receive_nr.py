@@ -11,7 +11,6 @@ import subprocess
 import numpy as np
 import pytest
 
-from synthetic_support import modulate
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -25,9 +24,14 @@ def appendix_c():
     return ((words[:, None] >> np.arange(15, -1, -1)) & 1).astype(np.uint8)
 
 
+def qam4_symbols(bits):
+    components = np.where(np.asarray(bits).reshape(-1, 2) == 0, -4.5, 4.5)
+    return (components[:, 0] + 1j * components[:, 1]).astype(np.complex64)
+
+
 def nr_modulate(bits):
     indices = np.packbits(bits.reshape(-1, 8), axis=1).ravel()
-    return modulate(appendix_c()[indices].ravel(), 4)
+    return qam4_symbols(appendix_c()[indices].ravel())
 
 
 def run(command, data=None, cwd=None):
@@ -39,7 +43,7 @@ def run(command, data=None, cwd=None):
 @pytest.mark.parametrize("method", ["max-log", "log-sum-exp"])
 @pytest.mark.parametrize("chunk", [8, 1872, 3744])
 def test_nr_soft_decode_matches_all_appendix_c_joint_likelihoods(native, method, chunk):
-    reference = modulate(appendix_c().ravel(), 4).reshape(256, 8)
+    reference = qam4_symbols(appendix_c().ravel()).reshape(256, 8)
     flat = reference.reshape(-1)
     result = run(native("qam_softdemap", "--qam", "4qam-nr",
                         "--soft-demod-method", method,

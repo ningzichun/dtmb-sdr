@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 from typing import BinaryIO, Sequence
+from .cuda import native_cuda_environment
 
 
 SYMBOL_RATE = 7_560_000
@@ -59,6 +60,11 @@ def build_commands(args: argparse.Namespace) -> list[list[str]]:
         raise ValueError("--system-info-index must be 3/4 (4QAM-NR), 5..10 (4QAM), 11..16 (16QAM), 17..18 (32QAM) or 19..24 (64QAM)")
     if args.pn_mode not in ("pn420", "pn595", "pn945"):
         raise ValueError("--pn-mode must be pn420, pn595 or pn945")
+    frame_body_mode = getattr(args, "frame_body_mode", "c3780")
+    if frame_body_mode not in {"auto", "c1", "c3780"}:
+        raise ValueError("--frame-body-mode must be auto, c1 or c3780")
+    if frame_body_mode == "c1" and args.pn_mode != "pn595":
+        raise ValueError("C=1 processing requires PN595")
     if args.pn_mode == "pn595" and args.pn_schedule_tracking:
         raise ValueError("PN595 uses fixed-sequence timing tracking, without cyclic PN schedule options")
     fec_rate, interleaver = PROFILES[args.system_info_index]
@@ -128,6 +134,8 @@ def build_commands(args: argparse.Namespace) -> list[list[str]]:
             "--system-info-index",
             str(args.system_info_index),
     ]
+    if frame_body_mode != "c3780":
+        frontend.extend(["--frame-body-mode", frame_body_mode])
     if precise:
         frontend.extend(["--input-format", "cf32"])
     if args.pn_schedule_tracking:
@@ -213,6 +221,8 @@ def run(commands: list[list[str]]) -> int:
                 command,
                 stdin=previous,
                 stdout=None if index == len(commands) - 1 else subprocess.PIPE,
+                env=native_cuda_environment() if "--ldpc-accel" in command
+                and command[command.index("--ldpc-accel") + 1] == "cuda" else None,
             )
             if previous is not None:
                 previous.close()
@@ -239,6 +249,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-rate", type=int, required=True)
     parser.add_argument("--output", default="-", help="MPEG-TS path or - for stdout")
     parser.add_argument("--pn-mode", choices=("pn420", "pn595", "pn945"), default="pn945")
+    parser.add_argument("--frame-body-mode", choices=("auto", "c1", "c3780"), default="c3780",
+                        help="Frame-body processing; Auto additionally checks PN595/C=1 normal 4QAM.")
     parser.add_argument("--system-info-index", type=int, choices=tuple(PROFILES), default=22,
                         help="3/4: 4QAM-NR; 5..10: 4QAM; 11..16: 16QAM; 17..18: 32QAM; 19..24: 64QAM (default 22)")
     parser.add_argument("--nr-frame-phase", choices=("auto", "0", "1"), default="auto",

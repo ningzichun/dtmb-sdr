@@ -20,30 +20,46 @@
         <div class="samples-url"><input id="url" type="url" inputmode="url" spellcheck="false" placeholder="https://… .ci8/.zip link" aria-label="Load IQ capture or ZIP from URL"><button id="url-load" class="button secondary small" type="button">Load ↗</button></div>
       </div>
       <label>Sample format<select id="format"><option value="ci8">CI8 / CS8 · signed 8-bit</option><option value="cu8">CU8 · unsigned 8-bit</option><option value="ci16">CI16 / SC16 · signed 16-bit LE</option><option value="cf32">CF32 · float 32-bit LE</option></select></label>
-      <label>Sample rate <span>samples / second</span><input id="rate" type="number" min="1" max="4294967295" step="1" value="20000000" required></label>
+      <div class="rate-field"><label for="rate">Sample rate <span>samples / second</span></label><div class="rate-input"><input id="rate" type="number" min="1" max="4294967295" step="1" placeholder="Enter or guess" aria-describedby="rate-status" required><button id="guess-rate" class="button secondary small" type="button" disabled>Guess</button></div><p id="rate-status" class="hint" role="status">Enter the recording rate, or guess common rates from PN.</p></div>
       <label>Center frequency <span>MHz · display only</span><input id="center" type="number" min="0" step="0.001" value="538"></label>
       <div class="two-col"><label>Start <span>seconds</span><input id="start" type="number" min="0" step="0.1" value="0"></label><label>Duration <span>seconds</span><input id="duration" type="number" min="0" step="0.1" value="2"></label></div>
       <p class="hint">Duration 0 selects the rest of the file. Use a short interval for a first decode.</p>
+      <label class="checkbox"><input id="auto-scan-pn" type="checkbox" checked> Scan PN modes after inspection</label>
       <button id="inspect" class="button primary" disabled>Inspect capture <span>↗</span></button>
       <div class="rule"></div>
       <div class="panel-title"><h2>DTMB receiver</h2><span class="step">02</span></div>
-      <label>Frame header<select id="pn"><option value="pn945">PN945</option><option value="pn595">PN595</option><option value="pn420">PN420</option></select></label>
-      <label>Transmission profile<select id="profile"></select></label>
+      <label>PN mode<select id="pn"><option value="auto" selected>Auto (default)</option><option value="pn945">PN945</option><option value="pn595">PN595</option><option value="pn420">PN420</option></select></label>
+      <label>Transmission profile<select id="profile"><option value="auto" selected>Auto (default)</option></select></label>
+      <p id="receiver-selection" class="hint" role="status">Auto selection is waiting for a PN scan.</p>
       <label class="checkbox"><input id="tracking" type="checkbox"> Track cyclic PN schedule <span title="Optional; applies to PN420/PN945. Enable only when appropriate for your capture.">ⓘ</span></label>
-      <button id="decode" class="button secondary" disabled>Decode to MPEG-TS <span>→</span></button><button id="cancel" class="button danger" hidden>Stop decoding</button>
-      <p class="hint">Choose the transmitted profile.</p>
+      <button id="decode" class="button secondary" disabled>Decode to MPEG-TS <span>→</span></button><button id="cancel" class="button danger" hidden>Stop receiver</button>
+      <p class="hint">Auto follows PN acquisition and system-information lock. Select a specific mode or profile to override it.</p>
     </aside>
     <div class="workspace">
       <section class="panel display"><div class="panel-title"><div class="title-line"><span class="live-dot"></span><h2>Spectrum & waterfall</h2><span id="plot-state" class="muted">Waiting for capture</span></div><span class="unit">dBFS / bin · MHz</span></div>
-        <canvas id="spectrum" aria-label="IQ power spectrum"></canvas>
-        <div class="waterfall-label"><span>WATERFALL</span><span id="waterfall-scope">128 sampled windows across the selected interval</span></div>
-        <canvas id="waterfall" aria-label="WebGL waterfall of sampled IQ windows"></canvas>
-        <div class="plot-footer"><span><i class="legend"></i> Hann window · 2,048-point FFT</span><label>Floor <input id="floor" type="range" min="-140" max="-45" value="-100" aria-label="Spectrum floor"><output id="floor-value">−100 dB</output></label></div>
+        <div class="spectrum-pn"><div class="plots-view"><div class="spectrum-view"><canvas id="spectrum" aria-label="IQ power spectrum"></canvas></div>
+          <div class="waterfall-label"><span>WATERFALL</span><span id="waterfall-scope">128 sampled windows across the selected interval</span></div>
+          <canvas id="waterfall" aria-label="WebGL waterfall of sampled IQ windows"></canvas>
+          <div class="plot-footer"><span><i class="legend"></i> Hann window · 2,048-point FFT</span><label>Floor <input id="floor" type="range" min="-140" max="-45" value="-100" aria-label="Spectrum floor"><output id="floor-value">−100 dB</output></label></div>
+        </div>
+          <section class="pn-summary" aria-label="PN detection summary">
+            <h2>PN detection</h2><p id="pn-summary" role="status">PN945: Not tested.</p>
+            <dl class="pn-values"><dt>Results for</dt><dd id="pn-result-mode">PN945</dd><dt>Configured mode</dt><dd id="pn-configured">Auto</dd><dt>Detection state</dt><dd id="pn-state">Not tested</dd><dt>Header hits</dt><dd id="pn-hits">—</dd><dt>Correlation / threshold</dt><dd id="pn-correlation">—</dd><dt>Peak correlation</dt><dd id="pn-peak">—</dd><dt>Estimated offset (coarse)</dt><dd id="pn-offset">—</dd><dt>Header / frame symbols</dt><dd id="pn-dimensions">—</dd><dt>Frame period</dt><dd id="pn-period">—</dd><dt>Frames / superframe</dt><dd id="pn-superframe">—</dd></dl>
+            <p class="hint">Correlation is a normalized metric, not SNR.</p><p id="pn-context" class="hint">No interval analyzed.</p>
+            <h3 class="pn-section-title">System information</h3>
+            <dl class="pn-values"><dt>Lock state</dt><dd id="si-state">Not tested</dd><dt>Frame body</dt><dd id="si-body">—</dd><dt>Detected profile</dt><dd id="si-profile">—</dd><dt>Modulation</dt><dd id="si-modulation">—</dd><dt>FEC rate</dt><dd id="si-fec">—</dd><dt>Interleaver</dt><dd id="si-interleaver">—</dd><dt>SI metric / margin</dt><dd id="si-confidence">—</dd><dt>Observations</dt><dd id="si-observations">—</dd></dl>
+            <p id="si-settings" class="hint">A configured profile is separate from a detected profile.</p>
+            <details><summary>Timing details</summary><p id="pn-timing" class="hint">Not tested.</p></details>
+            <ul id="pn-modes" class="pn-modes"><li>PN420: Not tested</li><li>PN595: Not tested</li><li>PN945: Not tested</li></ul>
+            <div class="pn-actions"><button id="test-pn" class="button secondary small" disabled>Test configured PN</button><button id="scan-pn" class="button secondary small" disabled>Scan PN modes</button></div>
+            <p class="hint">Probe: first 0.2 s, at most 16 MiB and 30 s per mode. Scan tests all three; configuration stays explicit.</p>
+          </section>
+        </div>
       </section>
       <section class="metrics" aria-label="Capture measurements"><article class="panel metric"><span>RECORDED LEVEL</span><strong id="rms">— <small>dBFS</small></strong><p>RMS per component</p></article><article class="panel metric"><span>CLIPPING</span><strong id="clipping">— <small>%</small></strong><p>Sampled I / Q components</p></article><article class="panel metric"><span>DC OFFSET</span><strong id="dc">—</strong><p>Normalized I / Q mean</p></article><article class="panel metric"><span>CAPTURE LENGTH</span><strong id="length">— <small>s</small></strong><p id="sample-count">From file size and input rate</p></article></section>
       <section class="panel health"><div class="panel-title"><h2>Capture check</h2><span id="health-badge" class="badge">NOT INSPECTED</span></div><div id="findings"><p class="empty">Your spectrum is the first check. A successful DTMB decode is the next.</p><p class="hint">Format, sample rate, clipping, and I/Q balance are checked over sampled windows. Only receiver lock and clean FEC output can establish that a capture contains decodable DTMB.</p></div></section>
-      <section class="panel receiver"><div class="panel-title"><h2>Receiver output</h2><span id="receiver-badge" class="badge">IDLE</span></div><div class="stages"><span>01 <b>Condition</b></span><span>02 <b>Synchronize</b></span><span>03 <b>Demap</b></span><span>04 <b>Recover TS</b></span></div><progress id="progress" value="0" max="1" aria-label="Capture input progress"></progress><div class="status-row"><p id="status" role="status" aria-live="polite">Open a file to begin.</p><a id="download" class="button small" hidden>Download .ts ↓</a></div><p id="transport" class="hint"></p><button id="preview" class="button secondary small" hidden>Preview video ?</button><video id="video" controls playsinline hidden></video><p id="preview-status" class="hint"></p><details><summary>Receiver log</summary><pre id="log">No receiver run yet.</pre></details></section>
-      <section class="panel report"><div><h2>Sharing a capture problem?</h2><p>Attach the diagnostic report, your RF settings, and a short original IQ recording.</p></div><div class="report-actions"><button id="report" class="button secondary small" disabled>Save report ↓</button><a id="issue" class="text-link" href="https://github.com/ningzichun/dtmb-sdr/issues/new?template=capture.yml" target="_blank" rel="noreferrer">Prepare an issue ↗</a></div></section>
+      <section class="panel receiver"><div class="panel-title"><h2>Receiver output</h2><span id="receiver-badge" class="badge">IDLE</span></div><ol class="receiver-stages" aria-label="Receiver stages"><li>PN acquisition →<strong id="stage-pn">Not tested</strong></li><li>System-information lock →<strong id="stage-si">Not tested</strong></li><li>FEC recovery →<strong id="stage-fec">Not tested</strong></li><li>TS validation<strong id="stage-ts">Not tested</strong></li></ol><progress id="progress" max="1" aria-label="Receiver input read" aria-describedby="progress-status" hidden></progress><p id="progress-status" class="hint" data-state="idle"></p><div class="status-row"><p id="status" role="status" aria-live="polite">Open a file to begin.</p><a id="download" class="button small" hidden>Download .ts ↓</a></div><p id="transport" class="hint"></p><button id="ts-info" class="button secondary small" hidden>Transport stream info</button><details id="ts-details" hidden><summary>Programs and tracks</summary><div id="ts-content"></div><p class="hint">Track declarations come from CRC-valid PAT/PMT tables.</p></details><details><summary>Receiver log</summary><pre id="log">No receiver run yet.</pre></details></section>
+      <section class="panel report"><div><h2>Diagnostic report</h2><p>Save capture settings, PN observations and receiver results for your records.</p></div><div class="report-actions"><button id="report" class="button secondary small" disabled>Save report ↓</button></div></section>
     </div>
   </div>
 </main>

@@ -1,4 +1,5 @@
 #include "dtmb/core.hpp"
+#include "dtmb/c1.hpp"
 #include "dtmb/worker.hpp"
 
 #include <algorithm>
@@ -1888,6 +1889,18 @@ decltype(auto) dispatch_pn(PnMode mode, Function&& function) {
 }
 
 }  // namespace
+
+std::vector<float> pn595_linear_channel_cf32(std::span<const float> header) {
+    const auto taps = PnChannel<PnMode::pn595>::estimate_direct_channel_taps(header, 595, 1.0e-3F, 149);
+    std::vector<float> result(298);
+    for (std::size_t column = 0; column < 149; ++column) {
+        const auto delay = static_cast<int>(column) - 74;
+        const auto position = static_cast<std::size_t>((delay + 595) % 595);
+        result[column * 2] = taps[position].real();
+        result[column * 2 + 1] = taps[position].imag();
+    }
+    return result;
+}
 
 std::size_t pn_detect_phase_cf32(PnMode mode, std::span<const float> header) {
     return dispatch_pn(mode, [&](auto impl) { return impl.pn_detect_phase_cf32(header); });

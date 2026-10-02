@@ -9,6 +9,12 @@ body:
         Check the spectrum, actual export format and sample rate, and run a short decode.
         Files stay on your device. Save the diagnostic report and attach it below.
 
+        For a first test, aim for a strong, stable signal with a good signal-to-noise
+        ratio (SNR) and little interference. Adjust gain for a useful sample level
+        without clipping or receiver overload; more gain is not always better.
+        If weak or noisy reception is the issue, share that capture and mention
+        the conditions.
+
         A healthy DTMB multiplex in an 8 MHz channel occupies about 7.56 MHz and looks like
         this: a broad digital signal covering most of the channel, not narrow spectral peaks.
         The exact shape varies with SDR filtering, multipath and gain.
@@ -39,7 +45,12 @@ body:
     id: recording
     attributes:
       label: Original recording and observed behavior
-      description: Link a short original IQ recording, include its byte size and SHA-256, and describe expected and actual results. Avoid converting to CI8 before sharing CI16 captures.
+      description: |
+        Share a short IQ recording in its original format. Include the file size and SHA-256 hash, and tell us what you expected and what happened.
+
+        Thanks for sharing a sample. Please check that you're allowed to post it publicly, and respect access restrictions on encrypted or subscription broadcasts.
+
+        GitHub issue attachments, including ZIP files, may be limited to 25 MB. For larger recordings, Google Drive is recommended for easier uploads and downloads. Set sharing to "Anyone with the link", allow downloads, and paste the link here so others can download without requesting access.
     validations:
       required: true
 

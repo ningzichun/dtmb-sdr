@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CORE "${CMAKE_CURRENT_SOURCE_DIR}/../core/cpp")
 add_library(receiver STATIC
   ${CORE}/src/core.cpp ${CORE}/src/nr.cpp ${CORE}/src/iq.cpp ${CORE}/src/resampler.cpp
-  ${CORE}/src/c3780.cpp ${CORE}/src/frame_sync.cpp ${CORE}/src/pn_channel.cpp
+  ${CORE}/src/c1.cpp ${CORE}/src/c3780.cpp ${CORE}/src/frame_sync.cpp ${CORE}/src/pn_channel.cpp
   ${CORE}/src/fec.cpp ${CORE}/src/transport.cpp)
 target_include_directories(receiver PUBLIC ${CORE}/include)
 target_compile_options(receiver PRIVATE -O3 -fexceptions)

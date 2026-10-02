@@ -6,7 +6,6 @@
     "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
-    "fflate": "^0.8.3",
-    "mpegts.js": "1.8.0"
+    "fflate": "^0.8.3"
   }
 }

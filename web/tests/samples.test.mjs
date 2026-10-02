@@ -32,6 +32,11 @@ test('entry values map onto form fields with validation', () => {
   assert.equal(fields.tracking.checked, true);
   const bad = applyEntry({ name: 'x', url: 'http://insecure', format: 'bogus', pn_mode: 'pn999', profile: '99', sample_rate_sps: '-1' }, fields);
   assert.equal(bad.length, 5);
+  fields.pn.options.push({ value: 'auto' });
+  assert.deepEqual(applyEntry({ url: 'https://example.com/a.ci8', pn_mode: 'auto', profile: 'auto' }, fields), []);
+  assert.equal(fields.pn.value, 'auto'); assert.equal(fields.profile.value, 'auto');
+  assert.deepEqual(applyEntry({ url: 'https://example.com/a.ci8', profile: '3' }, fields), []);
+  assert.equal(fields.profile.value, 3);
 });
 
 test('zip entry selection honours archive_entry or finds the IQ file', () => {
