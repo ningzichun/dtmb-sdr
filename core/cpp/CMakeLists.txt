@@ -7,7 +7,7 @@ if(CMAKE_HOST_APPLE AND CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS "10.15")
   message(FATAL_ERROR "The native receiver requires macOS 10.15 or later; set MACOSX_DEPLOYMENT_TARGET accordingly")
 endif()
 
-project(dtmb_core VERSION 0.4.1 LANGUAGES C CXX)
+project(dtmb_core VERSION 0.4.2 LANGUAGES C CXX)
 
 option(DTMB_CORE_BUILD_TESTS "Build dtmb-core tests" ON)
 option(DTMB_CORE_ENABLE_CUDA_LDPC "Build the optional CUDA LDPC backend" OFF)
