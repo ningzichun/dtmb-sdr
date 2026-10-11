@@ -24,7 +24,7 @@ def main():
         raise SystemExit('Activate Emscripten 4.0.15 or pass --emsdk PATH')
     build = ROOT / 'build/web-wasm'
     subprocess.run([emcmake, 'cmake', '-S', str(ROOT/'web'), '-B', str(build),
-                    '-DCMAKE_BUILD_TYPE=Release'], env=env, check=True)
+                    '-DCMAKE_BUILD_TYPE=Release', '-DDTMB_WEB_PTHREADS=OFF'], env=env, check=True)
     subprocess.run(['cmake', '--build', str(build), '--parallel', '4'], env=env, check=True)
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)

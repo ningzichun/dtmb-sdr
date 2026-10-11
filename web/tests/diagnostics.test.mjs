@@ -4,7 +4,7 @@ import { readIQ, spectrum, inspect } from '../src/diagnostics.js';
 import { commands, profile } from '../src/pipeline.js';
 import { createDetection, observeDetection, detectionSummary, resolveReceiver } from '../src/pn-detection.js';
 import { TransportMetadata, mpegSectionCrc, pcrSyntaxError } from '../src/transport-info.js';
-import { commonSampleRates, selectRateGuess } from '../src/sample-rate.js';
+import { commonSampleRates, selectRateGuess, rateGuessSnapshot } from '../src/sample-rate.js';
 test('signed aliases, unsigned centering and low CI16 bits', () => {
   assert.deepEqual([...readIQ(Uint8Array.of(0,128,255,129).buffer,'cu8')],[-1,0,127/128,1/128]);
   assert.deepEqual([...readIQ(Int16Array.of(-32768,1,32767,-1).buffer,'sc16')],[-1,1/32768,32767/32768,-1/32768]);
@@ -60,6 +60,10 @@ test('sample-rate guessing requires a complete scan and unique or dominant acqui
   const selected = candidates.find(candidate => candidate.rate === 12500000);
   const alternative = candidates.find(candidate => candidate.rate === 15120000);
   selected.detections.pn595 = acquired;
+  const early = selectRateGuess([selected], { allowPartial: true });
+  assert.equal(early.rate, 12500000);
+  assert.equal(early.complete, false);
+  assert.equal(rateGuessSnapshot({ candidates: [selected], appliedGuess: early }).provisional, true);
   assert.equal(selectRateGuess(candidates).rate, 12500000);
   assert.equal(selectRateGuess(candidates.slice(0, -1)).rate, null);
   alternative.detections.pn595 = acquired;

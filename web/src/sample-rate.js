@@ -33,7 +33,7 @@ function strongAcquisition(result) {
     && Number.isFinite(metric) && Number.isFinite(threshold) && threshold > 0 && metric >= threshold;
 }
 
-export function selectRateGuess(candidates) {
+export function selectRateGuess(candidates, { allowPartial = false } = {}) {
   const complete = commonSampleRates.every(rate => pnModes.every(mode => {
     const result = candidates.find(candidate => candidate.rate === rate)?.detections?.[mode];
     return result?.runStatus === 'complete' && result.state !== 'not-tested'
@@ -45,18 +45,25 @@ export function selectRateGuess(candidates) {
       .sort((first, second) => second.metric - first.metric);
     return matches.length ? [{ rate: candidate.rate, ...matches[0] }] : [];
   }).sort((first, second) => second.metric - first.metric);
-  if (!complete) return { rate: null, complete, reason: 'Rate guess incomplete. Enter the known rate or retry.' };
+  if (!complete && !allowPartial) return { rate: null, complete, reason: 'Rate guess incomplete. Enter the known rate or retry.' };
   if (!acquired.length) return { rate: null, complete, reason: 'No common rate confirmed by PN. Check input format, enter the known sample rate, or check signal quality.' };
   const best = acquired[0], runnerUp = acquired[1], margin = runnerUp ? best.metric - runnerUp.metric : null;
-  if (runnerUp && (margin < 0.1 || best.metric < runnerUp.metric * 1.5)) return { rate: null, complete,
-    reason: `Multiple sample rates match PN (${acquired.map(candidate => (candidate.rate / 1e6).toFixed(3)).join(', ')} MS/s). Enter the known rate; no guess was applied.` };
+  if (runnerUp && (margin < 0.1 || best.metric < runnerUp.metric * 1.5)) return { rate: null, complete, ambiguous: true,
+    reason: `Multiple sample rates match PN (${acquired.map(candidate => (candidate.rate / 1e6).toFixed(3)).join(', ')} MS/s). Check the recording's known rate.` };
   return { ...best, margin, runnerUpMetric: runnerUp?.metric ?? null, complete, reason: 'Guessed from PN acquisition, not capture metadata.' };
+}
+
+// An early match is an editable candidate, never a completed scan or receiver lock.
+export function rateGuessSnapshot(evidence, selection = selectRateGuess(evidence.candidates, { allowPartial: true })) {
+  const retained = selection.rate ? selection : evidence.appliedGuess;
+  return { ...evidence, ...selection, rate: retained?.rate ?? null, mode: retained?.mode ?? null,
+    selectedRate: selection.complete ? selection.rate : null, provisional: !selection.complete || !selection.rate };
 }
 
 export function guessSampleRate(file, options, handlers = {}) {
   rateGuessOptions(file, options, commonSampleRates[0]);
   let active, cancelled = false, timedOut = false;
-  const evidence = { candidates: [], format: options.format, testedRates: [...commonSampleRates],
+  const evidence = { candidates: [], appliedGuess: null, format: options.format, testedRates: [...commonSampleRates],
     limits: { secondsPerProbe: 0.04, bytesPerProbe: 16 * 1024 * 1024, millisecondsPerProbe: 3000, totalMilliseconds: 45000 } };
   const timer = setTimeout(() => { timedOut = true; active?.cancel(); }, evidence.limits.totalMilliseconds);
   const promise = (async () => {
@@ -87,10 +94,13 @@ export function guessSampleRate(file, options, handlers = {}) {
             if (timedOut) throw Error('Sample-rate guess reached its 45-second limit. Enter the known rate or retry.');
             if (cancelled || ['AbortError', 'ReceiverBuildError'].includes(error.name)) throw error;
           } finally { result.inputProgress = active.inputProgress; result.logs = active.logs; }
+          const selection = selectRateGuess(evidence.candidates, { allowPartial: true });
+          if (selection.rate) evidence.appliedGuess = selection;
+          handlers.result?.(rateGuessSnapshot(evidence, selection));
         }
       }
       if (cancelled) throw new DOMException('Sample-rate guess cancelled.', 'AbortError');
-      return { ...evidence, ...selectRateGuess(evidence.candidates) };
+      return rateGuessSnapshot(evidence);
     } finally { clearTimeout(timer); }
   })();
   return { promise, evidence, cancel() { cancelled = true; active?.cancel(); } };
