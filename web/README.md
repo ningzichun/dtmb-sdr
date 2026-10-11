@@ -164,7 +164,7 @@ versions and WebAssembly hashes are checked to keep receiver assets consistent.
 ## Continue in a terminal
 
 The **CLI recipe** panel assembles commands from the current input format,
-sample rate, resolved PN/profile, PN tracking and selected time interval.
+sample rate, resolved PN/profile and PN tracking, using the entire recording.
 Resolve Auto through inspection, or select known PN/profile values explicitly.
 Edit **Input path** to point at the same local recording and choose an output
 path. Select **Bash** or **PowerShell** for your terminal.
@@ -176,11 +176,9 @@ a Windows/Linux x86-64 wheel, an NVIDIA GPU and a CUDA 12/13 compatible driver.
 Python 3.10+ is required for the package.
 
 **Copy recipe** copies installation, decoding and `dtmb-ts-analyze` checks.
-You can also copy just the decode command or pip installation. For a selected
-interval, the decode command first uses bounded Python file I/O to write a
-`.interval` I/Q file, then decodes those same sample-aligned bytes. Keep space
-for this file and the recovered TS. Duration `0` with Start `0` uses the original
-recording directly.
+You can also copy just the decode command or pip installation. The command
+reads the original input file directly. Start and Duration control the browser's
+inspection and decoding window; the CLI recipe decodes the full file.
 
 The generated command selects the browser's 100 LDPC iterations and
 `--error-policy continue`. Failed FEC groups retain discontinuity markers, and

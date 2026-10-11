@@ -78,8 +78,9 @@ function lock(busy) {
   renderRecipe();
 }
 function renderRecipe() {
-  let selected;
-  if (file) { try { selected = options(); } catch {} }
+  const selection = receiverSelection();
+  const selected = { rate: Number($('rate').value), format: $('format').value,
+    pn: selection.pn, profile: selection.profile, bodyMode: 'auto', tracking: $('tracking').checked };
   recipe = cliRecipe(file, selected, { shell: $('cli-shell').value, cuda: $('cli-backend').value === 'cuda',
     install: $('cli-install').checked, input: $('cli-input').value, output: $('cli-output').value });
   $('cli-command').textContent = recipe.recipe || 'Confirm the receiver settings to generate a command.';
@@ -89,7 +90,7 @@ function renderRecipe() {
   $('cli-copy-status').textContent = '';
 }
 for (const id of ['cli-shell', 'cli-backend', 'cli-install']) $(id).addEventListener('change', renderRecipe);
-for (const id of ['cli-input', 'cli-output', 'start', 'duration']) $(id).addEventListener('input', renderRecipe);
+for (const id of ['cli-input', 'cli-output']) $(id).addEventListener('input', renderRecipe);
 async function copyRecipe(part) {
   const text = recipe?.[part];
   if (!text) return;

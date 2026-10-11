@@ -1107,10 +1107,13 @@ static float pn_known_phase_metric_ci8(
 }
 
 static PnScheduleAlignment fit_pn_phase_schedule(
-    std::span<const std::size_t> observed_phases) {
+    std::span<const std::size_t> observed_phases, double max_clock_ppm = 0.0) {
     constexpr std::size_t period = definition.frames_per_superframe;
     if constexpr (!definition.cyclic_extension()) {
         throw std::invalid_argument("PN595 has a fixed header, not a cyclic phase schedule");
+    }
+    if (!std::isfinite(max_clock_ppm) || max_clock_ppm < 0.0 || max_clock_ppm > 100.0) {
+        throw std::invalid_argument("PN schedule maximum clock error must be finite and in 0..100 ppm");
     }
     PnScheduleAlignment result;
     result.observations = std::min(observed_phases.size(), period);
@@ -1132,6 +1135,7 @@ static PnScheduleAlignment fit_pn_phase_schedule(
     std::array<double, period> costs;
     costs.fill(std::numeric_limits<double>::infinity());
     std::array<int, period> biases{};
+    std::array<double, period> slopes{};
     for (std::size_t origin = 0; origin < period; ++origin) {
         for (int bias = -static_cast<int>(kPnPrefixSymbols); bias <= static_cast<int>(kPnSuffixSymbols); ++bias) {
             double sum = 0.0;
@@ -1147,10 +1151,60 @@ static PnScheduleAlignment fit_pn_phase_schedule(
                 biases[origin] = bias;
             }
         }
+        if (max_clock_ppm == 0.0) continue;
+        // A clock offset changes the phase observed in nominally spaced
+        // header windows. Fit the known PN law plus a bounded affine timing
+        // error, using only header phases. Unwrap around the median so the
+        // PN core's modular boundary does not create a spurious clock step.
+        std::array<double, period> residuals{};
+        for (std::size_t frame = 0; frame < period; ++frame) {
+            residuals[frame] = distance(static_cast<int>(observed_phases[frame]),
+                phase_at(origin + frame));
+        }
+        auto ordered = residuals;
+        std::sort(ordered.begin(), ordered.end());
+        const auto center = static_cast<int>(ordered[period / 2]);
+        for (std::size_t frame = 0; frame < period; ++frame) {
+            residuals[frame] = center + distance(static_cast<int>(observed_phases[frame]),
+                phase_at(origin + frame) + center);
+        }
+        double intercept = center, slope = 0.0;
+        for (int pass = 0; pass < 4; ++pass) {
+            double count = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
+            for (std::size_t frame = 0; frame < period; ++frame) {
+                const double x = static_cast<double>(frame);
+                const double y = residuals[frame];
+                if (pass != 0 && std::abs(y - intercept - slope * x) > 5.0) continue;
+                count += 1; sx += x; sy += y; sxx += x * x; sxy += x * y;
+            }
+            const auto denominator = count * sxx - sx * sx;
+            if (count < 0.95 * period || denominator <= 0) break;
+            slope = (count * sxy - sx * sy) / denominator;
+            intercept = (sy - slope * sx) / count;
+        }
+        const auto unwrapped_intercept = std::remainder(intercept, static_cast<double>(kPnCoreSymbols));
+        const auto turn = unwrapped_intercept - intercept;
+        intercept = unwrapped_intercept;
+        for (auto& residual : residuals) residual += turn;
+        const double max_slope = definition.frame_symbols() * max_clock_ppm * 1e-6;
+        if (std::abs(slope) > max_slope
+            || intercept < -static_cast<double>(kPnPrefixSymbols) - 0.5
+            || intercept > static_cast<double>(kPnSuffixSymbols) + 0.5) continue;
+        const auto bias = static_cast<int>(std::lround(intercept));
+        double sum = 0;
+        for (std::size_t frame = 0; frame < period; ++frame) {
+            const double error = residuals[frame] - bias - slope * frame;
+            sum += std::min(error * error, 25.0);
+        }
+        const auto cost = sum / period;
+        if (cost < costs[origin]) {
+            costs[origin] = cost; biases[origin] = bias; slopes[origin] = slope;
+        }
     }
     result.superframe_index = static_cast<std::size_t>(
         std::distance(costs.begin(), std::min_element(costs.begin(), costs.end())));
     result.phase_bias = biases[result.superframe_index];
+    result.phase_slope_samples_per_frame = slopes[result.superframe_index];
     result.mean_squared_error = costs[result.superframe_index];
     result.runner_up_error = std::numeric_limits<double>::infinity();
     for (std::size_t origin = 0; origin < period; ++origin) {
@@ -1159,8 +1213,12 @@ static PnScheduleAlignment fit_pn_phase_schedule(
         }
     }
     for (std::size_t frame = 0; frame < period; ++frame) {
-        result.inliers += std::abs(distance(static_cast<int>(observed_phases[frame]),
-            phase_at(result.superframe_index + frame) + result.phase_bias)) <= 1;
+        const auto error = distance(static_cast<int>(observed_phases[frame]),
+            phase_at(result.superframe_index + frame) + result.phase_bias);
+        const auto drift = result.phase_slope_samples_per_frame * frame;
+        // Reduce the residual circularly after subtracting fractional drift.
+        result.inliers += std::abs(std::remainder(error - drift,
+            static_cast<double>(kPnCoreSymbols))) <= 1;
     }
     result.valid = result.mean_squared_error <= 1.0
         && result.runner_up_error - result.mean_squared_error >= 0.25
@@ -1484,7 +1542,31 @@ static PnWidebandChannelModel build_pn_wideband_channel_model_cf32(
     auto guarded_mask = mask;
     dilate_circular_mask(guarded_mask, options.guard_taps);
     const auto [gap_start, gap_length] = longest_circular_false_run(guarded_mask);
-    const auto rotation = (gap_start + gap_length) % kPnCoreSymbols;
+    auto rotation = (gap_start + gap_length) % kPnCoreSymbols;
+    if (kPnCoreSymbols - gap_length > options.max_span_symbols) {
+        // Distant weak/noisy taps can put the main path beyond the end of
+        // a capped longest-gap window. Keep the most masked channel energy
+        // within the bound instead. Leave already-fitting windows unchanged.
+        const auto power_at = [&](std::size_t index) -> double {
+            index %= kPnCoreSymbols;
+            return guarded_mask[index] ? averaged_power[index] : 0.0;
+        };
+        double energy = 0.0;
+        for (std::size_t tap = 0; tap < options.max_span_symbols; ++tap) {
+            energy += power_at(rotation + tap);
+        }
+        auto best_rotation = rotation;
+        auto best_energy = energy;
+        for (std::size_t step = 1; step < kPnCoreSymbols; ++step) {
+            energy -= power_at(rotation + step - 1);
+            energy += power_at(rotation + step + options.max_span_symbols - 1);
+            if (energy > best_energy) {
+                best_energy = energy;
+                best_rotation = (rotation + step) % kPnCoreSymbols;
+            }
+        }
+        rotation = best_rotation;
+    }
     auto rotated_taps = rotate_left(mean_taps, rotation);
     auto rotated_mask = rotate_left(guarded_mask, rotation);
     std::size_t span = 1;
@@ -1918,8 +2000,8 @@ std::size_t pn_phase_for_frame(PnMode mode, std::size_t index) {
     return dispatch_pn(mode, [&](auto impl) { return impl.pn_phase_for_frame(index); });
 }
 
-PnScheduleAlignment fit_pn_phase_schedule(PnMode mode, std::span<const std::size_t> phases) {
-    return dispatch_pn(mode, [&](auto impl) { return impl.fit_pn_phase_schedule(phases); });
+PnScheduleAlignment fit_pn_phase_schedule(PnMode mode, std::span<const std::size_t> phases, double max_clock_ppm) {
+    return dispatch_pn(mode, [&](auto impl) { return impl.fit_pn_phase_schedule(phases, max_clock_ppm); });
 }
 
 PnResidualCfoResult estimate_pn_residual_cfo_cf32(
@@ -1968,8 +2050,8 @@ float pn945_known_phase_metric_ci8(std::span<const std::int8_t> header, std::siz
 std::size_t pn945_phase_for_frame(std::size_t index) noexcept {
     return PnChannel<PnMode::pn945>::pn_phase_for_frame(index);
 }
-Pn945ScheduleAlignment fit_pn945_phase_schedule(std::span<const std::size_t> phases) {
-    return fit_pn_phase_schedule(PnMode::pn945, phases);
+Pn945ScheduleAlignment fit_pn945_phase_schedule(std::span<const std::size_t> phases, double max_clock_ppm) {
+    return fit_pn_phase_schedule(PnMode::pn945, phases, max_clock_ppm);
 }
 Pn945ResidualCfoResult estimate_pn945_residual_cfo_cf32(
     std::span<const float> symbols, std::size_t offset, Pn945ResidualCfoOptions options) {

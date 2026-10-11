@@ -169,6 +169,7 @@ struct FrameNormalizationStats {
     ComplexGainEstimate qam_gain;
     ComplexGainEstimate system_info_gain;
     float qam_residual_ratio = 0.0F;
+    bool qam_residual_valid = false;
     float qam_minus_system_info_phase_rad = 0.0F;
     float qam_minus_system_info_phase_mod_pi_over_2_rad = 0.0F;
     int qam_minus_system_info_quadrant = 0;
@@ -583,6 +584,7 @@ void usage(const char* program) {
         << " [--qam64-integer-timing-correction]"
         << " [--pn-schedule-sync]"
         << " [--pn-schedule-tracking]"
+        << " [--pn-schedule-max-clock-ppm X]"
         << " [--pn-current-header-tracking]"
         << " [--system-info-index N|auto]"
         << " [--system-info-auto-observation-frames N]"
@@ -2147,7 +2149,12 @@ void normalize_data_from_system_info(
     std::span<float> output_data) {
     using Complex = std::complex<float>;
     const auto estimate = estimate_system_info_gain(logical_symbols, reference);
-    const auto gain = estimate.gain;
+    // GB 20600 4.6.3(d) uses Figure 6's SI mapping: bit 0 -> -4.5,
+    // bit 1 -> +4.5. C3780's legacy unit correlator has the opposite
+    // polarity; C1's unit correlator follows Figure 6. Preserve both
+    // correlation conventions while restoring the data's physical scale.
+    const auto reference_scale = c1_frame_body ? 4.5F : -4.5F;
+    const auto gain = estimate.gain / reference_scale;
     if (std::abs(gain) <= 1.0e-12F) {
         throw std::runtime_error("system-information gain estimate is zero");
     }
@@ -2203,18 +2210,23 @@ void update_frame_normalization_stats(
         raw_data,
         frame.data_cf32);
 
-    if (profile_probe) return;
-    double residual_ratio_sum = 0.0;
-    for (std::size_t carrier = 0; carrier < dtmb::core::kC3780DataSymbols; ++carrier) {
-        const auto point = qam_residual_point(
-            frame.data_cf32[carrier * 2U],
-            frame.data_cf32[carrier * 2U + 1U]);
-        residual_ratio_sum += point.decision_abs > 0.0F
-            ? point.residual_abs / point.decision_abs
-            : 0.0F;
+    // Auto SI may still be probing an unknown constellation. Keep its residual
+    // explicitly unavailable, but report the phase of the gains measured above.
+    // A skipped residual must not suppress the independent phase diagnostics.
+    if (!profile_probe) {
+        double residual_ratio_sum = 0.0;
+        for (std::size_t carrier = 0; carrier < dtmb::core::kC3780DataSymbols; ++carrier) {
+            const auto point = qam_residual_point(
+                frame.data_cf32[carrier * 2U],
+                frame.data_cf32[carrier * 2U + 1U]);
+            residual_ratio_sum += point.decision_abs > 0.0F
+                ? point.residual_abs / point.decision_abs
+                : 0.0F;
+        }
+        frame.normalization_stats.qam_residual_ratio = static_cast<float>(
+            residual_ratio_sum / static_cast<double>(dtmb::core::kC3780DataSymbols));
+        frame.normalization_stats.qam_residual_valid = true;
     }
-    frame.normalization_stats.qam_residual_ratio = static_cast<float>(
-        residual_ratio_sum / static_cast<double>(dtmb::core::kC3780DataSymbols));
 
     if (!frame.normalization_stats.qam_gain.valid
         || !frame.normalization_stats.system_info_gain.valid) {
@@ -3115,7 +3127,7 @@ public:
             << "system_info_gain_phase_rad,system_info_coherence,"
             << "qam_minus_system_info_phase_rad,"
             << "qam_minus_system_info_phase_mod_pi_over_2_rad,"
-            << "qam_minus_system_info_quadrant,qam_residual_ratio,"
+            << "qam_minus_system_info_quadrant,qam_residual_ratio,qam_residual_valid,"
             << "pn_metadata_valid,pn_phase,next_pn_phase,model_pn_phase,"
             << "model_next_pn_phase,model_rotation_symbols,"
             << "integer_timing_evaluated,integer_timing_delta_samples,"
@@ -3165,6 +3177,7 @@ public:
             << stats.qam_minus_system_info_phase_mod_pi_over_2_rad << ','
             << stats.qam_minus_system_info_quadrant << ','
             << stats.qam_residual_ratio << ','
+            << (stats.qam_residual_valid ? 1 : 0) << ','
             << (pn_metadata_valid ? 1 : 0) << ','
             << pn_phase << ','
             << next_pn_phase << ','
@@ -3581,6 +3594,7 @@ int main(int argc, char** argv) {
     bool auto_sync = false;
     bool pn_schedule_sync = false;
     bool pn_schedule_tracking = false;
+    double pn_schedule_max_clock_ppm = 0.0;
     bool pn_current_header_tracking = false;
     dtmb::core::PnScheduleAlignment pn_schedule_alignment;
     std::size_t pn_schedule_refined_phase = 0;
@@ -3620,6 +3634,9 @@ int main(int argc, char** argv) {
             } else if (arg == "--pn-schedule-tracking") {
                 pn_schedule_sync = true;
                 pn_schedule_tracking = true;
+            } else if (arg == "--pn-schedule-max-clock-ppm") {
+                if (++index >= argc) throw std::invalid_argument("--pn-schedule-max-clock-ppm needs a value");
+                pn_schedule_max_clock_ppm = parse_float(argv[index], "PN schedule maximum clock error");
             } else if (arg == "--pn-current-header-tracking") {
                 pn_schedule_sync = true;
                 pn_schedule_tracking = true;
@@ -4150,6 +4167,11 @@ int main(int argc, char** argv) {
         if (pn_schedule_sync && !auto_sync) {
             throw std::invalid_argument("--pn-schedule-sync requires --auto-sync");
         }
+        if (!std::isfinite(pn_schedule_max_clock_ppm) || pn_schedule_max_clock_ppm < 0.0
+            || pn_schedule_max_clock_ppm > 100.0
+            || (pn_schedule_max_clock_ppm != 0.0 && !pn_schedule_tracking)) {
+            throw std::invalid_argument("--pn-schedule-max-clock-ppm must be in 0..100 and requires --pn-schedule-tracking");
+        }
         if (pn_schedule_tracking && (timing_search_radius == 0
             || equalizer != Equalizer::pn || pn_estimator != PnEstimator::wideband)) {
             throw std::invalid_argument(
@@ -4470,7 +4492,7 @@ int main(int argc, char** argv) {
                         std::span<const float>(startup_cf32.data() + first * 2,
                             pn().header_symbols * 2)));
                 }
-                pn_schedule_alignment = dtmb::core::fit_pn_phase_schedule(pn_mode, phases);
+                pn_schedule_alignment = dtmb::core::fit_pn_phase_schedule(pn_mode, phases, pn_schedule_max_clock_ppm);
                 if (pn_schedule_alignment.valid) {
                     const auto corrected = static_cast<std::int64_t>(acquisition.phase_offset)
                         - pn_schedule_alignment.phase_bias + auto_phase_adjustment;
@@ -4544,7 +4566,7 @@ int main(int argc, char** argv) {
         ReplayInput replay_input(input, std::move(startup_ci8));
         const auto phase_bytes = phase_offset * 2;
         const auto discarded_phase_bytes = discard_bytes(replay_input, phase_bytes);
-        const auto timing_trajectory_seed = load_timing_trajectory_seed(
+        auto timing_trajectory_seed = load_timing_trajectory_seed(
             timing_trajectory_seed_path);
         if (timing_trajectory_seed.frame_index_offset.has_value()) {
             if (timing_trajectory_frame_index_offset != 0
@@ -4569,6 +4591,17 @@ int main(int argc, char** argv) {
             }
             timing_trajectory_offset_origin_samples =
                 *timing_trajectory_seed.offset_origin_samples;
+        }
+        bool pn_schedule_clock_seeded = false;
+        if (pn_schedule_max_clock_ppm != 0.0 && pn_schedule_alignment.valid
+            && timing_trajectory_interval_frames != 0 && timing_trajectory_seed.points.empty()
+            && timing_trajectory_frame_index_offset == 0 && timing_trajectory_offset_origin_samples == 0.0) {
+            // Observed PN phase advances when the nominal header window is
+            // late; the frame-start trajectory has the opposite sign.
+            const double last = static_cast<double>(pn_schedule_alignment.observations - 1);
+            timing_trajectory_seed.points = {{0.0, 0.0},
+                {last, -pn_schedule_alignment.phase_slope_samples_per_frame * last}};
+            pn_schedule_clock_seeded = true;
         }
         TrackingFrameReader frame_reader(
             replay_input,
@@ -4648,6 +4681,8 @@ int main(int argc, char** argv) {
                 observe_system_information(frame);
                 if (normalization == Normalization::none) {
                     std::copy_n(frame.logical_cf32.begin() + 72, normalized_data.size(), frame.data_cf32.begin());
+                } else if (normalization == Normalization::system_info) {
+                    normalize_data_from_system_info(frame.logical_cf32, reference, frame.data_cf32);
                 } else {
                     const auto gain = estimate_system_info_gain(frame.logical_cf32, reference);
                     if (!gain.valid) throw std::runtime_error("C=1 SI gain is unavailable");
@@ -4658,12 +4693,8 @@ int main(int argc, char** argv) {
                         normalized_data[symbol * 2] = value.real();
                         normalized_data[symbol * 2 + 1] = value.imag();
                     }
-                    if (normalization == Normalization::system_info) {
-                        std::copy(normalized_data.begin(), normalized_data.end(), frame.data_cf32.begin());
-                    } else {
-                        dtmb::core::qam_normalize_amplitude_cf32(normalized_data, frame.data_cf32,
-                                                               dtmb::core::QamMode::qam4);
-                    }
+                    dtmb::core::qam_normalize_amplitude_cf32(normalized_data, frame.data_cf32,
+                                                           dtmb::core::QamMode::qam4);
                 }
                 write_all(output, frame.data_cf32);
                 ++frame_count;
@@ -5142,6 +5173,9 @@ int main(int argc, char** argv) {
                   << "pn_channel_method=" << (pn().cyclic_extension() ? "cyclic-fft" : "direct-ls") << '\n'
                   << "pn_schedule_sync=" << (pn_schedule_sync ? "true" : "false") << '\n'
                   << "pn_schedule_tracking=" << (pn_schedule_tracking ? "true" : "false") << '\n'
+                  << "pn_schedule_max_clock_ppm=" << pn_schedule_max_clock_ppm << '\n'
+                  << "pn_schedule_phase_slope_samples_per_frame=" << pn_schedule_alignment.phase_slope_samples_per_frame << '\n'
+                  << "pn_schedule_clock_seeded=" << (pn_schedule_clock_seeded ? "true" : "false") << '\n'
                   << "pn_current_header_tracking=" << (pn_current_header_tracking ? "true" : "false") << '\n'
                   << "pn_current_header_min_improvement=0.005\n"
                   << "pn_schedule_tracking_active=" << (frame_reader.pn_schedule_active() ? "true" : "false") << '\n'

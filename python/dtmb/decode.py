@@ -54,6 +54,11 @@ def _exe(name: str, bin_dir: Path | None) -> Path:
 
 
 def build_commands(args: argparse.Namespace) -> list[list[str]]:
+    clock_bound = getattr(args, "pn_schedule_max_clock_ppm", 0.0)
+    if not math.isfinite(clock_bound) or not 0 <= clock_bound <= 100:
+        raise ValueError("--pn-schedule-max-clock-ppm must be finite and in 0..100")
+    if clock_bound and not args.pn_schedule_tracking:
+        raise ValueError("--pn-schedule-max-clock-ppm requires --pn-schedule-tracking")
     if args.input_rate <= 0:
         raise ValueError("--input-rate must be positive")
     if args.system_info_index not in PROFILES:
@@ -140,6 +145,8 @@ def build_commands(args: argparse.Namespace) -> list[list[str]]:
         frontend.extend(["--input-format", "cf32"])
     if args.pn_schedule_tracking:
         frontend.extend(["--pn-schedule-tracking", "--pn-current-header-tracking"])
+        if clock_bound:
+            frontend.extend(["--pn-schedule-max-clock-ppm", str(clock_bound)])
     frontend.extend([source, "-"])
     commands.append(frontend)
 
@@ -264,6 +271,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--error-policy", choices=("fail", "continue"), default="fail")
     parser.add_argument("--workers", type=int, default=max(1, os.cpu_count() or 1))
     parser.add_argument("--pn-schedule-tracking", action="store_true")
+    parser.add_argument("--pn-schedule-max-clock-ppm", type=float, default=0.0,
+                        help="Opt-in bounded PN acquisition clock fit (0..100 ppm); requires --pn-schedule-tracking.")
     parser.add_argument(
         "--source-frame-confidence", choices=("off", "inverse-mse"), default="off"
     )

@@ -105,8 +105,56 @@ void check_schedule(PnMode mode) {
     const auto fit = fit_pn_phase_schedule(mode, observed);
     assert(fit.valid && fit.superframe_index == origin && fit.phase_bias == -3);
     assert(fit.inliers == pn.frames_per_superframe);
+    assert(fit.phase_slope_samples_per_frame == 0.0);
+    const auto bounded_static = fit_pn_phase_schedule(mode, observed, 100.0);
+    assert(bounded_static.valid && bounded_static.superframe_index == origin && bounded_static.phase_bias == -3);
+    assert(bounded_static.phase_slope_samples_per_frame == 0.0);
+    for (const double ppm : {-80.0, -20.0, 20.0, 80.0}) {
+        const double slope = pn.frame_symbols() * ppm * 1e-6;
+        for (std::size_t n = 0; n < observed.size(); ++n) {
+            const auto phase = static_cast<int>(pn_phase_for_frame(mode, n + origin))
+                - 3 + static_cast<int>(std::lround(slope * n));
+            observed[n] = (phase + 2 * pn.core_symbols) % pn.core_symbols;
+        }
+        assert(!fit_pn_phase_schedule(mode, observed).valid);
+        const auto drifted = fit_pn_phase_schedule(mode, observed, 100.0);
+        assert(drifted.valid && drifted.superframe_index == origin && drifted.phase_bias == -3);
+        assert(std::abs(drifted.phase_slope_samples_per_frame - slope) < 0.001);
+        assert(drifted.inliers == observed.size());
+        assert(!fit_pn_phase_schedule(mode, observed, 3.0).valid);
+    }
+    std::mt19937 generator(20600);
+    for (int trial = 0; trial < 20; ++trial) {
+        for (auto& phase : observed) phase = generator() % pn.core_symbols;
+        assert(!fit_pn_phase_schedule(mode, observed, 100.0).valid);
+    }
+    std::fill(observed.begin(), observed.end(), 0);
+    assert(!fit_pn_phase_schedule(mode, observed, 100.0).valid);
+    for (const auto index : {std::size_t{0}, observed.size() - 1}) {
+        for (const int bias : {-static_cast<int>(pn.prefix_symbols), static_cast<int>(pn.suffix_symbols)}) {
+            const double slope = pn.frame_symbols() * (bias < 0 ? -80.0 : 80.0) * 1e-6;
+            for (std::size_t n = 0; n < observed.size(); ++n) {
+                const auto phase = static_cast<int>(pn_phase_for_frame(mode, n + index))
+                    + bias + static_cast<int>(std::lround(slope * n));
+                observed[n] = (phase + 2 * pn.core_symbols) % pn.core_symbols;
+            }
+            const auto wrapped = fit_pn_phase_schedule(mode, observed, 100.0);
+            assert(wrapped.valid && wrapped.superframe_index == index && wrapped.phase_bias == bias);
+        }
+    }
+    for (std::size_t n = 0; n < observed.size(); ++n) {
+        observed[n] = (pn_phase_for_frame(mode, n + origin) + (n >= observed.size() / 2 ? 15 : 0)) % pn.core_symbols;
+    }
+    assert(!fit_pn_phase_schedule(mode, observed, 100.0).valid);
     observed.resize(observed.size() - 1);
     assert(!fit_pn_phase_schedule(mode, observed).valid);
+    assert(!fit_pn_phase_schedule(mode, observed, 100.0).valid);
+    for (const double invalid : {-1.0, 101.0, static_cast<double>(INFINITY), static_cast<double>(NAN)}) {
+        bool threw = false;
+        try { (void)fit_pn_phase_schedule(mode, observed, invalid); }
+        catch (const std::invalid_argument&) { threw = true; }
+        assert(threw);
+    }
 }
 
 void check_equalizer(PnMode mode, std::size_t window_offset) {
@@ -164,9 +212,46 @@ void check_equalizer(PnMode mode, std::size_t window_offset) {
     }
 }
 
+void check_bounded_window_retains_main_path() {
+    // Two weak, distant echoes split the circular gaps. The longest-gap
+    // window starts at an echo; blindly capping its length loses the main
+    // path. Shift the whole channel to also exercise wrapping across zero.
+    constexpr auto mode = PnMode::pn945;
+    constexpr std::size_t core = 511;
+    for (const std::size_t shift : {0U, 7U, 504U}) {
+        std::vector<float> headers;
+        const std::vector<std::size_t> phases{17, 20, 23};
+        for (const auto phase : phases) {
+            auto received = header(mode, (phase + core - shift) % core);
+            for (const auto delay : {200U, 350U}) {
+                const auto echo = header(mode, (phase + 2 * core - shift - delay) % core);
+                for (std::size_t n = 0; n < received.size(); ++n) {
+                    received[n] += 0.02F * echo[n];
+                }
+            }
+            headers.insert(headers.end(), received.begin(), received.end());
+        }
+        PnWidebandModelOptions options;
+        options.expected_phases = phases;
+        options.header_observation = PnHeaderObservation::core_only;
+        options.regularization = 1e-6F;
+        options.max_span_symbols = 217;
+        const auto model = build_pn_wideband_channel_model_cf32(mode, headers, options);
+        const auto main_index = (shift + core - model.rotation_symbols) % core;
+        assert(main_index < model.template_taps.size() / 2);
+        const auto main = Complex{model.template_taps[main_index * 2],
+                                  model.template_taps[main_index * 2 + 1]};
+        assert(std::abs(std::abs(main) - 1.0F) < 1e-4F);
+        assert(model.template_taps.size() / 2 <= options.max_span_symbols);
+        // The best bounded interval retains the main path and one echo.
+        assert(std::abs(model.truncated_energy_fraction - 0.0004F / 1.0008F) < 1e-5F);
+    }
+}
+
 }  // namespace
 
 int main() {
+    check_bounded_window_retains_main_path();
     const auto release = version();
     assert(release.major == 0 && release.minor == 4 && release.patch == 1);
     assert(std::string_view(build_info()) == "dtmb-core-cpp 0.4.1");

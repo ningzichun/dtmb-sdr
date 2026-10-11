@@ -236,12 +236,16 @@ struct Pn945ScheduleAlignment {
     double mean_squared_error = 0.0;
     double runner_up_error = 0.0;
     std::size_t inliers = 0;
+    double phase_slope_samples_per_frame = 0.0;
 };
 
 // Fits only the first complete 200-frame PN945 superframe observation window.
 // The phase bias is a header-window displacement, not decoded-payload state.
+// max_clock_ppm in 0..100 optionally fits affine phase drift; zero preserves
+// constant-bias acquisition. Positive observed phase drift implies negative
+// frame-start drift. Lock thresholds are identical for both models.
 [[nodiscard]] Pn945ScheduleAlignment fit_pn945_phase_schedule(
-    std::span<const std::size_t> observed_phases);
+    std::span<const std::size_t> observed_phases, double max_clock_ppm = 0.0);
 
 [[nodiscard]] std::size_t pn945_phase_for_frame(std::size_t superframe_index) noexcept;
 
@@ -630,7 +634,7 @@ using PnWidebandChannelModel = Pn945WidebandChannelModel;
 [[nodiscard]] std::size_t pn_phase_for_frame(PnMode mode, std::size_t superframe_index);
 // Only cyclic modes carry a PN phase schedule; PN595 cannot identify a superframe origin.
 [[nodiscard]] PnScheduleAlignment fit_pn_phase_schedule(
-    PnMode mode, std::span<const std::size_t> observed_phases);
+    PnMode mode, std::span<const std::size_t> observed_phases, double max_clock_ppm = 0.0);
 [[nodiscard]] PnResidualCfoResult estimate_pn_residual_cfo_cf32(
     PnMode mode, std::span<const float> symbols, std::size_t phase_offset,
     PnResidualCfoOptions options = {});
