@@ -169,6 +169,7 @@ struct FrameNormalizationStats {
     ComplexGainEstimate qam_gain;
     ComplexGainEstimate system_info_gain;
     float qam_residual_ratio = 0.0F;
+    bool qam_residual_valid = false;
     float qam_minus_system_info_phase_rad = 0.0F;
     float qam_minus_system_info_phase_mod_pi_over_2_rad = 0.0F;
     int qam_minus_system_info_quadrant = 0;
@@ -2147,7 +2148,12 @@ void normalize_data_from_system_info(
     std::span<float> output_data) {
     using Complex = std::complex<float>;
     const auto estimate = estimate_system_info_gain(logical_symbols, reference);
-    const auto gain = estimate.gain;
+    // GB 20600 4.6.3(d) uses Figure 6's SI mapping: bit 0 -> -4.5,
+    // bit 1 -> +4.5. C3780's legacy unit correlator has the opposite
+    // polarity; C1's unit correlator follows Figure 6. Preserve both
+    // correlation conventions while restoring the data's physical scale.
+    const auto reference_scale = c1_frame_body ? 4.5F : -4.5F;
+    const auto gain = estimate.gain / reference_scale;
     if (std::abs(gain) <= 1.0e-12F) {
         throw std::runtime_error("system-information gain estimate is zero");
     }
@@ -2203,18 +2209,23 @@ void update_frame_normalization_stats(
         raw_data,
         frame.data_cf32);
 
-    if (profile_probe) return;
-    double residual_ratio_sum = 0.0;
-    for (std::size_t carrier = 0; carrier < dtmb::core::kC3780DataSymbols; ++carrier) {
-        const auto point = qam_residual_point(
-            frame.data_cf32[carrier * 2U],
-            frame.data_cf32[carrier * 2U + 1U]);
-        residual_ratio_sum += point.decision_abs > 0.0F
-            ? point.residual_abs / point.decision_abs
-            : 0.0F;
+    // Auto SI may still be probing an unknown constellation. Keep its residual
+    // explicitly unavailable, but report the phase of the gains measured above.
+    // A skipped residual must not suppress the independent phase diagnostics.
+    if (!profile_probe) {
+        double residual_ratio_sum = 0.0;
+        for (std::size_t carrier = 0; carrier < dtmb::core::kC3780DataSymbols; ++carrier) {
+            const auto point = qam_residual_point(
+                frame.data_cf32[carrier * 2U],
+                frame.data_cf32[carrier * 2U + 1U]);
+            residual_ratio_sum += point.decision_abs > 0.0F
+                ? point.residual_abs / point.decision_abs
+                : 0.0F;
+        }
+        frame.normalization_stats.qam_residual_ratio = static_cast<float>(
+            residual_ratio_sum / static_cast<double>(dtmb::core::kC3780DataSymbols));
+        frame.normalization_stats.qam_residual_valid = true;
     }
-    frame.normalization_stats.qam_residual_ratio = static_cast<float>(
-        residual_ratio_sum / static_cast<double>(dtmb::core::kC3780DataSymbols));
 
     if (!frame.normalization_stats.qam_gain.valid
         || !frame.normalization_stats.system_info_gain.valid) {
@@ -3115,7 +3126,7 @@ public:
             << "system_info_gain_phase_rad,system_info_coherence,"
             << "qam_minus_system_info_phase_rad,"
             << "qam_minus_system_info_phase_mod_pi_over_2_rad,"
-            << "qam_minus_system_info_quadrant,qam_residual_ratio,"
+            << "qam_minus_system_info_quadrant,qam_residual_ratio,qam_residual_valid,"
             << "pn_metadata_valid,pn_phase,next_pn_phase,model_pn_phase,"
             << "model_next_pn_phase,model_rotation_symbols,"
             << "integer_timing_evaluated,integer_timing_delta_samples,"
@@ -3165,6 +3176,7 @@ public:
             << stats.qam_minus_system_info_phase_mod_pi_over_2_rad << ','
             << stats.qam_minus_system_info_quadrant << ','
             << stats.qam_residual_ratio << ','
+            << (stats.qam_residual_valid ? 1 : 0) << ','
             << (pn_metadata_valid ? 1 : 0) << ','
             << pn_phase << ','
             << next_pn_phase << ','
@@ -4648,6 +4660,8 @@ int main(int argc, char** argv) {
                 observe_system_information(frame);
                 if (normalization == Normalization::none) {
                     std::copy_n(frame.logical_cf32.begin() + 72, normalized_data.size(), frame.data_cf32.begin());
+                } else if (normalization == Normalization::system_info) {
+                    normalize_data_from_system_info(frame.logical_cf32, reference, frame.data_cf32);
                 } else {
                     const auto gain = estimate_system_info_gain(frame.logical_cf32, reference);
                     if (!gain.valid) throw std::runtime_error("C=1 SI gain is unavailable");
@@ -4658,12 +4672,8 @@ int main(int argc, char** argv) {
                         normalized_data[symbol * 2] = value.real();
                         normalized_data[symbol * 2 + 1] = value.imag();
                     }
-                    if (normalization == Normalization::system_info) {
-                        std::copy(normalized_data.begin(), normalized_data.end(), frame.data_cf32.begin());
-                    } else {
-                        dtmb::core::qam_normalize_amplitude_cf32(normalized_data, frame.data_cf32,
-                                                               dtmb::core::QamMode::qam4);
-                    }
+                    dtmb::core::qam_normalize_amplitude_cf32(normalized_data, frame.data_cf32,
+                                                           dtmb::core::QamMode::qam4);
                 }
                 write_all(output, frame.data_cf32);
                 ++frame_count;

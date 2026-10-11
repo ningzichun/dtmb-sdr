@@ -164,9 +164,46 @@ void check_equalizer(PnMode mode, std::size_t window_offset) {
     }
 }
 
+void check_bounded_window_retains_main_path() {
+    // Two weak, distant echoes split the circular gaps. The longest-gap
+    // window starts at an echo; blindly capping its length loses the main
+    // path. Shift the whole channel to also exercise wrapping across zero.
+    constexpr auto mode = PnMode::pn945;
+    constexpr std::size_t core = 511;
+    for (const std::size_t shift : {0U, 7U, 504U}) {
+        std::vector<float> headers;
+        const std::vector<std::size_t> phases{17, 20, 23};
+        for (const auto phase : phases) {
+            auto received = header(mode, (phase + core - shift) % core);
+            for (const auto delay : {200U, 350U}) {
+                const auto echo = header(mode, (phase + 2 * core - shift - delay) % core);
+                for (std::size_t n = 0; n < received.size(); ++n) {
+                    received[n] += 0.02F * echo[n];
+                }
+            }
+            headers.insert(headers.end(), received.begin(), received.end());
+        }
+        PnWidebandModelOptions options;
+        options.expected_phases = phases;
+        options.header_observation = PnHeaderObservation::core_only;
+        options.regularization = 1e-6F;
+        options.max_span_symbols = 217;
+        const auto model = build_pn_wideband_channel_model_cf32(mode, headers, options);
+        const auto main_index = (shift + core - model.rotation_symbols) % core;
+        assert(main_index < model.template_taps.size() / 2);
+        const auto main = Complex{model.template_taps[main_index * 2],
+                                  model.template_taps[main_index * 2 + 1]};
+        assert(std::abs(std::abs(main) - 1.0F) < 1e-4F);
+        assert(model.template_taps.size() / 2 <= options.max_span_symbols);
+        // The best bounded interval retains the main path and one echo.
+        assert(std::abs(model.truncated_energy_fraction - 0.0004F / 1.0008F) < 1e-5F);
+    }
+}
+
 }  // namespace
 
 int main() {
+    check_bounded_window_retains_main_path();
     const auto release = version();
     assert(release.major == 0 && release.minor == 4 && release.patch == 1);
     assert(std::string_view(build_info()) == "dtmb-core-cpp 0.4.1");

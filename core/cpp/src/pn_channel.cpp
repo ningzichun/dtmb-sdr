@@ -1484,7 +1484,31 @@ static PnWidebandChannelModel build_pn_wideband_channel_model_cf32(
     auto guarded_mask = mask;
     dilate_circular_mask(guarded_mask, options.guard_taps);
     const auto [gap_start, gap_length] = longest_circular_false_run(guarded_mask);
-    const auto rotation = (gap_start + gap_length) % kPnCoreSymbols;
+    auto rotation = (gap_start + gap_length) % kPnCoreSymbols;
+    if (kPnCoreSymbols - gap_length > options.max_span_symbols) {
+        // Distant weak/noisy taps can put the main path beyond the end of
+        // a capped longest-gap window. Keep the most masked channel energy
+        // within the bound instead. Leave already-fitting windows unchanged.
+        const auto power_at = [&](std::size_t index) -> double {
+            index %= kPnCoreSymbols;
+            return guarded_mask[index] ? averaged_power[index] : 0.0;
+        };
+        double energy = 0.0;
+        for (std::size_t tap = 0; tap < options.max_span_symbols; ++tap) {
+            energy += power_at(rotation + tap);
+        }
+        auto best_rotation = rotation;
+        auto best_energy = energy;
+        for (std::size_t step = 1; step < kPnCoreSymbols; ++step) {
+            energy -= power_at(rotation + step - 1);
+            energy += power_at(rotation + step + options.max_span_symbols - 1);
+            if (energy > best_energy) {
+                best_energy = energy;
+                best_rotation = (rotation + step) % kPnCoreSymbols;
+            }
+        }
+        rotation = best_rotation;
+    }
     auto rotated_taps = rotate_left(mean_taps, rotation);
     auto rotated_mask = rotate_left(guarded_mask, rotation);
     std::size_t span = 1;
