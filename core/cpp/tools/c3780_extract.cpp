@@ -584,6 +584,7 @@ void usage(const char* program) {
         << " [--qam64-integer-timing-correction]"
         << " [--pn-schedule-sync]"
         << " [--pn-schedule-tracking]"
+        << " [--pn-schedule-max-clock-ppm X]"
         << " [--pn-current-header-tracking]"
         << " [--system-info-index N|auto]"
         << " [--system-info-auto-observation-frames N]"
@@ -3593,6 +3594,7 @@ int main(int argc, char** argv) {
     bool auto_sync = false;
     bool pn_schedule_sync = false;
     bool pn_schedule_tracking = false;
+    double pn_schedule_max_clock_ppm = 0.0;
     bool pn_current_header_tracking = false;
     dtmb::core::PnScheduleAlignment pn_schedule_alignment;
     std::size_t pn_schedule_refined_phase = 0;
@@ -3632,6 +3634,9 @@ int main(int argc, char** argv) {
             } else if (arg == "--pn-schedule-tracking") {
                 pn_schedule_sync = true;
                 pn_schedule_tracking = true;
+            } else if (arg == "--pn-schedule-max-clock-ppm") {
+                if (++index >= argc) throw std::invalid_argument("--pn-schedule-max-clock-ppm needs a value");
+                pn_schedule_max_clock_ppm = parse_float(argv[index], "PN schedule maximum clock error");
             } else if (arg == "--pn-current-header-tracking") {
                 pn_schedule_sync = true;
                 pn_schedule_tracking = true;
@@ -4162,6 +4167,11 @@ int main(int argc, char** argv) {
         if (pn_schedule_sync && !auto_sync) {
             throw std::invalid_argument("--pn-schedule-sync requires --auto-sync");
         }
+        if (!std::isfinite(pn_schedule_max_clock_ppm) || pn_schedule_max_clock_ppm < 0.0
+            || pn_schedule_max_clock_ppm > 100.0
+            || (pn_schedule_max_clock_ppm != 0.0 && !pn_schedule_tracking)) {
+            throw std::invalid_argument("--pn-schedule-max-clock-ppm must be in 0..100 and requires --pn-schedule-tracking");
+        }
         if (pn_schedule_tracking && (timing_search_radius == 0
             || equalizer != Equalizer::pn || pn_estimator != PnEstimator::wideband)) {
             throw std::invalid_argument(
@@ -4482,7 +4492,7 @@ int main(int argc, char** argv) {
                         std::span<const float>(startup_cf32.data() + first * 2,
                             pn().header_symbols * 2)));
                 }
-                pn_schedule_alignment = dtmb::core::fit_pn_phase_schedule(pn_mode, phases);
+                pn_schedule_alignment = dtmb::core::fit_pn_phase_schedule(pn_mode, phases, pn_schedule_max_clock_ppm);
                 if (pn_schedule_alignment.valid) {
                     const auto corrected = static_cast<std::int64_t>(acquisition.phase_offset)
                         - pn_schedule_alignment.phase_bias + auto_phase_adjustment;
@@ -4556,7 +4566,7 @@ int main(int argc, char** argv) {
         ReplayInput replay_input(input, std::move(startup_ci8));
         const auto phase_bytes = phase_offset * 2;
         const auto discarded_phase_bytes = discard_bytes(replay_input, phase_bytes);
-        const auto timing_trajectory_seed = load_timing_trajectory_seed(
+        auto timing_trajectory_seed = load_timing_trajectory_seed(
             timing_trajectory_seed_path);
         if (timing_trajectory_seed.frame_index_offset.has_value()) {
             if (timing_trajectory_frame_index_offset != 0
@@ -4581,6 +4591,17 @@ int main(int argc, char** argv) {
             }
             timing_trajectory_offset_origin_samples =
                 *timing_trajectory_seed.offset_origin_samples;
+        }
+        bool pn_schedule_clock_seeded = false;
+        if (pn_schedule_max_clock_ppm != 0.0 && pn_schedule_alignment.valid
+            && timing_trajectory_interval_frames != 0 && timing_trajectory_seed.points.empty()
+            && timing_trajectory_frame_index_offset == 0 && timing_trajectory_offset_origin_samples == 0.0) {
+            // Observed PN phase advances when the nominal header window is
+            // late; the frame-start trajectory has the opposite sign.
+            const double last = static_cast<double>(pn_schedule_alignment.observations - 1);
+            timing_trajectory_seed.points = {{0.0, 0.0},
+                {last, -pn_schedule_alignment.phase_slope_samples_per_frame * last}};
+            pn_schedule_clock_seeded = true;
         }
         TrackingFrameReader frame_reader(
             replay_input,
@@ -5152,6 +5173,9 @@ int main(int argc, char** argv) {
                   << "pn_channel_method=" << (pn().cyclic_extension() ? "cyclic-fft" : "direct-ls") << '\n'
                   << "pn_schedule_sync=" << (pn_schedule_sync ? "true" : "false") << '\n'
                   << "pn_schedule_tracking=" << (pn_schedule_tracking ? "true" : "false") << '\n'
+                  << "pn_schedule_max_clock_ppm=" << pn_schedule_max_clock_ppm << '\n'
+                  << "pn_schedule_phase_slope_samples_per_frame=" << pn_schedule_alignment.phase_slope_samples_per_frame << '\n'
+                  << "pn_schedule_clock_seeded=" << (pn_schedule_clock_seeded ? "true" : "false") << '\n'
                   << "pn_current_header_tracking=" << (pn_current_header_tracking ? "true" : "false") << '\n'
                   << "pn_current_header_min_improvement=0.005\n"
                   << "pn_schedule_tracking_active=" << (frame_reader.pn_schedule_active() ? "true" : "false") << '\n'

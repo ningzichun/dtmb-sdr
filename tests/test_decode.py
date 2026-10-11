@@ -5,6 +5,32 @@ import pytest
 from dtmb import decode
 
 
+def test_bounded_clock_fit_is_explicit_and_preserves_fec_gates(monkeypatch, tmp_path):
+    monkeypatch.setattr(decode, "_exe", lambda name, bin_dir: tmp_path / name)
+    args = decode.build_parser().parse_args(["--input-rate", "9000000", "--input-format", "cu8",
+        "--system-info-index", "16", "--pn-schedule-tracking", "--pn-schedule-max-clock-ppm", "80",
+        "--pipeline-buffer-mib", "0"])
+    _, front, _, fec = decode.build_commands(args)
+    assert front[front.index("--pn-schedule-max-clock-ppm") + 1] == "80.0"
+    assert "--pn-current-header-tracking" in front
+    assert "--clean-frames-only" in fec and "--fail-on-unclean-frame" in fec and "--require-output" in fec
+
+
+@pytest.mark.parametrize("value", ["-1", "101", "nan", "inf"])
+def test_bounded_clock_fit_rejects_invalid_bounds(value):
+    args = decode.build_parser().parse_args(["--input-rate", "9000000", "--pn-schedule-tracking",
+        "--pn-schedule-max-clock-ppm", value])
+    with pytest.raises(ValueError, match="0..100"):
+        decode.build_commands(args)
+
+
+@pytest.mark.parametrize("extra", [[], ["--pn-schedule-tracking", "--pn-mode", "pn595"]])
+def test_bounded_clock_fit_requires_cyclic_tracking(extra):
+    args = decode.build_parser().parse_args(["--input-rate", "9000000", "--pn-schedule-max-clock-ppm", "20", *extra])
+    with pytest.raises(ValueError):
+        decode.build_commands(args)
+
+
 @pytest.mark.parametrize("profile", range(11, 25))
 def test_receive_profiles_build_all_stage_parameters(monkeypatch, profile, tmp_path):
     monkeypatch.setattr(decode, "_exe", lambda name, bin_dir: tmp_path / name)

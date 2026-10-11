@@ -124,6 +124,14 @@ option retains the configured profile and the existing FEC checks. Compare
 the acquisition and tracking diagnostics for your recording before adopting
 the setting. Schedule lock and transport checks are separate results.
 
+If clock drift prevents the initial schedule from locking, add
+`--pn-schedule-max-clock-ppm 80` to bound an affine clock fit during acquisition.
+The allowed bound is 0–100 ppm; zero retains constant-bias acquisition. A
+confirmed fit seeds the native timing trajectory from received PN phases.
+The lock residual, competing-schedule margin and inlier thresholds remain
+unchanged. This option improves schedule acquisition; verify the recovered
+transport and decoded pictures separately.
+
 ## Optional CUDA acceleration
 
 CUDA accelerates the LDPC stage. CUDA-enabled Windows and Linux x86-64 wheels
