@@ -94,7 +94,7 @@ automatically selecting a detected profile.
 C=3780 multicarrier reception supports all three PN modes and profiles 3–24.
 For PN595 with normal 4QAM (profiles 5–10), the receiver also supports C=1
 single-carrier reception. Use `--frame-body-mode auto` to check the frame body,
-or `--frame-body-mode c1` when C=1 is known. The CLI defaults to `c3780);
+or `--frame-body-mode c1` when C=1 is known. The CLI defaults to `c3780`;
 the browser uses Auto.
 
 For example, decode a PN595, profile 10 CF32 recording with automatic
@@ -107,6 +107,22 @@ dtmb-decode --input capture.cf32 --input-format cf32 --input-rate 12500000 --pn-
 Run `dtmb-decode --help` for the full set of receiver options. Use additional
 tracking, confidence and calibration controls after validating them for your
 input.
+
+### Native PN schedule tracking
+
+For PN420 or PN945 recordings with timing drift, try the native receiver's
+opt-in `--pn-schedule-tracking` setting:
+
+```sh
+dtmb-decode --input capture.cu8 --input-format cu8 --input-rate 9000000 --pn-mode pn945 --system-info-index 16 --pn-schedule-tracking --output recovered.ts
+dtmb-ts-analyze recovered.ts
+```
+
+The CLI enables both PN schedule tracking and current-header tracking in the
+native frontend. The schedule is acquired from received PN headers; this
+option retains the configured profile and the existing FEC checks. Compare
+the acquisition and tracking diagnostics for your recording before adopting
+the setting. Schedule lock and transport checks are separate results.
 
 ## Optional CUDA acceleration
 
