@@ -9,8 +9,10 @@ MIT for local ZIP extraction. Its license is distributed as
 ## CUDA runtime
 
 The optional `cuda` extra depends on NVIDIA's separately distributed
-`nvidia-cuda-runtime-cu12` package and its NVIDIA license. Its runtime libraries
-are not bundled in the DTMB wheel. CUDA-enabled builds use NVIDIA's CUDA 12
+`nvidia-cuda-runtime-cu12` package and its NVIDIA license. Its runtime
+libraries are not bundled in the DTMB wheel; a conda-installed
+`cuda-cudart` (CUDA 12 or 13) is also used when present.
+CUDA-enabled builds use NVIDIA's CUDA 12 or CUDA 13
 Toolkit; the DTMB LDPC implementation is project source compiled into an
 optional shared backend.
 

@@ -1,5 +1,9 @@
 #include "ldpc_cuda_plugin.h"
 
+#ifdef DTMB_TEST_RUNTIME_MAJOR
+extern "C" int dtmb_test_runtime_major();
+#endif
+
 extern "C" DTMB_CUDA_EXPORT uint32_t dtmb_cuda_abi_version() {
 #ifdef DTMB_TEST_BAD_ABI
     return DTMB_CUDA_ABI_VERSION + 1;
@@ -9,7 +13,11 @@ extern "C" DTMB_CUDA_EXPORT uint32_t dtmb_cuda_abi_version() {
 }
 
 extern "C" DTMB_CUDA_EXPORT int dtmb_cuda_probe(char*, uint64_t) {
+#ifdef DTMB_TEST_RUNTIME_MAJOR
+    return dtmb_test_runtime_major() == DTMB_TEST_RUNTIME_MAJOR ? 0 : 1;
+#else
     return 0;
+#endif
 }
 
 extern "C" DTMB_CUDA_EXPORT int dtmb_cuda_decode(const DtmbCudaBatchRequest* request,

@@ -37,19 +37,46 @@ std::filesystem::path executable_directory() {
 #endif
 }
 
+// CUDA majors we know how to load, newest first. The packaged plugin and
+// runtime library names encode the CUDA major (dtmb_cuda12/libcudart.so.12).
+constexpr int kCudaMajors[] = {13, 12};
+
+#ifdef _WIN32
+std::filesystem::path backend_filename(int major) {
+    return std::filesystem::path("dtmb_cuda" + std::to_string(major) + ".dll");
+}
+std::filesystem::path runtime_filename(int major) {
+    return std::filesystem::path("cudart64_" + std::to_string(major) + ".dll");
+}
+#elif defined(__APPLE__)
+std::filesystem::path backend_filename(int major) {
+    return std::filesystem::path("libdtmb_cuda" + std::to_string(major) + ".dylib");
+}
+std::filesystem::path runtime_filename(int major) {
+    return std::filesystem::path("libcudart." + std::to_string(major) + ".dylib");
+}
+#else
+std::filesystem::path backend_filename(int major) {
+    return std::filesystem::path("libdtmb_cuda" + std::to_string(major) + ".so");
+}
+std::filesystem::path runtime_filename(int major) {
+    return std::filesystem::path("libcudart.so." + std::to_string(major));
+}
+#endif
+
 std::filesystem::path backend_path() {
     if (const auto configured = std::getenv("DTMB_CUDA_BACKEND")) {
         const auto path = std::filesystem::path(configured);
         if (!path.is_absolute()) throw std::runtime_error("DTMB_CUDA_BACKEND must be an absolute library path");
         return path;
     }
-#ifdef _WIN32
-    return executable_directory() / "dtmb_cuda12.dll";
-#elif defined(__APPLE__)
-    return executable_directory() / "libdtmb_cuda12.dylib";
-#else
-    return executable_directory() / "libdtmb_cuda12.so";
-#endif
+    const auto directory = executable_directory();
+    for (const int major : kCudaMajors) {
+        const auto candidate = directory / backend_filename(major);
+        if (std::filesystem::is_regular_file(candidate)) return candidate;
+    }
+    // Return the newest name for a clear "missing" diagnostic.
+    return directory / backend_filename(kCudaMajors[0]);
 }
 
 class Backend {
@@ -57,24 +84,46 @@ public:
     Backend() {
         const auto path = backend_path();
         if (!std::filesystem::is_regular_file(path)) {
-            throw std::runtime_error("CUDA 12 backend library is missing: " + path.string()
+            throw std::runtime_error("CUDA backend library is missing: " + path.string()
                 + "; install a CUDA-enabled dtmb-sdr wheel or build with DTMB_CORE_ENABLE_CUDA_LDPC=ON");
         }
         if (const auto directory = std::getenv("DTMB_CUDA_RUNTIME_DIR"); directory != nullptr && *directory != '\0') {
             const auto runtime_directory = std::filesystem::path(directory);
             if (!runtime_directory.is_absolute()) throw std::runtime_error("DTMB_CUDA_RUNTIME_DIR must be absolute");
+            int required_major = 0;
+            for (const int major : kCudaMajors) {
+                if (path.filename() == backend_filename(major)) required_major = major;
+            }
 #ifdef _WIN32
             if (AddDllDirectory(runtime_directory.c_str()) == nullptr) {
                 throw std::runtime_error("invalid DTMB_CUDA_RUNTIME_DIR");
             }
-            const auto runtime = runtime_directory / "cudart64_12.dll";
-            if (LoadLibraryExW(runtime.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) == nullptr) {
-                throw std::runtime_error("cannot load CUDA 12 runtime; install dtmb-sdr[cuda]");
+            bool loaded = false;
+            for (const int major : kCudaMajors) {
+                if (required_major != 0 && major != required_major) continue;
+                const auto runtime = runtime_directory / runtime_filename(major);
+                if (LoadLibraryExW(runtime.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) != nullptr) {
+                    loaded = true;
+                    break;
+                }
+            }
+            if (!loaded) {
+                throw std::runtime_error("cannot load CUDA runtime from DTMB_CUDA_RUNTIME_DIR; install dtmb-sdr[cuda]");
             }
 #else
-            const auto runtime = runtime_directory / "libcudart.so.12";
-            if (dlopen(runtime.c_str(), RTLD_NOW | RTLD_GLOBAL) == nullptr) {
-                throw std::runtime_error("cannot load CUDA 12 runtime: " + std::string(dlerror())
+            bool loaded = false;
+            std::string last_error;
+            for (const int major : kCudaMajors) {
+                if (required_major != 0 && major != required_major) continue;
+                const auto runtime = runtime_directory / runtime_filename(major);
+                if (dlopen(runtime.c_str(), RTLD_NOW | RTLD_GLOBAL) != nullptr) {
+                    loaded = true;
+                    break;
+                }
+                last_error = dlerror();
+            }
+            if (!loaded) {
+                throw std::runtime_error("cannot load CUDA runtime from DTMB_CUDA_RUNTIME_DIR: " + last_error
                     + "; install dtmb-sdr[cuda]");
             }
 #endif
@@ -82,13 +131,13 @@ public:
 #ifdef _WIN32
         handle_ = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
         if (handle_ == nullptr) {
-            throw std::runtime_error("cannot load CUDA 12 backend (Windows error " + std::to_string(GetLastError())
+            throw std::runtime_error("cannot load CUDA backend (Windows error " + std::to_string(GetLastError())
                 + "); install dtmb-sdr[cuda] or set DTMB_CUDA_RUNTIME_DIR");
         }
 #else
         handle_ = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
         if (handle_ == nullptr) {
-            throw std::runtime_error("cannot load CUDA 12 backend: " + std::string(dlerror())
+            throw std::runtime_error("cannot load CUDA backend: " + std::string(dlerror())
                 + "; install dtmb-sdr[cuda] or set DTMB_CUDA_RUNTIME_DIR");
         }
 #endif
@@ -98,7 +147,7 @@ public:
         decode = symbol<DtmbCudaDecodeFunction>("dtmb_cuda_decode");
         auto error = std::array<char, 1024>{};
         if (probe(error.data(), error.size()) != 0) {
-            throw std::runtime_error("CUDA 12 device initialization failed: " + std::string(error.data())
+            throw std::runtime_error("CUDA device initialization failed: " + std::string(error.data())
                 + "; a compatible NVIDIA GPU and driver are required");
         }
     }

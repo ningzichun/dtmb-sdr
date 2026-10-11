@@ -170,9 +170,9 @@ Edit **Input path** to point at the same local recording and choose an output
 path. Select **Bash** or **PowerShell** for your terminal.
 
 **Include pip installation** adds `python -m pip install dtmb-sdr`. Selecting
-**CUDA 12** changes this to `python -m pip install 'dtmb-sdr[cuda]'` and adds
+**CUDA** changes this to `python -m pip install 'dtmb-sdr[cuda]'` and adds
 `--acceleration cuda` to the decoder. CUDA accelerates LDPC decoding and requires
-a Windows/Linux x86-64 wheel, an NVIDIA GPU and a CUDA 12 compatible driver.
+a Windows/Linux x86-64 wheel, an NVIDIA GPU and a CUDA 12/13 compatible driver.
 Python 3.10+ is required for the package.
 
 **Copy recipe** copies installation, decoding and `dtmb-ts-analyze` checks.

@@ -64,12 +64,12 @@
         <p class="hint">Decode the entire recording with the current receiver settings using the Python package. Edit the local paths, choose an installation recipe, then copy.</p>
         <div class="recipe-options">
           <label for="cli-shell">Shell<select id="cli-shell"><option value="bash">Bash · Linux / macOS</option><option value="powershell">PowerShell · Windows</option></select></label>
-          <label for="cli-backend">Acceleration<select id="cli-backend"><option value="cpu">CPU</option><option value="cuda">CUDA 12 · NVIDIA GPU</option></select></label>
+          <label for="cli-backend">Acceleration<select id="cli-backend"><option value="cpu">CPU</option><option value="cuda">CUDA · NVIDIA GPU</option></select></label>
           <label for="cli-input">Input path<input id="cli-input" type="text" placeholder="Path to local IQ recording" spellcheck="false"></label>
           <label for="cli-output">Output path<input id="cli-output" type="text" value="recovered.ts" spellcheck="false"></label>
         </div>
         <label class="checkbox recipe-install"><input id="cli-install" type="checkbox" checked> Include pip installation</label>
-        <p id="cli-cuda-hint" class="hint" hidden>CUDA accelerates LDPC decoding. Requires a Windows/Linux x86-64 wheel, an NVIDIA GPU and a CUDA 12 compatible driver; [cuda] installs the runtime.</p>
+        <p id="cli-cuda-hint" class="hint" hidden>CUDA accelerates LDPC decoding. Requires a Windows/Linux x86-64 wheel, an NVIDIA GPU and a CUDA 12/13 compatible driver; [cuda] or a conda cuda-cudart installs the runtime.</p>
         <p id="cli-status" class="hint" role="status"></p>
         <pre id="cli-command" tabindex="0" aria-label="Generated CLI recipe"></pre>
         <div class="recipe-actions"><button id="cli-copy" class="button primary small" type="button" disabled>Copy recipe</button><button id="cli-copy-command" class="button secondary small" type="button" disabled>Copy decode command</button><button id="cli-copy-install" class="button secondary small" type="button">Copy pip install</button><span id="cli-copy-status" class="hint" role="status" aria-live="polite"></span></div>
