@@ -253,8 +253,8 @@ void check_bounded_window_retains_main_path() {
 int main() {
     check_bounded_window_retains_main_path();
     const auto release = version();
-    assert(release.major == 0 && release.minor == 4 && release.patch == 1);
-    assert(std::string_view(build_info()) == "dtmb-core-cpp 0.4.1");
+    assert(release.major == 0 && release.minor == 4 && release.patch == 3);
+    assert(std::string_view(build_info()) == "dtmb-core-cpp 0.4.3");
     // PN420/PN945: GB 20600 appendices D/E phase-zero vectors.
     check_vector(PnMode::pn420,
         "B0A5E9FEA1CF0D9A3DC7407C4A22D5C8C938109BCCEFCB2B69063"

@@ -21,7 +21,7 @@ namespace {
 
 constexpr std::uint32_t kVersionMajor = 0;
 constexpr std::uint32_t kVersionMinor = 4;
-constexpr std::uint32_t kVersionPatch = 1;
+constexpr std::uint32_t kVersionPatch = 3;
 constexpr std::uint32_t kAbiVersionMajor = 0;
 constexpr std::uint32_t kAbiVersionMinor = 1;
 
@@ -452,7 +452,7 @@ Version version() noexcept {
 }
 
 const char* build_info() noexcept {
-    return "dtmb-core-cpp 0.4.1";
+    return "dtmb-core-cpp 0.4.3";
 }
 
 Ci8PowerStats ci8_power_stats(
