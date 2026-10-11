@@ -111,9 +111,10 @@ input.
 ## Optional CUDA acceleration
 
 CUDA accelerates the LDPC stage. CUDA-enabled Windows and Linux x86-64 wheels
-contain both the CPU decoder and an optional CUDA 12 backend. The `cuda`
-extra installs the CUDA runtime separately; CPU decoding does not load it.
-macOS wheels use the CPU decoder.
+contain both the CPU decoder and an optional CUDA 12 backend.
+The `cuda` extra installs the matching CUDA 12 runtime
+separately (a conda `cuda-cudart` install is also detected); CPU decoding
+does not load it. macOS wheels use the CPU decoder.
 
 When using a CUDA-enabled wheel, install the runtime and select CUDA explicitly:
 
@@ -123,15 +124,18 @@ dtmb-decode --input capture.ci8 --input-rate 16000000 --output recovered.ts --ac
 ```
 
 A compatible NVIDIA GPU and driver are required. Wheel users do not need the
-CUDA Toolkit. The launcher locates the installed runtime and reports missing
-runtime or device errors.
+CUDA Toolkit. The launcher locates the runtime matching the packaged backend
+and reports missing runtime or device errors.
 
 Source builds use the CPU backend by default. To build with CUDA, install a
-CUDA 12 Toolkit and run this command from the repository root:
+CUDA 12 or newer Toolkit and run this command from the repository root:
 
 ```sh
 python -m pip install ".[cuda]" --config-settings "cmake.define.DTMB_CORE_ENABLE_CUDA_LDPC=ON"
 ```
+
+CUDA 13 source builds require a matching CUDA 13 runtime, such as conda's
+`cuda-cudart`. The `cuda` extra supplies CUDA 12 for released wheels.
 
 The build setting enables the native backend; selecting the extra alone only
 installs the runtime.

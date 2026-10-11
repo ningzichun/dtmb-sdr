@@ -2,7 +2,7 @@
 #include <thread>
 #include <utility>
 namespace dtmb::core {
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
 class WorkerThread {
 public:
     template<class F, class... Args> explicit WorkerThread(F&& f, Args&&... args) {

@@ -3,7 +3,8 @@ import { profile, decode, probe } from './pipeline.js';
 import { pnModes, detectionLabels, boundedProbeOptions, createDetection, observeDetection, detectionSummary, canReuseDetection, observedProfileIndex, resolveReceiver } from './pn-detection.js';
 import { Spectrum, Waterfall } from './plots.js';
 import { TransportMetadata, pcrSyntaxError } from './transport-info.js';
-import { guessSampleRate } from './sample-rate.js';
+import { guessSampleRate, rateGuessSnapshot } from './sample-rate.js';
+import { cliRecipe } from './cli-recipe.js';
 import { defaultManifest, parseManifest, applyEntry, fetchFile, sampleFile, iqFromZip, CorsError } from './samples.js';
 
 const $ = id => document.getElementById(id);
@@ -12,6 +13,8 @@ let detections = {};
 let viewedMode;
 let progressLabel = '', inputFraction = 0;
 let rateGuess;
+let recipe;
+if (/Win/i.test(navigator.platform)) $('cli-shell').value = 'powershell';
 const spectrum = new Spectrum($('spectrum'));
 let waterfall;
 try { waterfall = new Waterfall($('waterfall')); } catch (error) { $('status').textContent = error.message; }
@@ -72,7 +75,37 @@ function lock(busy) {
   $('inspect').disabled = busy || !file || !validRate; $('decode').disabled = busy || !analysis || analysis.nonfinite > 0 || !receiverSelection().ready;
   $('test-pn').disabled = $('scan-pn').disabled = busy || !analysis || analysis.nonfinite > 0;
   $('cancel').hidden = !running;
+  renderRecipe();
 }
+function renderRecipe() {
+  let selected;
+  if (file) { try { selected = options(); } catch {} }
+  recipe = cliRecipe(file, selected, { shell: $('cli-shell').value, cuda: $('cli-backend').value === 'cuda',
+    install: $('cli-install').checked, input: $('cli-input').value, output: $('cli-output').value });
+  $('cli-command').textContent = recipe.recipe || 'Confirm the receiver settings to generate a command.';
+  $('cli-status').textContent = recipe.reason;
+  $('cli-cuda-hint').hidden = $('cli-backend').value !== 'cuda';
+  $('cli-copy').disabled = $('cli-copy-command').disabled = !recipe.ready;
+  $('cli-copy-status').textContent = '';
+}
+for (const id of ['cli-shell', 'cli-backend', 'cli-install']) $(id).addEventListener('change', renderRecipe);
+for (const id of ['cli-input', 'cli-output', 'start', 'duration']) $(id).addEventListener('input', renderRecipe);
+async function copyRecipe(part) {
+  const text = recipe?.[part];
+  if (!text) return;
+  try { await navigator.clipboard.writeText(text); $('cli-copy-status').textContent = 'Copied!'; }
+  catch {
+    // Keep the exact requested text selectable when clipboard permissions are unavailable.
+    $('cli-command').textContent = text;
+    const range = document.createRange(); range.selectNodeContents($('cli-command'));
+    const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
+    $('cli-command').focus();
+    $('cli-copy-status').textContent = 'Clipboard unavailable. Selected text: press Ctrl+C / ⌘C.';
+  }
+}
+$('cli-copy').onclick = () => copyRecipe('recipe');
+$('cli-copy-command').onclick = () => copyRecipe('command');
+$('cli-copy-install').onclick = () => copyRecipe('installation');
 function renderDetection() {
   const configured = $('pn').value, selection = receiverSelection();
   const mode = viewedMode || selection.pn || 'pn945', result = detections[mode], native = result?.native || {};
@@ -124,6 +157,7 @@ function renderDetection() {
     report.pnDetection = Object.fromEntries(pnModes.map(candidate => [candidate, detections[candidate] || { mode: candidate, state: 'not-tested', systemInformation: 'not-tested' }]));
     report.selection = { pnSetting: configured, profileSetting: $('profile').value, ...selection };
   }
+  renderRecipe();
 }
 function detectedProfile(result) {
   const index = observedProfileIndex(result);
@@ -152,6 +186,8 @@ function choose(selected) {
   invalidate(); file = selected;
   if (/\.zip$/i.test(file.name)) { unpackZip(file).then(choose).catch(error => { file = null; lock(false); status(error.message); }); return; }
   $('file-name').textContent = file.name; $('file-info').textContent = `${(file.size / 1048576).toFixed(1)} MiB`;
+  $('cli-input').value = file.name;
+  $('cli-output').value = `${file.name.replace(/\.[^.]+$/, '')}.ts`;
   const suffix = file.name.split('.').pop().toLowerCase();
   const names = { cs8: 'ci8', sc16: 'ci16', cs16: 'ci16' };
   if (formats[suffix]) $('format').value = names[suffix] || suffix;
@@ -232,6 +268,18 @@ function inspect() {
 }
 function unit(text) { const el = document.createElement('small'); el.textContent = text; return el; }
 $('inspect').onclick = inspect;
+function showRateGuess(value, suffix = '') {
+  rateGuess = value;
+  if (!value.rate) return;
+  $('rate').value = value.rate;
+  const result = value.candidates.find(candidate => candidate.rate === value.rate)?.detections[value.mode];
+  const headers = result ? ` ${result.native.acquisition_hit_count}/${result.native.acquisition_observed_frames} headers` : '';
+  const qualification = value.ambiguous ? `Retained candidate; ${value.reason}`
+    : value.provisional ? 'Candidate retained; scan incomplete.' : 'Scan complete.';
+  $('rate-status').textContent = `Guessed ${(value.rate / 1e6).toFixed(3)} MS/s · ${value.mode.toUpperCase()}${headers}. ${qualification} Editable; not capture metadata.${suffix ? ` ${suffix}` : ''}`;
+  $('guess-rate').hidden = true;
+  renderRecipe();
+}
 $('guess-rate').onclick = async () => {
   if (!file || running || inspection || $('rate').value.trim()) return;
   invalidate(); $('log').textContent = '';
@@ -241,23 +289,28 @@ $('guess-rate').onclick = async () => {
     current = guessSampleRate(file, { format: $('format').value, start: Number($('start').value), duration: Number($('duration').value) }, {
       candidate: (rate, mode) => {
         const message = `Testing ${(rate / 1e6).toFixed(3)} MS/s · ${mode.toUpperCase()}…`;
-        $('rate-status').textContent = message; status(`Guessing common sample rates. ${message}`);
+        if (rateGuess?.rate) showRateGuess(rateGuess, message);
+        else $('rate-status').textContent = message;
+        status(`Guessing common sample rates. ${message}`);
         beginProgress('Sample-rate guess probe');
       },
+      result: value => { if (value.rate) showRateGuess(value); },
       progress: updateProgress, log: appendLog,
     });
     running = current; lock(true);
     rateGuess = await current.promise;
     if (rateGuess.rate) {
-      $('rate').value = rateGuess.rate; guessed = true;
-      const result = rateGuess.candidates.find(candidate => candidate.rate === rateGuess.rate).detections[rateGuess.mode];
-      $('rate-status').textContent = `Guessed ${(rateGuess.rate / 1e6).toFixed(3)} MS/s · ${rateGuess.mode.toUpperCase()} ${result.native.acquisition_hit_count}/${result.native.acquisition_observed_frames} headers. Editable; not capture metadata.`;
-      status('Sample rate guessed from PN. Inspecting with this rate…');
+      showRateGuess(rateGuess); guessed = !rateGuess.provisional;
+      status(guessed ? 'Sample rate guessed from PN. Inspecting with this rate…' : 'The earlier sample-rate candidate is retained. Review the scan evidence before inspecting.');
     } else { $('rate-status').textContent = rateGuess.reason; status(rateGuess.reason); }
     endProgress('Sample-rate guess finished', 'complete');
   } catch (error) {
-    rateGuess = { ...current?.evidence, rate: null, complete: false, reason: error.message };
-    $('rate-status').textContent = error.message; status(error.message);
+    rateGuess = { ...(current ? rateGuessSnapshot(current.evidence) : { rate: null }), complete: false,
+      selectedRate: null, provisional: true, error: error.message };
+    if (!rateGuess.rate) rateGuess.reason = error.message;
+    if (rateGuess.rate) showRateGuess(rateGuess, error.message);
+    else $('rate-status').textContent = error.message;
+    status(rateGuess.rate ? `${error.message} The guessed rate is retained; review it or inspect the capture.` : error.message);
     endProgress(error.name === 'AbortError' ? 'Sample-rate guess cancelled' : 'Sample-rate guess stopped', error.name === 'AbortError' ? 'cancelled' : 'failed');
   } finally { running = null; lock(false); }
   if (guessed) inspect();

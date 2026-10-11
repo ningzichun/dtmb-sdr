@@ -4,6 +4,13 @@ if(NOT EMSCRIPTEN)
   message(FATAL_ERROR "Configure with emcmake; see web/README.md")
 endif()
 set(CMAKE_CXX_STANDARD 20)
+option(DTMB_WEB_PTHREADS "Build experimental shared-memory WebAssembly stages" OFF)
+set(DTMB_WEB_PTHREAD_POOL_SIZE 2 CACHE STRING "Preloaded pthreads per experimental stage")
+if(DTMB_WEB_PTHREADS)
+  if(NOT DTMB_WEB_PTHREAD_POOL_SIZE MATCHES "^[1-9][0-9]*$")
+    message(FATAL_ERROR "DTMB_WEB_PTHREAD_POOL_SIZE must be a positive integer")
+  endif()
+endif()
 set(CORE "${CMAKE_CURRENT_SOURCE_DIR}/../core/cpp")
 add_library(receiver STATIC
   ${CORE}/src/core.cpp ${CORE}/src/nr.cpp ${CORE}/src/iq.cpp ${CORE}/src/resampler.cpp
@@ -11,6 +18,9 @@ add_library(receiver STATIC
   ${CORE}/src/fec.cpp ${CORE}/src/transport.cpp)
 target_include_directories(receiver PUBLIC ${CORE}/include)
 target_compile_options(receiver PRIVATE -O3 -fexceptions)
+if(DTMB_WEB_PTHREADS)
+  target_compile_options(receiver PUBLIC -pthread)
+endif()
 foreach(stage IN ITEMS ci8_resample c3780_extract deinterleave_qam64 ldpc_bch_decode)
   add_executable(${stage} ${CORE}/tools/${stage}.cpp)
   target_link_libraries(${stage} PRIVATE receiver)
@@ -21,6 +31,11 @@ foreach(stage IN ITEMS ci8_resample c3780_extract deinterleave_qam64 ldpc_bch_de
     -sSTACK_SIZE=2097152 -sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=262144
     "-sEXPORTED_RUNTIME_METHODS=['callMain','FS','Asyncify']"
     -sENVIRONMENT=web,worker,node)
+  if(DTMB_WEB_PTHREADS)
+    target_link_options(${stage} PRIVATE -pthread
+      "-sPTHREAD_POOL_SIZE=${DTMB_WEB_PTHREAD_POOL_SIZE}"
+      -sPTHREAD_POOL_SIZE_STRICT=2)
+  endif()
   set_target_properties(${stage} PROPERTIES SUFFIX ".mjs")
 endforeach()
 target_sources(ldpc_bch_decode PRIVATE ${CORE}/tools/ldpc_h_gate.cpp ${CORE}/tools/ldpc_cuda_backend.cpp)

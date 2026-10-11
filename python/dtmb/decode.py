@@ -221,7 +221,7 @@ def run(commands: list[list[str]]) -> int:
                 command,
                 stdin=previous,
                 stdout=None if index == len(commands) - 1 else subprocess.PIPE,
-                env=native_cuda_environment() if "--ldpc-accel" in command
+                env=native_cuda_environment(command[0]) if "--ldpc-accel" in command
                 and command[command.index("--ldpc-accel") + 1] == "cuda" else None,
             )
             if previous is not None:

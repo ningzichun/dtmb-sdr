@@ -44,9 +44,16 @@ available. **Guess** checks these common rates (MS/s) against all three PN modes
 7.56, 7.68, 8, 8.192, 9.6, 10, 10.24, 11.52, 12, 12.288, 12.5, 15.12,
 15.36, 16, 16.384, 19.2, 20, 24, 25, 30.72, 32, 40, 50 and 61.44.
 
-Repeated header matches with an unambiguous result
-supply an editable rate and start inspection. Ambiguous, incomplete or unmatched
-scans leave the field empty.
+As soon as a completed probe has enough repeated header matches, an
+unambiguous candidate is filled into the editable rate field. The scan continues
+to compare other rates, and the field labels this early value as a candidate.
+**Stop receiver** or a timeout retains the candidate and the available evidence;
+you can review the value and click **Inspect capture**.
+
+A complete scan with a unique or clearly dominant match confirms the guess and
+starts inspection. If later matches conflict, the earlier filled value stays
+visible with an ambiguity warning for you to check. A scan with no qualifying
+match leaves the field empty. Incomplete scans do not confirm a guessed rate.
 
 A guessed rate is a candidate from this list, not recording metadata or an
 exact clock measurement. It does not establish system-information lock or
@@ -154,6 +161,33 @@ If the app reports an incompatible receiver build, refresh the page. For a
 local installation, rebuild and serve the complete output directory. Script
 versions and WebAssembly hashes are checked to keep receiver assets consistent.
 
+## Continue in a terminal
+
+The **CLI recipe** panel assembles commands from the current input format,
+sample rate, resolved PN/profile, PN tracking and selected time interval.
+Resolve Auto through inspection, or select known PN/profile values explicitly.
+Edit **Input path** to point at the same local recording and choose an output
+path. Select **Bash** or **PowerShell** for your terminal.
+
+**Include pip installation** adds `python -m pip install dtmb-sdr`. Selecting
+**CUDA** changes this to `python -m pip install 'dtmb-sdr[cuda]'` and adds
+`--acceleration cuda` to the decoder. CUDA accelerates LDPC decoding and requires
+a Windows/Linux x86-64 wheel, an NVIDIA GPU and a CUDA 12/13 compatible driver.
+Python 3.10+ is required for the package.
+
+**Copy recipe** copies installation, decoding and `dtmb-ts-analyze` checks.
+You can also copy just the decode command or pip installation. For a selected
+interval, the decode command first uses bounded Python file I/O to write a
+`.interval` I/Q file, then decodes those same sample-aligned bytes. Keep space
+for this file and the recovered TS. Duration `0` with Start `0` uses the original
+recording directly.
+
+The generated command selects the browser's 100 LDPC iterations and
+`--error-policy continue`. Failed FEC groups retain discontinuity markers, and
+transport checks remain a separate step. Check audio/video integrity with a
+codec decoder. Clipboard access works over HTTPS or localhost; if access is
+blocked, the requested text is selected for manual copying.
+
 ## Build and run locally
 
 Install and activate Emscripten **4.0.15**, and install CMake 3.20+, Python
@@ -184,6 +218,22 @@ The browser build compiles the receiver stages from `core/cpp`, using one
 worker per stage and bounded byte streams between them. The waterfall is
 rendered with WebGL. The [native build instructions](../README.md#build-from-source)
 cover the shared receiver tests.
+
+### Optional pthread stage build
+
+An experimental LDPC stage build can reuse native C++ threads in an embedding
+host that supplies cross-origin isolation and `SharedArrayBuffer`:
+
+```sh
+emcmake cmake -S web -B build/web-ldpc-pthread -DCMAKE_BUILD_TYPE=Release -DDTMB_WEB_PTHREADS=ON -DDTMB_WEB_PTHREAD_POOL_SIZE=2
+cmake --build build/web-ldpc-pthread --target ldpc_bch_decode --parallel 2
+```
+
+Use `--workers 2` with this two-thread pool. Pool exhaustion fails explicitly;
+increase the pool before requesting more simultaneous threads. Check host
+capabilities before loading these artifacts and keep an ordinary WASM build
+for hosts without shared memory. The regular `web/build.py` application build
+continues to use ordinary WASM stage workers.
 
 ## Deploy to GitHub Pages
 

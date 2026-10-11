@@ -2575,7 +2575,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--cuda-check") {
         try {
             dtmb::tools::ldpc_cuda::require_backend();
-            std::cerr << "cuda_backend=cuda12\n";
+            std::cerr << "cuda_backend=loaded\n";
             return 0;
         } catch (const std::exception& error) {
             std::cerr << "dtmb_core_ldpc_bch_decode: " << error.what() << '\n';

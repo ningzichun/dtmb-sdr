@@ -5,16 +5,18 @@
 #include <string>
 
 int main(int argc, char** argv) {
-    if (argc != 3) return 2;
+    if (argc != 3 && argc != 4) return 2;
 #ifdef _WIN32
     _putenv_s("DTMB_CUDA_BACKEND", argv[1]);
-    _putenv_s("DTMB_CUDA_RUNTIME_DIR", "");
+    _putenv_s("DTMB_CUDA_RUNTIME_DIR", argc == 4 ? argv[3] : "");
 #else
     setenv("DTMB_CUDA_BACKEND", argv[1], 1);
-    unsetenv("DTMB_CUDA_RUNTIME_DIR");
+    if (argc == 4) setenv("DTMB_CUDA_RUNTIME_DIR", argv[3], 1);
+    else unsetenv("DTMB_CUDA_RUNTIME_DIR");
 #endif
     try {
         dtmb::tools::ldpc_cuda::require_backend();
+        if (std::string(argv[2]) == "runtime") return 0;
         if (std::string(argv[2]) != "batch") return 1;
         const auto graph = dtmb::core::LdpcSparseGraph{3, {0, 3}, {0, 1, 2}};
         const auto llr = std::array<float, 6>{2, -3, -5, 1, 2, -3};
@@ -28,7 +30,8 @@ int main(int argc, char** argv) {
         return 0;
     } catch (const std::exception& error) {
         const auto expected = std::string(argv[2]) == "abi" ? "ABI version mismatch" : "library is missing";
-        if (std::string(argv[2]) != "batch" && std::string(error.what()).find(expected) != std::string::npos) return 0;
+        if (std::string(argv[2]) != "batch" && std::string(argv[2]) != "runtime"
+            && std::string(error.what()).find(expected) != std::string::npos) return 0;
         std::cerr << error.what() << '\n';
         return 1;
     }
